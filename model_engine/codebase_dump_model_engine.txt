@@ -1,0 +1,940 @@
+Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_v3_r/model_engine':
+===============================================================================
+  R/00_contracts_and_spec.R
+  R/01_data_adapter.R
+  R/02_risk_engine.R
+  R/03_signal_engine.R
+  R/04_state_and_gating.R
+  R/05_portfolio_constructor.R
+  R/06_snapshot_runner.R
+
+
+
+###############################################################################
+### FILE: R/00_contracts_and_spec.R
+###############################################################################
+#' @title Model Engine Contracts and Specs
+#' @description Define contracts, validators, enums, spec defaults, and shared structural helpers.
+
+#' @export
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+#' @export
+me_require <- function(pkgs) {
+    for (pkg in pkgs) {
+        if (!requireNamespace(pkg, quietly = TRUE)) {
+            stop(sprintf("Package '%s' is strictly required but not installed.", pkg), call. = FALSE)
+        }
+    }
+}
+
+#' @export
+me_spec_default <- function() {
+    list(
+        data = list(
+            min_coverage_ratio = 0.9,
+            min_median_turnover = 1e5,
+            allowed_types = c("equity", "unit")
+        ),
+        risk = list(
+            vol = list(lookback = 63L),
+            pca = list(lookback = 252L, k = 3L),
+            resid = list(use_glasso = TRUE, lambda = 0.05),
+            factor = list(),
+            hrp = list()
+        ),
+        signals = list(
+            kalman = list(lookback = 252L, q_var = 1e-4, r_var = 1e-2, scale = 1.0),
+            tsmom = list(horizon = 252L, scale = 2.0)
+        ),
+        market_state = list(
+            dispersion = list(lookback = 1L),
+            eta = list(lookback = 63L),
+            vov = list(lookback = 126L)
+        ),
+        gating = list(
+            w0 = c(kalman = 0, tsmom = 0, cash = -1),
+            W = NULL
+        ),
+        portfolio = list(
+            tilt = list(max_tilt = 2.0),
+            caps = list(max_weight = 0.15)
+        ),
+        meta = list()
+    )
+}
+
+#' @export
+me_get_spec <- function(overrides = NULL) {
+    spec <- me_spec_default()
+    if (!is.null(overrides)) {
+        spec <- utils::modifyList(spec, overrides)
+    }
+    spec
+}
+
+#' @export
+me_validate_spec <- function(spec) {
+    req_names <- c("data", "risk", "signals", "market_state", "gating", "portfolio", "meta")
+    missing <- setdiff(req_names, names(spec))
+    if (length(missing) > 0) stop("ModelSpec missing sections: ", paste(missing, collapse = ", "))
+
+    # Validate scalar domains
+    if (!is.null(spec$portfolio$caps$max_weight) &&
+        (spec$portfolio$caps$max_weight <= 0 || spec$portfolio$caps$max_weight > 1)) {
+        stop("portfolio$caps$max_weight must be in (0, 1]")
+    }
+
+    if (!is.null(spec$data$min_coverage_ratio) &&
+        (spec$data$min_coverage_ratio < 0 || spec$data$min_coverage_ratio > 1)) {
+        stop("data$min_coverage_ratio must be in [0, 1]")
+    }
+
+    invisible(spec)
+}
+
+#' @export
+me_validate_snapshot_artifact <- function(x) {
+    req_names <- c(
+        "as_of_date", "tradable_symbols", "target_weights", "cash_weight",
+        "risk", "signals", "market_state", "gating", "portfolio_diag", "meta", "warnings"
+    )
+    missing <- setdiff(req_names, names(x))
+    if (length(missing) > 0) stop("SnapshotArtifact missing sections: ", paste(missing, collapse = ", "))
+
+    if (!inherits(x$as_of_date, "Date")) stop("as_of_date must be a Date")
+
+    # Check target bounds
+    if (!is.data.frame(x$target_weights)) stop("target_weights must be a data.frame")
+    if (!all(c("symbol", "weight_target") %in% names(x$target_weights))) {
+        stop("target_weights must have 'symbol' and 'weight_target'")
+    }
+    if (length(unique(x$target_weights$symbol)) != nrow(x$target_weights)) {
+        stop("Duplicate symbols in target_weights")
+    }
+    if (any(x$target_weights$weight_target < 0, na.rm = TRUE)) {
+        stop("Negative target weights are not allowed")
+    }
+
+    if (!is.numeric(x$cash_weight) || x$cash_weight < -1e-6 || x$cash_weight > 1 + 1e-6) {
+        stop("cash_weight must be in [0,1]")
+    }
+
+    tot_w <- sum(x$target_weights$weight_target, na.rm = TRUE) + x$cash_weight
+    if (abs(tot_w - 1.0) > 1e-4) stop(sprintf("Weights sum to %f, not 1.0", tot_w))
+
+    invisible(x)
+}
+
+#' @export
+me_hash_spec <- function(spec) {
+    me_require("digest")
+    digest::digest(spec)
+}
+
+
+
+###############################################################################
+### FILE: R/01_data_adapter.R
+###############################################################################
+#' @title Model Data Adapter
+#' @description Wrap data bundle/panel securely into no-lookahead structures.
+
+#' @export
+me_make_data_adapter <- function(data_bundle_or_panel, aux = list()) {
+    me_require("data.table")
+
+    # Extract true panel
+    if (is.list(data_bundle_or_panel) && "panel_adj_model" %in% names(data_bundle_or_panel)) {
+        dt <- data.table::as.data.table(data_bundle_or_panel$panel_adj_model)
+    } else if (is.data.frame(data_bundle_or_panel)) {
+        dt <- data.table::as.data.table(data_bundle_or_panel)
+    } else {
+        stop("data_bundle_or_panel must be a data.frame or a bundle list containing 'panel_adj_model'")
+    }
+
+    req_cols <- c("symbol", "refdate", "close", "turnover", "qty", "asset_type")
+    missing <- setdiff(req_cols, names(dt))
+    if (length(missing) > 0) stop("Panel missing fields: ", paste(missing, collapse = ", "))
+
+    # Canonicalize
+    data.table::setkeyv(dt, c("symbol", "refdate"))
+    if (anyDuplicated(dt, by = c("symbol", "refdate")) > 0) {
+        stop("Panel contains duplicate (symbol, refdate) pairs")
+    }
+
+    adapter <- list()
+
+    adapter$calendar <- function() {
+        sort(unique(dt$refdate))
+    }
+
+    adapter$panel_upto <- function(as_of_date) {
+        dt[refdate <= as_of_date]
+    }
+
+    adapter$price_matrix <- function(as_of_date, lookback, field = "close", symbols = NULL, strict = TRUE) {
+        sub_dt <- adapter$panel_upto(as_of_date)
+        if (nrow(sub_dt) == 0) {
+            return(matrix(NA_real_, 0, 0))
+        }
+        cal_upto <- sort(unique(sub_dt$refdate))
+        dates_to_keep <- tail(cal_upto, lookback)
+        sub_dt <- sub_dt[refdate %in% dates_to_keep]
+
+        if (!is.null(symbols)) sub_dt <- sub_dt[symbol %in% symbols]
+
+        mat <- data.table::dcast(sub_dt, refdate ~ symbol, value.var = field)
+        if (nrow(mat) == 0) {
+            return(matrix(NA_real_, 0, 0))
+        }
+
+        mat_out <- as.matrix(mat[, -1, with = FALSE])
+        rownames(mat_out) <- as.character(mat$refdate)
+
+        if (strict) {
+            keep <- colSums(!is.na(mat_out)) == nrow(mat_out)
+            mat_out <- mat_out[, keep, drop = FALSE]
+        }
+
+        # Return with requested symbol order if provided and possible
+        if (!is.null(symbols)) {
+            found <- intersect(symbols, colnames(mat_out))
+            mat_out <- mat_out[, found, drop = FALSE]
+        }
+        mat_out
+    }
+
+    adapter$returns_matrix <- function(as_of_date, lookback, field = "close", method = "log", symbols = NULL, strict = TRUE) {
+        pm <- adapter$price_matrix(as_of_date, lookback + 1, field, symbols, strict)
+        if (nrow(pm) < 2) {
+            return(matrix(NA_real_, nrow = 0, ncol = ncol(pm), dimnames = list(NULL, colnames(pm))))
+        }
+        if (method == "log") {
+            diff(log(pm))
+        } else {
+            diff(pm) / pm[-nrow(pm), ]
+        }
+    }
+
+    adapter$execution_price <- function(exec_date, field = "open", symbols = NULL) {
+        sub_dt <- dt[refdate == exec_date]
+        if (!is.null(symbols)) sub_dt <- sub_dt[symbol %in% symbols]
+        res <- sub_dt[[field]]
+        names(res) <- sub_dt$symbol
+        if (!is.null(symbols)) {
+            out <- rep(NA_real_, length(symbols))
+            names(out) <- symbols
+            found <- intersect(symbols, names(res))
+            out[found] <- res[found]
+            return(out)
+        }
+        res
+    }
+
+    adapter$investability_snapshot <- function(as_of_date, spec_data) {
+        sub_dt <- adapter$panel_upto(as_of_date)
+        cal_upto <- sort(unique(sub_dt$refdate))
+
+        # Needs at least 63 days of history to check coverage reasonably, otherwise take available
+        lkb <- min(63L, length(cal_upto))
+        if (lkb < 5) {
+            return(character(0))
+        }
+
+        dates_to_keep <- tail(cal_upto, lkb)
+        sub_dt <- sub_dt[refdate %in% dates_to_keep]
+
+        min_cov <- spec_data$min_coverage_ratio %||% 0.90
+        min_turnover <- spec_data$min_median_turnover %||% 1e5
+        allowed_types <- spec_data$allowed_types %||% c("equity")
+
+        # Filter by type first
+        if (length(allowed_types) > 0 && "asset_type" %in% names(sub_dt)) {
+            sub_dt <- sub_dt[asset_type %in% allowed_types]
+        }
+
+        # Aggregate over the lookback
+        agg <- sub_dt[, .(
+            n_obs = .N,
+            med_turnover = median(turnover, na.rm = TRUE),
+            last_price = tail(close, 1)
+        ), by = symbol]
+
+        # Filter
+        agg <- agg[n_obs >= (lkb * min_cov) & med_turnover >= min_turnover & last_price > 0]
+        agg$symbol
+    }
+
+    adapter
+}
+
+
+
+###############################################################################
+### FILE: R/02_risk_engine.R
+###############################################################################
+#' @title Risk Engine
+#' @description Risk estimation and baseline allocation logic.
+
+#' @export
+me_estimate_vol <- function(R_window, spec_risk_vol) {
+    vols <- apply(R_window, 2, sd, na.rm = TRUE) * sqrt(252)
+    vols
+}
+
+#' @export
+me_fit_pca_factor <- function(R_window, spec_pca) {
+    me_require("Matrix")
+    k <- spec_pca$k %||% 3
+    k <- min(k, ncol(R_window))
+
+    # Center, NO SCALING. Track means.
+    c_means <- colMeans(R_window, na.rm = TRUE)
+    R_centered <- scale(R_window, center = c_means, scale = FALSE)
+
+    # PCA on centered returns
+    pca <- prcomp(R_centered, center = FALSE, scale. = FALSE)
+
+    B <- pca$rotation[, 1:k, drop = FALSE]
+    F <- pca$x[, 1:k, drop = FALSE]
+
+    list(B = B, F = F, sdev = pca$sdev, centers = c_means)
+}
+
+#' @export
+me_residualize_returns <- function(R_window, pca_fit) {
+    # Reconstruct and subtract in raw space
+    R_centered <- scale(R_window, center = pca_fit$centers, scale = FALSE)
+
+    # Systematic = F %*% t(B)
+    Sys <- pca_fit$F %*% t(pca_fit$B)
+
+    E <- R_centered - Sys
+    dimnames(E) <- dimnames(R_window)
+    E
+}
+
+#' @export
+me_fit_residual_cov <- function(E_window, spec_resid) {
+    me_require(c("glasso", "Matrix"))
+
+    Sigma_eps <- cov(E_window, use = "pairwise.complete.obs")
+    lambda <- spec_resid$lambda %||% 0.1
+    precision <- NULL
+
+    if (isTRUE(spec_resid$use_glasso)) {
+        # Fail loud if it somehow bypassed require
+        gl <- glasso::glasso(Sigma_eps, rho = lambda)
+        Sigma_eps <- gl$w
+        precision <- gl$wi
+        dimnames(Sigma_eps) <- dimnames(precision) <- dimnames(cov(E_window))
+    } else {
+        diag(Sigma_eps) <- diag(Sigma_eps) + lambda * mean(diag(Sigma_eps), na.rm = TRUE)
+    }
+
+    list(sigma_eps = Sigma_eps, precision = precision)
+}
+
+#' @export
+me_factor_cov <- function(F_window, spec_factor_cov) {
+    sigma_f <- cov(F_window, use = "pairwise.complete.obs")
+    list(sigma_f = sigma_f)
+}
+
+#' @export
+me_assemble_total_cov <- function(pca_fit, Sigma_f, Sigma_eps) {
+    B <- pca_fit$B
+    Sigma_total <- B %*% Sigma_f %*% t(B) + Sigma_eps
+    dimnames(Sigma_total) <- dimnames(Sigma_eps)
+    Sigma_total
+}
+
+#' @export
+me_cov_sanity <- function(Sigma, repair = TRUE) {
+    me_require("Matrix")
+    repaired <- FALSE
+    if (!isSymmetric(Sigma)) {
+        Sigma <- (Sigma + t(Sigma)) / 2
+        repaired <- TRUE
+    }
+
+    eig <- eigen(Sigma, symmetric = TRUE, only.values = TRUE)$values
+    if (any(eig <= 0) || any(is.na(eig))) {
+        if (repair) {
+            Sigma <- as.matrix(Matrix::nearPD(Sigma, corr = FALSE, ensureSymmetry = TRUE)$mat)
+            repaired <- TRUE
+        }
+    }
+    list(is_valid = !any(eigen(Sigma)$values <= 0), repaired = repaired, Sigma = Sigma)
+}
+
+.inv_var_alloc <- function(cov_mat) {
+    v <- diag(cov_mat)
+    v[v <= 1e-8] <- 1e-8
+    w <- 1 / v
+    w / sum(w)
+}
+
+.get_cluster_var <- function(cov_mat, c_ix) {
+    cov_slice <- cov_mat[c_ix, c_ix, drop = FALSE]
+    w <- .inv_var_alloc(cov_slice)
+    v <- sum(w * (cov_slice %*% w))
+    if (v <= 0) v <- 1e-8
+    v
+}
+
+.get_rec_bipart <- function(cov_mat, sort_ix) {
+    w <- rep(1, length(sort_ix))
+    names(w) <- colnames(cov_mat)[sort_ix]
+
+    clusters <- list(sort_ix)
+    while (length(clusters) > 0) {
+        c_ix <- clusters[[1]]
+        clusters <- clusters[-1]
+
+        if (length(c_ix) > 1) {
+            split_idx <- floor(length(c_ix) / 2)
+            c1 <- c_ix[1:split_idx]
+            c2 <- c_ix[(split_idx + 1):length(c_ix)]
+
+            v1 <- .get_cluster_var(cov_mat, c1)
+            v2 <- .get_cluster_var(cov_mat, c2)
+
+            alpha <- 1 - v1 / (v1 + v2)
+            w[c1] <- w[c1] * alpha
+            w[c2] <- w[c2] * (1 - alpha)
+
+            clusters <- append(clusters, list(c1, c2))
+        }
+    }
+    return(w)
+}
+
+#' @export
+me_allocate_hrp <- function(Sigma, spec_hrp) {
+    n <- ncol(Sigma)
+    if (n == 0) {
+        return(numeric(0))
+    }
+    if (n == 1) {
+        w <- 1.0
+        names(w) <- colnames(Sigma)
+        return(w)
+    }
+
+    s <- sqrt(diag(Sigma))
+    s[s == 0] <- 1e-8
+    R <- Sigma / (s %o% s)
+    R[R > 1] <- 1
+    R[R < -1] <- -1
+
+    dist_mat <- sqrt(0.5 * (1 - R))
+    dist_mat[is.na(dist_mat)] <- 0
+
+    hc <- tryCatch(hclust(as.dist(dist_mat), method = "single"), error = function(e) NULL)
+    if (is.null(hc)) {
+        # fallback to inverse variance if hclust fails
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        return(w)
+    }
+
+    sort_ix <- hc$order
+    w_hrp <- .get_rec_bipart(Sigma, sort_ix)
+    w_hrp[colnames(Sigma)]
+}
+
+#' @export
+me_run_risk_engine <- function(R_window, spec_risk) {
+    # Drop assets with insufficient data (e.g. any NAs inside the required window)
+    keep_assets <- colSums(is.na(R_window)) == 0
+    R_clean <- R_window[, keep_assets, drop = FALSE]
+
+    if (ncol(R_clean) < 2) {
+        stop("Risk engine needs >= 2 assets without missing data in risk lookback.")
+    }
+
+    vols <- me_estimate_vol(R_clean, spec_risk$vol)
+    pca_fit <- me_fit_pca_factor(R_clean, spec_risk$pca)
+    E <- me_residualize_returns(R_clean, pca_fit)
+    resid_res <- me_fit_residual_cov(E, spec_risk$resid)
+    Sigma_eps <- resid_res$sigma_eps
+    fac_res <- me_factor_cov(pca_fit$F, spec_risk$factor)
+    Sigma_f <- fac_res$sigma_f
+
+    Sigma_total <- me_assemble_total_cov(pca_fit, Sigma_f, Sigma_eps)
+    sanity <- me_cov_sanity(Sigma_total, repair = TRUE)
+    Sigma_repaired <- sanity$Sigma
+
+    w_hrp <- me_allocate_hrp(Sigma_repaired, spec_risk$hrp)
+
+    list(
+        sigma_t = vols,
+        Sigma_total = Sigma_repaired,
+        w_hrp = w_hrp,
+        diag = list(
+            was_repaired = sanity$repaired,
+            kept_assets = colnames(R_clean),
+            dropped_assets = setdiff(colnames(R_window), colnames(R_clean))
+        )
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/03_signal_engine.R
+###############################################################################
+#' @title Signal Engine
+#' @description Implement trend experts and score normalization in one place.
+
+.tanh_scale <- function(x, scale = 1.0) {
+  tanh(x / scale)
+}
+
+#' @export
+me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
+  # 2-state Kalman filter (Level and Slope)
+  # State x_t = [l_t, b_t]'
+  # l_t = l_{t-1} + b_{t-1} + w_{l,t}
+  # b_t = b_{t-1} + w_{b,t}
+  # y_t = l_t + v_t
+
+  n_assets <- ncol(prices_window)
+  T <- nrow(prices_window)
+  scores <- rep(0, n_assets)
+  names(scores) <- colnames(prices_window)
+
+  if (T < 10) {
+    return(scores)
+  }
+
+  q_var <- spec_kalman$q_var %||% 1e-4
+  r_var <- spec_kalman$r_var %||% 1e-2
+
+  # Transition Matrix
+  F_mat <- matrix(c(1, 0, 1, 1), nrow = 2, byrow = TRUE)
+
+  # Observation Matrix
+  H_mat <- matrix(c(1, 0), nrow = 1)
+
+  for (j in seq_len(n_assets)) {
+    y <- log(prices_window[, j]) # Use log-prices
+    valid <- !is.na(y)
+    if (sum(valid) < 10) next
+    y <- y[valid]
+
+    # Init state
+    x_hat <- matrix(c(y[1], 0), nrow = 2)
+    P <- diag(c(1, 1))
+
+    # Process Noise
+    Q <- diag(c(q_var, q_var))
+    # Obs Noise
+    R <- r_var
+
+    for (i in 2:length(y)) {
+      # Predict
+      x_pred <- F_mat %*% x_hat
+      P_pred <- F_mat %*% P %*% t(F_mat) + Q
+
+      # Update
+      err <- y[i] - (H_mat %*% x_pred)[1, 1]
+      S <- (H_mat %*% P_pred %*% t(H_mat))[1, 1] + R
+      K <- P_pred %*% t(H_mat) / S
+
+      x_hat <- x_pred + K * err
+      P <- (diag(2) - K %*% H_mat) %*% P_pred
+    }
+
+    # Extract final slope estimate
+    slope <- x_hat[2, 1]
+
+    # Convert slope to daily return scale conceptually, then scale by asset vol
+    # vol is annualized. To normalize, compare annualized slope to annual vol
+    slope_ann <- slope * 252
+    vol_j <- sigma_t[names(sigma_t) == colnames(prices_window)[j]] %||% 0.2
+    if (vol_j == 0) vol_j <- 0.2
+
+    scores[j] <- slope_ann / vol_j
+  }
+
+  .tanh_scale(scores, spec_kalman$scale %||% 1.0)
+}
+
+#' @export
+me_signal_tsmom <- function(R_window, sigma_t, spec_tsmom) {
+  h <- spec_tsmom$horizon %||% 252
+  h <- min(h, nrow(R_window))
+
+  if (h < 5) {
+    return(rep(0, ncol(R_window)))
+  }
+
+  ret_cum <- apply(tail(R_window, h), 2, sum, na.rm = TRUE)
+
+  scores_raw <- ret_cum / (sigma_t * sqrt(h / 252))
+  scores_raw[is.na(scores_raw) | is.infinite(scores_raw)] <- 0
+
+  .tanh_scale(scores_raw, spec_tsmom$scale %||% 2.0)
+}
+
+#' @export
+me_align_signal_vectors <- function(...) {
+  lst <- list(...)
+  syms <- unique(unlist(lapply(lst, names)))
+
+  aligned <- lapply(lst, function(v) {
+    res <- rep(0, length(syms))
+    names(res) <- syms
+    idx <- intersect(names(v), syms)
+    res[idx] <- v[idx]
+    res
+  })
+  aligned
+}
+
+#' @export
+me_run_signal_engine <- function(prices_window, R_window, sigma_t, spec_signals) {
+  kalman_scores <- me_signal_kalman(prices_window, sigma_t, spec_signals$kalman)
+  tsmom_scores <- me_signal_tsmom(R_window, sigma_t, spec_signals$tsmom)
+
+  aligned <- me_align_signal_vectors(kalman = kalman_scores, tsmom = tsmom_scores)
+
+  list(
+    kalman = aligned$kalman, tsmom = aligned$tsmom,
+    diag = list(
+      kalman_coverage = sum(aligned$kalman != 0),
+      tsmom_coverage = sum(aligned$tsmom != 0)
+    )
+  )
+}
+
+
+
+###############################################################################
+### FILE: R/04_state_and_gating.R
+###############################################################################
+#' @title State and Gating
+#' @description Compute market-state features and map them to expert trust and cash mass.
+
+#' @export
+me_state_dispersion <- function(r_t) {
+    if (length(r_t) < 2) {
+        return(0)
+    }
+    sd(r_t, na.rm = TRUE)
+}
+
+#' @export
+me_state_mode_dominance <- function(R_state_window) {
+    if (nrow(R_state_window) < 10) {
+        return(0.5)
+    }
+    keep <- colSums(is.na(R_state_window)) == 0
+    R_clean <- R_state_window[, keep, drop = FALSE]
+
+    if (ncol(R_clean) < 2) {
+        return(0.5)
+    }
+
+    pca <- tryCatch(prcomp(R_clean, center = TRUE, scale. = TRUE), error = function(e) NULL)
+    if (is.null(pca)) {
+        return(0.5)
+    }
+
+    vars <- pca$sdev^2
+    vars[1] / sum(vars)
+}
+
+#' @export
+me_state_vov <- function(R_hist) {
+    if (nrow(R_hist) < 20) {
+        return(0)
+    }
+    keep <- colSums(is.na(R_hist)) == 0
+    R_clean <- R_hist[, keep, drop = FALSE]
+    if (ncol(R_clean) == 0) {
+        return(0)
+    }
+
+    roll_vols <- apply(R_clean, 1, function(x) sd(x, na.rm = TRUE))
+    v <- sd(roll_vols, na.rm = TRUE) / (mean(roll_vols, na.rm = TRUE) + 1e-6)
+    if (is.na(v)) {
+        return(0)
+    }
+    v
+}
+
+#' @export
+me_build_market_state <- function(R_disp, R_eta, R_vov) {
+    r_t <- tail(R_disp, 1)[1, ]
+    c(
+        disp = me_state_dispersion(r_t),
+        eta = me_state_mode_dominance(R_eta),
+        VoV = me_state_vov(R_vov)
+    )
+}
+
+#' @export
+me_gating_softmax_linear <- function(m_t, spec_gating) {
+    w0 <- spec_gating$w0 %||% c(kalman = 0, tsmom = 0, cash = -1)
+
+    if (is.null(spec_gating$W)) {
+        logits <- w0
+    } else {
+        logits <- w0 + as.vector(spec_gating$W %*% m_t)
+        names(logits) <- names(w0)
+    }
+
+    exp_logits <- exp(logits - max(logits))
+    probs <- exp_logits / sum(exp_logits)
+
+    list(
+        w_kalman = probs["kalman"],
+        w_tsmom = probs["tsmom"],
+        w_cash = probs["cash"],
+        gross_exposure = 1.0 - probs["cash"],
+        logits = logits
+    )
+}
+
+#' @export
+me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_gating) {
+    m_t <- me_build_market_state(R_disp, R_eta, R_vov)
+    gating <- me_gating_softmax_linear(m_t, spec_gating)
+
+    list(market_state = m_t, gating = gating)
+}
+
+
+
+###############################################################################
+### FILE: R/05_portfolio_constructor.R
+###############################################################################
+#' @title Portfolio Constructor
+#' @description Convert risk baseline + signals + gating into target weights.
+
+#' @export
+me_combine_expert_scores <- function(signal_artifact, gating_artifact, spec_portfolio) {
+    wk <- gating_artifact$w_kalman
+    wm <- gating_artifact$w_tsmom
+
+    w_tot <- wk + wm
+    if (w_tot == 0) {
+        v <- signal_artifact$kalman * 0
+        names(v) <- names(signal_artifact$kalman)
+        return(v)
+    }
+
+    wk <- wk / w_tot
+    wm <- wm / w_tot
+
+    S_t <- (wk * signal_artifact$kalman) + (wm * signal_artifact$tsmom)
+    S_t
+}
+
+#' @export
+me_score_to_tilt <- function(S_t, spec_tilt) {
+    max_tilt <- spec_tilt$max_tilt %||% 2.0
+    mult <- exp(S_t * log(max_tilt))
+    mult
+}
+
+#' @export
+me_apply_tilt_to_baseline <- function(w_hrp, tilt_mult, spec_portfolio) {
+    # Align vectors
+    mult_align <- rep(1.0, length(w_hrp))
+    names(mult_align) <- names(w_hrp)
+    found <- intersect(names(tilt_mult), names(w_hrp))
+    mult_align[found] <- tilt_mult[found]
+
+    w <- w_hrp * mult_align
+    if (sum(w) > 0) w / sum(w) else w_hrp
+}
+
+#' @export
+me_apply_weight_caps <- function(w, spec_caps) {
+    cap <- spec_caps$max_weight %||% 0.15
+    if (cap >= 1.0) {
+        return(w)
+    }
+
+    if (length(w) * cap < 1.0) {
+        # Cannot cap if mathematically impossible to sum to 1
+        return(w)
+    }
+
+    # Iterative proportional redistribution
+    for (iter in 1:100) {
+        if (all(w <= cap + 1e-6)) break
+
+        cap_idx <- w > cap
+        excess <- sum(w[cap_idx] - cap)
+        w[cap_idx] <- cap
+
+        uncapped_idx <- w < cap
+        if (sum(uncapped_idx) == 0) break
+
+        # Redistribute proportionally to uncapped weights
+        w_un <- w[uncapped_idx]
+        if (sum(w_un) > 0) {
+            w[uncapped_idx] <- w_un + excess * (w_un / sum(w_un))
+        } else {
+            w[uncapped_idx] <- w_un + excess / length(w_un)
+        }
+    }
+    w / sum(w)
+}
+
+#' @export
+me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gating_artifact, spec_portfolio, prev_target = NULL) {
+    g_t <- state_gating_artifact$gating$gross_exposure
+    w_hrp <- risk_artifact$w_hrp
+
+    S_t <- me_combine_expert_scores(signal_artifact, state_gating_artifact$gating, spec_portfolio)
+    tilt_mult <- me_score_to_tilt(S_t, spec_portfolio$tilt)
+
+    w_tilted <- me_apply_tilt_to_baseline(w_hrp, tilt_mult, spec_portfolio)
+    w_capped <- me_apply_weight_caps(w_tilted, spec_portfolio$caps)
+
+    w_final_risky <- g_t * w_capped
+    w_cash <- 1 - g_t
+
+    w_final_risky[w_final_risky < 1e-4] <- 0
+
+    tgt_table <- data.frame(
+        symbol = names(w_final_risky),
+        weight_target = unname(w_final_risky),
+        stringsAsFactors = FALSE
+    )
+
+    tgt_table <- tgt_table[tgt_table$weight_target > 0, ]
+
+    list(
+        target_weights = tgt_table,
+        cash_weight = w_cash,
+        diag = list(
+            cap_hits = sum(w_capped >= (spec_portfolio$caps$max_weight %||% 1) - 1e-4),
+            pre_cap_sum = sum(w_tilted),
+            post_cap_sum = sum(w_capped),
+            gross_exposure = g_t
+        )
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/06_snapshot_runner.R
+###############################################################################
+#' @title Snapshot Runner
+#' @description Orchestrate the full one-date modeling pipeline.
+
+#' @export
+me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_target = NULL, aux = list()) {
+    spec <- me_get_spec(spec)
+    adapter <- me_make_data_adapter(data_bundle_or_panel, aux)
+
+    cal <- adapter$calendar()
+    if (!(as_of_date %in% cal)) {
+        past_dates <- cal[cal <= as_of_date]
+        if (length(past_dates) == 0) stop("No data before as_of_date")
+        as_of_date <- max(past_dates)
+    }
+
+    syms <- adapter$investability_snapshot(as_of_date, spec$data)
+    if (length(syms) == 0) {
+        res_empty <- list(
+            as_of_date = as_of_date,
+            tradable_symbols = character(0),
+            target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+            cash_weight = 1.0,
+            risk = list(), signals = list(), market_state = list(), gating = list(), portfolio_diag = list(),
+            meta = list(), warnings = character(0)
+        )
+        me_validate_snapshot_artifact(res_empty)
+        return(res_empty)
+    }
+
+    # Module specific lookbacks
+    lkb_kalman <- spec$signals$kalman$lookback %||% 252L
+    lkb_tsmom <- spec$signals$tsmom$horizon %||% 252L
+    lkb_risk <- max(spec$risk$vol$lookback %||% 252L, spec$risk$pca$lookback %||% 252L)
+    lkb_disp <- spec$market_state$dispersion$lookback %||% 1L
+    lkb_eta <- spec$market_state$eta$lookback %||% 63L
+    lkb_vov <- spec$market_state$vov$lookback %||% 126L
+
+    warns <- character(0)
+
+    max_lkb <- max(lkb_kalman, lkb_tsmom, lkb_risk, lkb_disp, lkb_eta, lkb_vov) + 1
+    prices_max <- adapter$price_matrix(as_of_date, lookback = max_lkb, symbols = syms, strict = FALSE)
+    ret_max <- adapter$returns_matrix(as_of_date, lookback = max_lkb - 1, symbols = syms, strict = FALSE)
+
+    avail <- nrow(ret_max)
+    if (avail < max_lkb - 1) {
+        warns <- c(warns, sprintf("Global history (%d) is less than max requested lookback (%d)", avail, max_lkb - 1))
+    }
+
+    .slice_mat <- function(mat, n) {
+        if (nrow(mat) < n) {
+            return(mat)
+        }
+        tail(mat, n)
+    }
+
+    R_risk <- .slice_mat(ret_max, lkb_risk)
+    P_kalman <- .slice_mat(prices_max, lkb_kalman)
+    R_tsmom <- .slice_mat(ret_max, lkb_tsmom)
+    R_disp <- .slice_mat(ret_max, lkb_disp)
+    R_eta <- .slice_mat(ret_max, lkb_eta)
+    R_vov <- .slice_mat(ret_max, lkb_vov)
+
+    # Execute
+    risk_artifact <- tryCatch(me_run_risk_engine(R_risk, spec$risk), error = function(e) {
+        warns <<- c(warns, paste("Risk engine failed:", e$message))
+        NULL
+    })
+
+    if (is.null(risk_artifact)) {
+        res_err <- list(
+            as_of_date = as_of_date,
+            tradable_symbols = syms,
+            target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+            cash_weight = 1.0,
+            risk = list(), signals = list(), market_state = list(), gating = list(), portfolio_diag = list(),
+            meta = list(), warnings = c(warns, "Reverting to cash position")
+        )
+        me_validate_snapshot_artifact(res_err)
+        return(res_err)
+    }
+
+    sigma_t <- risk_artifact$sigma_t
+
+    signal_artifact <- me_run_signal_engine(P_kalman, R_tsmom, sigma_t, spec$signals)
+
+    state_gating_artifact <- me_run_state_and_gating(R_disp, R_eta, R_vov, risk_artifact, spec$gating)
+
+    port_artifact <- me_build_portfolio_target(risk_artifact, signal_artifact, state_gating_artifact, spec$portfolio, prev_target)
+
+    res <- list(
+        as_of_date = as_of_date,
+        tradable_symbols = syms,
+        target_weights = port_artifact$target_weights,
+        cash_weight = port_artifact$cash_weight,
+        risk = risk_artifact,
+        signals = signal_artifact,
+        market_state = state_gating_artifact$market_state,
+        gating = state_gating_artifact$gating,
+        portfolio_diag = port_artifact$diag,
+        meta = list(),
+        warnings = warns
+    )
+
+    me_validate_snapshot_artifact(res)
+    res
+}
+
+
+
