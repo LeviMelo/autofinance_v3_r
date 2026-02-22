@@ -25,14 +25,21 @@ de_weekdays_only <- function(dates) {
 }
 
 de_make_bizdays_seq <- function(start_date, end_date, cal = "Brazil/B3") {
+  de_require("bizdays")
+  
   start_date <- as.Date(start_date)
   end_date   <- as.Date(end_date)
   
-  if (requireNamespace("bizdays", quietly = TRUE)) {
-    out <- tryCatch(bizdays::bizseq(start_date, end_date, cal), error = function(e) NULL)
-    if (!is.null(out) && length(out)) return(as.Date(out))
-  }
+  out <- tryCatch(
+    bizdays::bizseq(start_date, end_date, cal),
+    error = function(e) {
+      stop(
+        "bizdays::bizseq failed for calendar '", cal, "': ",
+        conditionMessage(e),
+        call. = FALSE
+      )
+    }
+  )
   
-  d <- seq.Date(start_date, end_date, by = "day")
-  d[de_weekdays_only(d)]
+  as.Date(out)
 }

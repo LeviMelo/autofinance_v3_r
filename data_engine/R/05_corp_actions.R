@@ -1,30 +1,48 @@
 # /data_engine/R/05_corp_actions.R
 
 de_select_ca_candidates <- function(universe_raw, cfg, force_symbols = NULL) {
-  dt <- data.table::as.data.table(universe_raw)
+  de_require("data.table")
+  
+  # Work on a projected copy to avoid mutating/reordering upstream universe_raw
+  dt <- data.table::copy(
+    data.table::as.data.table(universe_raw)[, .(symbol, asset_type, refdate, turnover, close)]
+  )
+  
+  if (!nrow(dt)) {
+    force_symbols <- unique(toupper(trimws(as.character(force_symbols))))
+    force_symbols <- force_symbols[!is.na(force_symbols) & nzchar(force_symbols)]
+    audit_dt <- data.table::data.table(symbol = force_symbols)
+    audit_dt[, `:=`(
+      is_candidate = TRUE,
+      is_forced = TRUE,
+      has_positive_jump = FALSE,
+      has_negative_gap = FALSE
+    )]
+    return(list(candidates = force_symbols, prefilter_audit = audit_dt))
+  }
+  
   end_date <- max(dt$refdate, na.rm = TRUE)
   liq_start <- end_date - ceiling(cfg$ca_prefilter_liq_window_days * 1.6)
   
-  # 1) Calculate Candidate Universe (Strictly Modeling-Eligible names)
   dt_liq <- dt[refdate >= liq_start & refdate <= end_date]
-  
-  # FIX: Calculate ratio based on total unique market days in the window, not row count
   total_market_days <- length(unique(dt_liq$refdate))
-  if (total_market_days == 0) total_market_days <- 1 
+  if (total_market_days == 0) total_market_days <- 1L
   
   stats_liq <- dt_liq[, .(
     med_turnover = stats::median(turnover, na.rm = TRUE),
     days_ratio = .N / total_market_days
   ), by = .(symbol, asset_type)]
   
-  candidates <- stats_liq[med_turnover >= cfg$min_turnover & days_ratio >= cfg$min_days_traded_ratio]$symbol
+  candidates <- stats_liq[
+    med_turnover >= cfg$min_turnover & days_ratio >= cfg$min_days_traded_ratio,
+    unique(symbol)
+  ]
   
-  # FIX: Handle force_symbols inside the function so the audit table knows about them
   force_symbols <- unique(toupper(trimws(as.character(force_symbols))))
   force_symbols <- force_symbols[!is.na(force_symbols) & nzchar(force_symbols)]
   candidates <- unique(c(candidates, force_symbols))
   
-  # 2) Calculate Diagnostic Prefilter Audit (Gap tracking)
+  # Diagnostic prefilter audit (gap tracking)
   data.table::setorder(dt, symbol, refdate)
   dt[, close_lag := data.table::shift(close, 1L), by = symbol]
   dt[, log_ret := data.table::fifelse(close > 0 & close_lag > 0, log(close / close_lag), NA_real_)]
@@ -34,19 +52,19 @@ de_select_ca_candidates <- function(universe_raw, cfg, force_symbols = NULL) {
     asset_type = c("equity", "fii", "etf", "bdr"),
     thr = c(cfg$ca_prefilter_gap_equity, cfg$ca_prefilter_gap_fii, cfg$ca_prefilter_gap_etf, cfg$ca_prefilter_gap_bdr)
   )
-  dt <- merge(dt, thr_map, by = "asset_type", all.x = TRUE)
+  dt <- merge(dt, thr_map, by = "asset_type", all.x = TRUE, sort = FALSE)
   
   jump_pos <- dt[is.finite(log_ret) & log_ret >= cfg$ca_prefilter_jump_log_thr, unique(symbol)]
   jump_neg <- dt[is.finite(ret_1d) & is.finite(thr) & ret_1d <= thr, unique(symbol)]
   
-  # FIX: Ensure forced symbols that aren't in the universe still appear in the audit
   all_audit_syms <- unique(c(dt$symbol, force_symbols))
-  
   audit_dt <- data.table::data.table(symbol = all_audit_syms)
   audit_dt[, is_candidate := symbol %in% candidates]
   audit_dt[, is_forced := symbol %in% force_symbols]
   audit_dt[, has_positive_jump := symbol %in% jump_pos]
   audit_dt[, has_negative_gap := symbol %in% jump_neg]
+  
+  data.table::setorder(audit_dt, symbol)
   
   list(
     candidates = unique(candidates[!is.na(candidates) & nzchar(candidates)]),
@@ -57,44 +75,90 @@ de_select_ca_candidates <- function(universe_raw, cfg, force_symbols = NULL) {
 de_build_ca_registry <- function(symbols, from, to, cfg) {
   de_require("data.table")
   
-  # FIX: Only require 'digest' if we are actually using a cache mode
+  empty_ca_tbl <- function() {
+    data.table::data.table(
+      symbol = character(),
+      yahoo_symbol = character(),
+      refdate = as.Date(character()),
+      action_type = character(),
+      value = numeric(),
+      source = character()
+    )
+  }
+  
+  required_cols <- de_contracts$corp_actions_raw
+  
+  normalize_ca_tbl <- function(x) {
+    x <- data.table::as.data.table(x)
+    de_validate_contract(x, "corp_actions_raw")
+    # Drop extra columns from stale caches (e.g., accidental row_id leakage)
+    x <- x[, ..required_cols]
+    data.table::setcolorder(x, required_cols)
+    x
+  }
+  
+  # Sanitize symbols
+  symbols <- unique(toupper(trimws(as.character(symbols))))
+  symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+  if (!length(symbols)) return(empty_ca_tbl())
+  
   if (cfg$ca_cache_mode %in% c("batch", "by_symbol")) {
     de_require("digest")
-    hash_payload <- list(syms=sort(symbols), from=from, to=to, mode=cfg$ca_fetch_mode)
+    hash_payload <- list(syms = sort(symbols), from = as.Date(from), to = as.Date(to), mode = cfg$ca_fetch_mode)
     batch_hash <- digest::digest(hash_payload)
   }
   
   cache_dir_ca <- file.path(cfg$cache_dir, "corp_actions")
   if (!dir.exists(cache_dir_ca)) dir.create(cache_dir_ca, recursive = TRUE)
   
-  # Batch Cache mode check
+  # Batch cache check (validate before returning)
   if (cfg$ca_cache_mode == "batch") {
     batch_file <- file.path(cache_dir_ca, paste0("ca_batch_", batch_hash, ".rds"))
     if (file.exists(batch_file)) {
-      de_log("DE_CA:", "Loading from CA batch cache.")
-      return(readRDS(batch_file))
+      cached <- tryCatch(readRDS(batch_file), error = function(e) e)
+      if (!inherits(cached, "error")) {
+        norm <- tryCatch(normalize_ca_tbl(cached), error = function(e) e)
+        if (!inherits(norm, "error")) {
+          de_log("DE_CA:", "Loading from validated CA batch cache.")
+          return(norm)
+        } else {
+          de_log("DE_CA:", "Batch cache invalid/corrupt. Rebuilding.")
+        }
+      } else {
+        de_log("DE_CA:", "Batch cache unreadable. Rebuilding.")
+      }
     }
   }
-
-  map_dt <- data.table::data.table(symbol = symbols, yahoo_symbol = vapply(symbols, de_yahoo_symbol, ""))
-  map_dt <- map_dt[!is.na(yahoo_symbol)]
   
-  res_list <- list()
+  map_dt <- data.table::data.table(symbol = symbols, yahoo_symbol = vapply(symbols, de_yahoo_symbol, ""))
+  map_dt <- map_dt[!is.na(yahoo_symbol) & nzchar(yahoo_symbol)]
+  res_list <- vector("list", nrow(map_dt))
+  
   for (i in seq_len(nrow(map_dt))) {
     sym <- map_dt$symbol[i]
     ysym <- map_dt$yahoo_symbol[i]
     
-    # By-Symbol Cache check
     if (cfg$ca_cache_mode == "by_symbol") {
-      sym_hash <- digest::digest(list(sym=sym, from=from, to=to, mode=cfg$ca_fetch_mode))
+      sym_hash <- digest::digest(list(sym = sym, from = as.Date(from), to = as.Date(to), mode = cfg$ca_fetch_mode))
       sym_file <- file.path(cache_dir_ca, paste0("sym_", sym, "_", sym_hash, ".rds"))
+      
       if (file.exists(sym_file)) {
-        res_list[[i]] <- readRDS(sym_file)
-        next
+        cached <- tryCatch(readRDS(sym_file), error = function(e) e)
+        if (!inherits(cached, "error")) {
+          norm <- tryCatch(normalize_ca_tbl(cached), error = function(e) e)
+          if (!inherits(norm, "error")) {
+            res_list[[i]] <- norm
+            next
+          } else {
+            de_log("DE_CA:", "Invalid symbol cache for ", sym, "; refetching.")
+          }
+        } else {
+          de_log("DE_CA:", "Unreadable symbol cache for ", sym, "; refetching.")
+        }
       }
     }
     
-    # Fetch
+    # Fetch vendor data
     if (cfg$ca_fetch_mode == "chart") {
       out <- de_yahoo_fetch_chart_events_one(ysym, from, to)
     } else {
@@ -103,21 +167,28 @@ de_build_ca_registry <- function(symbols, from, to, cfg) {
       out <- data.table::rbindlist(list(dt_s, dt_d), fill = TRUE)
     }
     
-    if (!is.null(out) && nrow(out)) {
+    # Safe empty caching (0-row typed schema)
+    if (is.null(out) || !nrow(out)) {
+      out <- empty_ca_tbl()
+      attr(out, "cached_empty_symbol") <- sym
+      attr(out, "cached_empty_yahoo_symbol") <- ysym
+    } else {
       out[, symbol := sym]
-      if (cfg$ca_cache_mode == "by_symbol") saveRDS(out, sym_file)
-      res_list[[i]] <- out
+      out[, source := "yahoo"]
+      out <- out[, ..required_cols]
+      out <- normalize_ca_tbl(out)
     }
+    
+    if (cfg$ca_cache_mode == "by_symbol") saveRDS(out, sym_file)
+    res_list[[i]] <- out
   }
   
   dt <- data.table::rbindlist(res_list, fill = TRUE)
-  if (!nrow(dt)) dt <- data.table::data.table(symbol=character(), yahoo_symbol=character(), refdate=as.Date(character()), action_type=character(), value=numeric(), source=character())
-  else dt[, source := "yahoo"]
+  if (!nrow(dt)) dt <- empty_ca_tbl()
+  dt <- normalize_ca_tbl(dt)
   
-  de_validate_contract(dt, "corp_actions_raw")
-  
-  # Save batch cache if applicable
-  if (cfg$ca_cache_mode == "batch" && nrow(dt)) {
+  # Save batch cache (even empty, to prevent refetch storms)
+  if (cfg$ca_cache_mode == "batch") {
     batch_file <- file.path(cache_dir_ca, paste0("ca_batch_", batch_hash, ".rds"))
     saveRDS(dt, batch_file)
   }
@@ -126,9 +197,18 @@ de_build_ca_registry <- function(symbols, from, to, cfg) {
 }
 
 de_fix_yahoo_splits_by_raw_gap <- function(corp_actions_raw, universe_raw, cfg) {
-  sp <- data.table::as.data.table(corp_actions_raw)
-  dt <- data.table::as.data.table(universe_raw)
-  if (!nrow(sp)) return(list(corp_actions_apply = sp, split_audit = data.table::data.table(), quarantine = data.table::data.table()))
+  sp0 <- data.table::as.data.table(corp_actions_raw)
+  if (!nrow(sp0)) {
+    return(list(
+      corp_actions_apply = sp0,
+      split_audit = data.table::data.table(),
+      quarantine = data.table::data.table()
+    ))
+  }
+  
+  # Work on projected copies to avoid mutating caller objects (row_id / close_lag leakage)
+  sp <- data.table::copy(sp0[, .(symbol, yahoo_symbol, refdate, action_type, value, source)])
+  dt <- data.table::copy(data.table::as.data.table(universe_raw)[, .(symbol, refdate, open, close)])
   
   sp[, row_id := .I]
   to_val <- sp[action_type == "split" & source == "yahoo" & is.finite(value) & value > 0]
@@ -188,7 +268,6 @@ de_fix_yahoo_splits_by_raw_gap <- function(corp_actions_raw, universe_raw, cfg) 
 de_build_events <- function(corp_actions_apply, manual_events = NULL, cfg) {
   dt <- data.table::as.data.table(corp_actions_apply)
   
-  # Honor cfg$enable_manual_events
   if (cfg$enable_manual_events && !is.null(manual_events)) {
     me <- data.table::as.data.table(manual_events)
     if (!"source" %in% names(me)) me[, source := "manual"]

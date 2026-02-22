@@ -54,6 +54,7 @@ de_yahoo_with_retry <- function(fun, max_tries = 4L, base_sleep = 1.5, verbose =
 }
 
 de_yahoo_fetch_chart_events_one <- function(yahoo_symbol, from, to, verbose = FALSE) {
+  if (!requireNamespace("data.table", quietly = TRUE)) stop("data.table required")
   empty_dt <- data.table::data.table(yahoo_symbol = character(), refdate = as.Date(character()), action_type = character(), value = numeric(), source = character())
   if (is.na(yahoo_symbol)) return(empty_dt)
   
@@ -75,9 +76,11 @@ de_yahoo_fetch_chart_events_one <- function(yahoo_symbol, from, to, verbose = FA
   }
   
   js <- de_yahoo_with_retry(fetch_once, max_tries = 4L)
-  if (is.null(js) || is.null(js$chart$result[[1]]$events)) return(empty_dt)
+  if (is.null(js) || !is.list(js)) return(empty_dt)
   
-  ev <- js$chart$result[[1]]$events
+  res1 <- tryCatch(js$chart$result[[1]], error = function(e) NULL)
+  ev <- tryCatch(res1$events, error = function(e) NULL)
+  if (is.null(ev)) return(empty_dt)
   out_list <- list()
   
   if (!is.null(ev$dividends)) {

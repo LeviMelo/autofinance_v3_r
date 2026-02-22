@@ -1,0 +1,32 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+data/autofinance.sqlite
+codebase_dump_autofinance_R.txt
+plans
+data
+.png
+diagnostics
+playground/_cache
+playground/_runs
+_runs
+
+# generated runs/caches (DO NOT COMMIT)
+playground/_runs/
+playground/**/_runs/
+playground/**/cache/
+playground/**/cvm_*_extracted/
+playground/**/unzip_*/
+
+# common big data artifacts (optional extra safety)
+*.csv
+*.parquet
+*.fst
+*.rds
+*.qs
+*.pper
+.Rproj.user/46DC9FEC/pcs/files-pane.pper
+.Rproj.user/46DC9FEC/pcs/source-pane.pper
+.Rproj.user/46DC9FEC/pcs/windowlayoutstate.pper
+data_engine/R/codebase_dump_R.txt
