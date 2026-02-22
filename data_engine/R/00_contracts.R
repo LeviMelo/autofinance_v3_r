@@ -47,6 +47,18 @@ de_enforce_types_and_domains <- function(dt, contract_name) {
     if (any(x$split_value <= 0, na.rm = TRUE)) stop("events_apply has invalid split_value <= 0")
     if (any(x$div_cash < 0, na.rm = TRUE)) stop("events_apply has invalid div_cash < 0")
   }
+  # Corporate actions enum/domain
+  if (all(c("action_type", "value") %in% names(x))) {
+    if (!all(x$action_type %in% c("dividend", "split"))) {
+      stop(contract_name, " has invalid action_type (allowed: dividend, split)")
+    }
+    
+    bad_split <- x$action_type == "split" & (!is.finite(x$value) | is.na(x$value) | x$value <= 0)
+    bad_div <- x$action_type == "dividend" & (!is.finite(x$value) | is.na(x$value) | x$value < 0)
+    
+    if (any(bad_split, na.rm = TRUE)) stop(contract_name, " has invalid split value(s) <= 0 / non-finite")
+    if (any(bad_div, na.rm = TRUE)) stop(contract_name, " has invalid dividend value(s) < 0 / non-finite")
+  }
   invisible(TRUE)
 }
 

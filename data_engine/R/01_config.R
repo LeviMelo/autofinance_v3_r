@@ -21,7 +21,11 @@ de_config_default <- function() {
     ca_prefilter_gap_bdr    = -0.20,
     
     ca_fetch_mode = "chart", 
-    ca_cache_mode = "batch", 
+    # CA cache behavior:
+    # - "batch": cache one validated CA table for the exact (symbols, from, to, fetch_mode) request hash
+    # - "by_symbol": debug/inspection mode; caches per-symbol exact-window payloads
+    # - "none": bypass CA cache (useful for debugging vendor fetch behavior)
+    ca_cache_mode = "batch",
     enable_manual_events = TRUE,
     
     enable_split_gap_validation = TRUE,
@@ -57,7 +61,7 @@ de_validate_config <- function(cfg) {
   
   # Enums
   if (length(cfg$ca_cache_mode) != 1 || !cfg$ca_cache_mode %in% c("batch", "by_symbol", "none")) {
-    stop("Invalid ca_cache_mode. Must be 'batch', 'by_symbol', or 'none'.")
+    stop("Invalid ca_cache_mode. Must be 'batch', 'by_symbol', or 'none' (debug).")
   }
   if (length(cfg$ca_fetch_mode) != 1 || !cfg$ca_fetch_mode %in% c("chart", "quantmod")) {
     stop("Invalid ca_fetch_mode. Must be 'chart' or 'quantmod'.")

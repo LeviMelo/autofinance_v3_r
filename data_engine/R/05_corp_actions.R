@@ -284,7 +284,19 @@ de_build_events <- function(corp_actions_apply, manual_events = NULL, cfg) {
   ev <- merge(sp, di, by=c("symbol", "refdate"), all = TRUE)
   ev[is.na(split_value), split_value := 1]
   ev[is.na(div_cash), div_cash := 0]
-  ev[, source_mask := data.table::fifelse(!is.na(mask_s) & !is.na(mask_d), paste0(mask_s, "+", mask_d), data.table::fifelse(!is.na(mask_s), mask_s, mask_d))]
+  ev[, source_mask := data.table::fifelse(
+    !is.na(mask_s) & !is.na(mask_d),
+    paste0(mask_s, "+", mask_d),
+    data.table::fifelse(!is.na(mask_s), mask_s, mask_d)
+  )]
+  
+  # Normalize duplicated source labels (e.g., "yahoo+yahoo" -> "yahoo")
+  ev[, source_mask := vapply(
+    strsplit(source_mask, "\\+", perl = TRUE),
+    function(z) paste(sort(unique(z[nzchar(z)])), collapse = "+"),
+    character(1)
+  )]
+  
   ev[, has_manual := grepl("manual", source_mask)]
   ev[, c("mask_s", "mask_d") := NULL]
   

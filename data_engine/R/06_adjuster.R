@@ -13,9 +13,15 @@ de_apply_adjustments <- function(universe_raw, events_apply, cfg) {
   if (nrow(ev)) data.table::setkey(ev, symbol, refdate)
   
   if (nrow(ev)) dt <- merge(dt, ev, by=c("symbol", "refdate"), all.x=TRUE)
-  if (!"split_value" %in% names(dt)) dt[, `:=`(split_value=1, div_cash=0, source_mask="none", has_manual=FALSE)]
+  if (!"split_value" %in% names(dt)) dt[, split_value := 1]
+  if (!"div_cash" %in% names(dt)) dt[, div_cash := 0]
+  if (!"source_mask" %in% names(dt)) dt[, source_mask := "none"]
+  if (!"has_manual" %in% names(dt)) dt[, has_manual := FALSE]
+
   dt[is.na(split_value), split_value := 1]
   dt[is.na(div_cash), div_cash := 0]
+  dt[is.na(source_mask) | !nzchar(source_mask), source_mask := "none"]
+  dt[is.na(has_manual), has_manual := FALSE]
   
   data.table::setorder(dt, symbol, refdate)
   
@@ -46,12 +52,23 @@ de_apply_adjustments <- function(universe_raw, events_apply, cfg) {
   }
   
   # Apply Div
-  bad_div <- is_div & (is.na(dt$close_prev) | dt$close_prev <= 0 | is.na(dt$div_cash_eff) | dt$div_cash_eff < 0 | dt$div_cash_eff >= dt$close_prev)
+  # Track boundary dividend rows separately (first visible row in truncated window)
+  dt[, row_in_symbol := seq_len(.N), by = symbol]
+  dt[, issue_div_boundary := FALSE]
+  
+  boundary_div <- is_div & dt$row_in_symbol == 1L & is.na(dt$close_prev)
+  if (any(boundary_div)) dt[boundary_div, issue_div_boundary := TRUE]
+  
+  bad_div <- is_div & !boundary_div & (
+    is.na(dt$close_prev) | dt$close_prev <= 0 |
+    is.na(dt$div_cash_eff) | dt$div_cash_eff < 0 |
+    dt$div_cash_eff >= dt$close_prev
+  )
   if (any(bad_div)) dt[bad_div, issue_div := TRUE]
   
-  good_div <- is_div & !bad_div
+  good_div <- is_div & !boundary_div & !bad_div
   if (any(good_div)) dt[good_div, div_factor_event := (close_prev - div_cash_eff) / close_prev]
-  
+    
   dt[, div_factor_cum := de_rev_cumprod_exclusive(div_factor_event), by = symbol]
   dt[, adj_factor_final := split_factor_cum * div_factor_cum]
   
@@ -63,7 +80,13 @@ de_apply_adjustments <- function(universe_raw, events_apply, cfg) {
   )]
   
   # Adjustments Timeline Audit
-  tl <- dt[, .(symbol, refdate, split_value, div_cash, div_cash_eff, split_factor_cum, div_factor_event, div_factor_cum, adj_factor_final, source_mask, has_manual, issue_div)]
+  tl <- dt[, .(
+    symbol, refdate, split_value, div_cash, div_cash_eff,
+    split_factor_cum, div_factor_event, div_factor_cum, adj_factor_final,
+    source_mask, has_manual, issue_div, issue_div_boundary
+  )]
+  dt[, row_in_symbol := NULL]
+  
   list(panel = dt, adjustments_timeline = tl)
 }
 
@@ -73,24 +96,39 @@ de_build_panel_adjusted <- function(universe_raw, events_apply, cfg) {
   tl <- res$adjustments_timeline
   
   # State Calculation
-  st <- tl[, .(has_split = any(split_value != 1), has_div = any(div_cash > 0), has_manual = any(has_manual), issue_div_any = any(issue_div)), by = symbol]
+  st <- tl[, .(
+    has_split = any(split_value != 1),
+    has_div = any(div_cash > 0),
+    has_manual = any(has_manual),
+    issue_div_any = any(issue_div)
+  ), by = symbol]
+
   st[, adjustment_state := "no_actions"]
   st[has_div & !has_split, adjustment_state := "dividend_only"]
   st[has_split & !has_div, adjustment_state := "split_only"]
   st[has_split & has_div, adjustment_state := "split_dividend"]
   st[has_manual == TRUE, adjustment_state := "manual_override"]
-  st[issue_div_any == TRUE, adjustment_state := "suspect_unresolved"]
-  
+
   # Jump Safety Net
   jump_audit <- dt[is.finite(close_adj_final) & close_adj_final > 0, {
     v <- abs(diff(log(close_adj_final)))
-    if (!length(v) || all(!is.finite(v))) .(residual_max_abs_logret = 0, residual_jump_date = as.Date(NA))
-    else .(residual_max_abs_logret = as.numeric(v[which.max(v)]), residual_jump_date = refdate[which.max(v) + 1L])
+    if (!length(v) || all(!is.finite(v))) {
+      .(residual_max_abs_logret = 0, residual_jump_date = as.Date(NA))
+    } else {
+      .(residual_max_abs_logret = as.numeric(v[which.max(v)]),
+        residual_jump_date = refdate[which.max(v) + 1L])
+    }
   }, by = symbol]
-  jump_audit[, residual_jump_flag := is.finite(residual_max_abs_logret) & residual_max_abs_logret >= cfg$adj_residual_jump_tol_log]
-  
+
+  jump_audit[, residual_jump_flag := is.finite(residual_max_abs_logret) &
+                                   residual_max_abs_logret >= cfg$adj_residual_jump_tol_log]
+
   st <- merge(st, jump_audit, by = "symbol", all.x = TRUE)
-  st[residual_jump_flag == TRUE, adjustment_state := "suspect_unresolved"]
+
+  # Cause-specific suspect labels (more informative than a single bucket)
+  st[issue_div_any == TRUE & !residual_jump_flag, adjustment_state := "suspect_dividend_factor"]
+  st[issue_div_any != TRUE & residual_jump_flag == TRUE, adjustment_state := "suspect_residual_jump"]
+  st[issue_div_any == TRUE & residual_jump_flag == TRUE, adjustment_state := "suspect_both"]
   
   dt[st, on = "symbol", adjustment_state := i.adjustment_state]
   

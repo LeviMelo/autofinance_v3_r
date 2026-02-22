@@ -20,6 +20,11 @@ de_run_data_engine <- function(years = NULL,
   if (xor(has_start, has_end)) {
     stop("Provide both 'start_date' and 'end_date' together.", call. = FALSE)
   }
+  if (has_start && has_end) {
+    if (as.Date(start_date) > as.Date(end_date)) {
+      stop("'start_date' must be <= 'end_date'.", call. = FALSE)
+    }
+  }
   if (!has_years && !(has_start && has_end)) {
     stop("Must provide either 'years' or 'start_date/end_date'.", call. = FALSE)
   }

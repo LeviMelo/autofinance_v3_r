@@ -44,6 +44,9 @@ de_compute_symbol_diag_features <- function(dt_sym, horizons_days) {
 de_build_features_diag <- function(panel_adj_model, cfg) {
   dt <- data.table::as.data.table(panel_adj_model)
   data.table::setorder(dt, symbol, refdate)
+  
+  if (!nrow(dt)) return(data.table::data.table())
+  
   syms <- unique(dt$symbol)
   
   res <- lapply(syms, function(s) {
@@ -53,5 +56,7 @@ de_build_features_diag <- function(panel_adj_model, cfg) {
     de_compute_symbol_diag_features(sdt, cfg$feature_horizons_days)
   })
   
-  data.table::rbindlist(res[!vapply(res, is.null, logical(1))], fill = TRUE)
+  out <- data.table::rbindlist(res[!vapply(res, is.null, logical(1))], fill = TRUE)
+  if (is.null(out) || !nrow(out)) return(data.table::data.table())
+  out
 }
