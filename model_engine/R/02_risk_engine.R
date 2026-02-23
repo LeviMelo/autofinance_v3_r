@@ -3,7 +3,15 @@
 
 #' @export
 me_estimate_vol <- function(R_window, spec_risk_vol) {
-    vols <- apply(R_window, 2, sd, na.rm = TRUE) * sqrt(252)
+    if (is.null(R_window) || nrow(R_window) == 0 || ncol(R_window) == 0) {
+        return(setNames(numeric(0), character(0)))
+    }
+
+    lkb <- spec_risk_vol$lookback %||% nrow(R_window)
+    lkb <- max(1L, min(as.integer(lkb), nrow(R_window)))
+    R_use <- tail(R_window, lkb)
+
+    vols <- apply(R_use, 2, sd, na.rm = TRUE) * sqrt(252)
     vols
 }
 
@@ -164,11 +172,18 @@ me_cov_sanity <- function(Sigma, repair = TRUE) {
 me_allocate_hrp <- function(Sigma, spec_hrp) {
     n <- ncol(Sigma)
     if (is.null(n) || n == 0) {
-        return(numeric(0))
+        w <- numeric(0)
+        attr(w, "allocator_method") <- "empty"
+        attr(w, "allocator_fallback") <- FALSE
+        attr(w, "allocator_reason") <- "empty_covariance"
+        return(w)
     }
     if (n == 1) {
         w <- 1.0
         names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "single_asset"
+        attr(w, "allocator_fallback") <- FALSE
+        attr(w, "allocator_reason") <- "single_asset"
         return(w)
     }
 
@@ -195,28 +210,50 @@ me_allocate_hrp <- function(Sigma, spec_hrp) {
 
     hc <- tryCatch(
         hclust(as.dist(dist_mat), method = "single"),
-        error = function(e) NULL
+        error = function(e) e
     )
 
-    if (is.null(hc)) {
+    if (inherits(hc, "error")) {
         w <- .inv_var_alloc(Sigma)
         names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inverse_variance_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- paste("hclust_failed:", hc$message)
         return(w)
     }
 
     sort_ix <- hc$order
     w_hrp <- .get_rec_bipart(Sigma, sort_ix)
-    w_hrp[colnames(Sigma)]
+    out <- w_hrp[colnames(Sigma)]
+
+    attr(out, "allocator_method") <- "hrp"
+    attr(out, "allocator_fallback") <- FALSE
+    attr(out, "allocator_reason") <- "none"
+
+    out
 }
 
 #' @export
 me_run_risk_engine <- function(R_window, spec_risk) {
+    if (is.null(R_window) || nrow(R_window) == 0 || ncol(R_window) == 0) {
+        stop("Risk engine received empty R_window.")
+    }
+
+    n_obs_input <- nrow(R_window)
+    n_assets_input <- ncol(R_window)
+
     # Drop assets with insufficient data (e.g. any NAs inside the required window)
     keep_assets <- colSums(is.na(R_window)) == 0
     R_clean <- R_window[, keep_assets, drop = FALSE]
 
-    if (ncol(R_clean) < 2) {
-        stop("Risk engine needs >= 2 assets without missing data in risk lookback.")
+    n_assets_kept <- ncol(R_clean)
+    n_assets_dropped <- n_assets_input - n_assets_kept
+
+    if (n_assets_kept < 2) {
+        stop(sprintf(
+            "Risk engine needs >= 2 assets without missing data in risk lookback. Input assets=%d, kept=%d, dropped=%d, window_rows=%d",
+            n_assets_input, n_assets_kept, n_assets_dropped, n_obs_input
+        ))
     }
 
     vols <- me_estimate_vol(R_clean, spec_risk$vol)
@@ -235,6 +272,10 @@ me_run_risk_engine <- function(R_window, spec_risk) {
 
     w_hrp <- me_allocate_hrp(Sigma_repaired, spec_risk$hrp)
 
+    allocator_method <- attr(w_hrp, "allocator_method") %||% "unknown"
+    allocator_fallback <- isTRUE(attr(w_hrp, "allocator_fallback"))
+    allocator_reason <- attr(w_hrp, "allocator_reason") %||% "unknown"
+
     list(
         sigma_t = vols,
         B_t = pca_fit$B,
@@ -248,7 +289,15 @@ me_run_risk_engine <- function(R_window, spec_risk) {
         diag = list(
             was_repaired = sanity$repaired,
             kept_assets = colnames(R_clean),
-            dropped_assets = setdiff(colnames(R_window), colnames(R_clean))
+            dropped_assets = setdiff(colnames(R_window), colnames(R_clean)),
+            n_obs_input = n_obs_input,
+            n_assets_input = n_assets_input,
+            n_assets_kept = n_assets_kept,
+            n_assets_dropped = n_assets_dropped,
+            frac_assets_dropped = if (n_assets_input > 0) n_assets_dropped / n_assets_input else NA_real_,
+            allocator_method = allocator_method,
+            allocator_fallback = allocator_fallback,
+            allocator_reason = allocator_reason
         )
     )
 }

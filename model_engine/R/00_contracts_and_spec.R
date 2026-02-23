@@ -15,11 +15,21 @@ me_require <- function(pkgs) {
 
 #' @export
 me_spec_default <- function() {
+    W0 <- matrix(
+        0,
+        nrow = 3, ncol = 3,
+        dimnames = list(
+            c("kalman", "tsmom", "cash"),
+            c("disp", "eta", "VoV")
+        )
+    )
+
     list(
         data = list(
             min_coverage_ratio = 0.9,
             min_median_turnover = 1e5,
-            allowed_types = c("equity", "unit")
+            # Aligned with data_engine canonical asset types
+            allowed_types = c("equity", "fii", "etf", "bdr")
         ),
         risk = list(
             vol = list(lookback = 63L),
@@ -35,11 +45,12 @@ me_spec_default <- function() {
         market_state = list(
             dispersion = list(lookback = 1L),
             eta = list(lookback = 63L),
-            vov = list(lookback = 126L) # Note: requires R window of L + vol_lookback
+            vov = list(lookback = 126L) # requires R window of L + vol_lookback - 1
         ),
         gating = list(
             w0 = c(kalman = 0, tsmom = 0, cash = -1),
-            W = NULL
+            # Explicit matrix (zero matrix = static gating until calibrated, but no NULL/disabled ambiguity)
+            W = W0
         ),
         portfolio = list(
             tilt = list(max_tilt = 2.0),
@@ -67,18 +78,33 @@ me_validate_spec <- function(spec) {
     missing <- setdiff(req_names, names(spec))
     if (length(missing) > 0) stop("ModelSpec missing sections: ", paste(missing, collapse = ", "))
 
-    # Validate scalar domains
-    if (!is.null(spec$portfolio$caps$max_weight) &&
-        (spec$portfolio$caps$max_weight <= 0 || spec$portfolio$caps$max_weight > 1)) {
-        stop("portfolio$caps$max_weight must be in (0, 1]")
-    }
-
+    # ---- data section ----
     if (!is.null(spec$data$min_coverage_ratio) &&
         (spec$data$min_coverage_ratio < 0 || spec$data$min_coverage_ratio > 1)) {
         stop("data$min_coverage_ratio must be in [0, 1]")
     }
 
-    # Validate lookbacks
+    if (!is.null(spec$data$min_median_turnover) &&
+        (!is.numeric(spec$data$min_median_turnover) || length(spec$data$min_median_turnover) != 1 ||
+            !is.finite(spec$data$min_median_turnover) || spec$data$min_median_turnover < 0)) {
+        stop("data$min_median_turnover must be a finite scalar >= 0")
+    }
+
+    allowed_types <- spec$data$allowed_types
+    if (is.null(allowed_types) || length(allowed_types) == 0 ||
+        any(!nzchar(trimws(as.character(allowed_types))))) {
+        stop("data$allowed_types must be a non-empty character vector")
+    }
+    # Keep broad enough for compatibility; default should be data_engine canonical set
+    allowed_set <- c("equity", "fii", "etf", "bdr", "unit")
+    if (!all(as.character(allowed_types) %in% allowed_set)) {
+        stop(
+            "data$allowed_types contains invalid values. Allowed: ",
+            paste(allowed_set, collapse = ", ")
+        )
+    }
+
+    # ---- risk section ----
     for (mod in c("vol", "pca")) {
         if (!is.null(spec$risk[[mod]]$lookback) && spec$risk[[mod]]$lookback <= 0) {
             stop(sprintf("risk$%s$lookback must be positive", mod))
@@ -93,6 +119,19 @@ me_validate_spec <- function(spec) {
         stop("risk$resid$lambda must be >= 0")
     }
 
+    # Nonnegotiable in your locked backbone
+    if (!isTRUE(spec$risk$resid$use_glasso)) {
+        stop("risk$resid$use_glasso must be TRUE (PCA -> Glasso -> HRP is locked in this pipeline)")
+    }
+
+    # ---- signals section ----
+    if (!is.null(spec$signals$kalman$lookback) && spec$signals$kalman$lookback <= 0) {
+        stop("signals$kalman$lookback must be > 0")
+    }
+    if (!is.null(spec$signals$tsmom$horizon) && spec$signals$tsmom$horizon <= 0) {
+        stop("signals$tsmom$horizon must be > 0")
+    }
+
     if (!is.null(spec$signals$kalman$q_var) && spec$signals$kalman$q_var <= 0) {
         stop("signals$kalman$q_var must be > 0")
     }
@@ -101,24 +140,58 @@ me_validate_spec <- function(spec) {
         stop("signals$kalman$r_var must be > 0")
     }
 
-    # Validate gating parameter shapes
+    # ---- market_state section ----
+    if (!is.null(spec$market_state$dispersion$lookback) && spec$market_state$dispersion$lookback <= 0) {
+        stop("market_state$dispersion$lookback must be > 0")
+    }
+    if (!is.null(spec$market_state$eta$lookback) && spec$market_state$eta$lookback <= 0) {
+        stop("market_state$eta$lookback must be > 0")
+    }
+    if (!is.null(spec$market_state$vov$lookback) && spec$market_state$vov$lookback <= 0) {
+        stop("market_state$vov$lookback must be > 0")
+    }
+
+    # ---- gating section ----
     w0 <- spec$gating$w0
     if (is.null(w0) || length(w0) != 3 || !all(c("kalman", "tsmom", "cash") %in% names(w0))) {
         stop("gating$w0 must be a 3-element vector named c('kalman', 'tsmom', 'cash')")
     }
 
     W <- spec$gating$W
-    if (!is.null(W)) {
-        expected_state_names <- c("disp", "eta", "VoV")
-        if (nrow(W) != 3 || ncol(W) != length(expected_state_names)) {
-            stop("gating$W must be a 3 x 3 matrix")
-        }
-        if (!all(rownames(W) == c("kalman", "tsmom", "cash"))) {
-            stop("gating$W rownames must be exactly c('kalman', 'tsmom', 'cash')")
-        }
-        if (!all(colnames(W) == expected_state_names)) {
-            stop("gating$W colnames must be exactly c('disp', 'eta', 'VoV')")
-        }
+    expected_state_names <- c("disp", "eta", "VoV")
+
+    # Nonnegotiable in your adaptive gating design: W must exist
+    if (is.null(W)) {
+        stop("gating$W must be provided (3x3 matrix with rows kalman/tsmom/cash and cols disp/eta/VoV)")
+    }
+
+    if (!is.matrix(W)) stop("gating$W must be a matrix")
+    if (nrow(W) != 3 || ncol(W) != length(expected_state_names)) {
+        stop("gating$W must be a 3 x 3 matrix")
+    }
+    if (is.null(rownames(W)) || is.null(colnames(W))) {
+        stop("gating$W must have rownames and colnames")
+    }
+    if (!all(rownames(W) == c("kalman", "tsmom", "cash"))) {
+        stop("gating$W rownames must be exactly c('kalman', 'tsmom', 'cash')")
+    }
+    if (!all(colnames(W) == expected_state_names)) {
+        stop("gating$W colnames must be exactly c('disp', 'eta', 'VoV')")
+    }
+    if (any(!is.finite(W))) {
+        stop("gating$W must contain only finite numeric values")
+    }
+
+    # ---- portfolio section ----
+    if (!is.null(spec$portfolio$caps$max_weight) &&
+        (spec$portfolio$caps$max_weight <= 0 || spec$portfolio$caps$max_weight > 1)) {
+        stop("portfolio$caps$max_weight must be in (0, 1]")
+    }
+
+    if (!is.null(spec$portfolio$tilt$max_tilt) &&
+        (!is.numeric(spec$portfolio$tilt$max_tilt) || length(spec$portfolio$tilt$max_tilt) != 1 ||
+            !is.finite(spec$portfolio$tilt$max_tilt) || spec$portfolio$tilt$max_tilt < 1)) {
+        stop("portfolio$tilt$max_tilt must be a finite scalar >= 1")
     }
 
     invisible(spec)

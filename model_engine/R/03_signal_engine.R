@@ -133,11 +133,22 @@ me_run_signal_engine <- function(prices_window, R_window, sigma_t, spec_signals)
 
   aligned <- me_align_signal_vectors(kalman = kalman_scores, tsmom = tsmom_scores)
 
+  n_assets <- length(aligned$kalman)
+  kalman_nonzero <- sum(aligned$kalman != 0, na.rm = TRUE)
+  tsmom_nonzero <- sum(aligned$tsmom != 0, na.rm = TRUE)
+
   list(
-    kalman = aligned$kalman, tsmom = aligned$tsmom,
+    kalman = aligned$kalman,
+    tsmom = aligned$tsmom,
     diag = list(
-      kalman_coverage = sum(aligned$kalman != 0),
-      tsmom_coverage = sum(aligned$tsmom != 0)
+      n_assets = n_assets,
+      kalman_coverage = kalman_nonzero,
+      tsmom_coverage = tsmom_nonzero,
+      kalman_zero_count = sum(aligned$kalman == 0, na.rm = TRUE),
+      tsmom_zero_count = sum(aligned$tsmom == 0, na.rm = TRUE),
+      kalman_all_zero = (n_assets > 0 && kalman_nonzero == 0),
+      tsmom_all_zero = (n_assets > 0 && tsmom_nonzero == 0),
+      both_all_zero = (n_assets > 0 && kalman_nonzero == 0 && tsmom_nonzero == 0)
     )
   )
 }

@@ -106,8 +106,36 @@ me_gating_softmax_linear <- function(m_t, spec_gating) {
 
 #' @export
 me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_market_state, spec_gating, vol_lookback = 63L) {
+    # Heuristic diagnostics for default-path risk in state features
+    eta_keep_cols <- if (!is.null(R_eta) && nrow(R_eta) > 0 && ncol(R_eta) > 0) {
+        sum(colSums(is.na(R_eta)) == 0)
+    } else {
+        0L
+    }
+
+    vov_n_days <- if (!is.null(R_vov)) nrow(R_vov) else 0L
+    disp_n_assets <- if (!is.null(R_disp)) ncol(R_disp) else 0L
+
+    eta_likely_defaulted <- (is.null(R_eta) || nrow(R_eta) < 10 || eta_keep_cols < 2)
+    vov_likely_defaulted <- (is.null(R_vov) || vov_n_days <= vol_lookback)
+    disp_likely_degenerate <- (is.null(R_disp) || nrow(R_disp) < 1 || disp_n_assets < 2)
+
     m_t <- me_build_market_state(R_disp, R_eta, R_vov, spec_market_state, vol_lookback)
     gating <- me_gating_softmax_linear(m_t, spec_gating)
 
-    list(market_state = m_t, gating = gating)
+    W <- spec_gating$W
+    gating_is_static <- is.null(W) || (is.matrix(W) && all(W == 0))
+
+    list(
+        market_state = m_t,
+        gating = gating,
+        diag = list(
+            disp_likely_degenerate = disp_likely_degenerate,
+            eta_likely_defaulted = eta_likely_defaulted,
+            vov_likely_defaulted = vov_likely_defaulted,
+            gating_is_static = gating_is_static,
+            # Explicit placeholder status
+            risk_artifact_used = FALSE
+        )
+    )
 }

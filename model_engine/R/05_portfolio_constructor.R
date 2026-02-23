@@ -50,23 +50,53 @@ me_apply_tilt_to_baseline <- function(w_hrp, tilt_mult, spec_portfolio) {
     mult_align[found] <- tilt_mult[found]
 
     w <- w_hrp * mult_align
-    if (sum(w) > 0) w / sum(w) else w_hrp
+
+    fallback_to_hrp <- FALSE
+    fallback_reason <- "none"
+
+    if (sum(w, na.rm = TRUE) > 0) {
+        out <- w / sum(w, na.rm = TRUE)
+    } else {
+        out <- w_hrp
+        fallback_to_hrp <- TRUE
+        fallback_reason <- "degenerate_tilt_sum_nonpositive"
+    }
+
+    attr(out, "fallback_to_hrp") <- fallback_to_hrp
+    attr(out, "fallback_reason") <- fallback_reason
+    out
 }
 
 #' @export
 me_apply_weight_caps <- function(w, spec_caps) {
     cap <- spec_caps$max_weight %||% 0.15
+
+    cap_infeasible <- FALSE
+    cap_reason <- "none"
+    n_iters <- 0L
+
     if (cap >= 1.0) {
-        return(w)
+        out <- w
+        attr(out, "cap_infeasible") <- FALSE
+        attr(out, "cap_reason") <- "cap_ge_1_noop"
+        attr(out, "cap_iters") <- 0L
+        return(out)
     }
 
     if (length(w) * cap < 1.0) {
         # Cannot cap if mathematically impossible to sum to 1
-        return(w)
+        out <- w
+        cap_infeasible <- TRUE
+        cap_reason <- "cap_infeasible_given_universe_size"
+        attr(out, "cap_infeasible") <- cap_infeasible
+        attr(out, "cap_reason") <- cap_reason
+        attr(out, "cap_iters") <- 0L
+        return(out)
     }
 
     # Iterative proportional redistribution
     for (iter in 1:100) {
+        n_iters <- iter
         if (all(w <= cap + 1e-6)) break
 
         cap_idx <- w > cap
@@ -84,7 +114,12 @@ me_apply_weight_caps <- function(w, spec_caps) {
             w[uncapped_idx] <- w_un + excess / length(w_un)
         }
     }
-    w / sum(w)
+
+    out <- w / sum(w)
+    attr(out, "cap_infeasible") <- cap_infeasible
+    attr(out, "cap_reason") <- cap_reason
+    attr(out, "cap_iters") <- n_iters
+    out
 }
 
 #' @export
@@ -109,7 +144,13 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gati
     tilt_mult <- tilt_res$mult
 
     w_tilted <- me_apply_tilt_to_baseline(w_hrp, tilt_mult, spec_portfolio)
+    tilt_fallback_to_hrp <- isTRUE(attr(w_tilted, "fallback_to_hrp"))
+    tilt_fallback_reason <- attr(w_tilted, "fallback_reason") %||% "none"
+
     w_capped <- me_apply_weight_caps(w_tilted, spec_portfolio$caps)
+    cap_infeasible <- isTRUE(attr(w_capped, "cap_infeasible"))
+    cap_reason <- attr(w_capped, "cap_reason") %||% "none"
+    cap_iters <- attr(w_capped, "cap_iters") %||% 0L
 
     w_final_risky <- g_t * w_capped
     w_cash <- 1 - g_t
@@ -136,7 +177,14 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gati
             cap_hits = sum(w_capped >= (spec_portfolio$caps$max_weight %||% 1) - 1e-4),
             pre_cap_sum = sum(w_tilted),
             post_cap_sum = sum(w_capped),
-            gross_exposure = g_t
+            gross_exposure = g_t,
+            tilt_fallback_to_hrp = tilt_fallback_to_hrp,
+            tilt_fallback_reason = tilt_fallback_reason,
+            cap_infeasible = cap_infeasible,
+            cap_reason = cap_reason,
+            cap_iters = cap_iters,
+            prev_target_supplied = !is.null(prev_target),
+            prev_target_used = FALSE
         )
     )
 }

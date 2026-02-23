@@ -50,7 +50,7 @@ me_spec_default <- function() {
         market_state = list(
             dispersion = list(lookback = 1L),
             eta = list(lookback = 63L),
-            vov = list(lookback = 126L)
+            vov = list(lookback = 126L) # Note: requires R window of L + vol_lookback
         ),
         gating = list(
             w0 = c(kalman = 0, tsmom = 0, cash = -1),
@@ -60,7 +60,10 @@ me_spec_default <- function() {
             tilt = list(max_tilt = 2.0),
             caps = list(max_weight = 0.15)
         ),
-        meta = list()
+        meta = list(
+            retain_windows = TRUE,
+            retain_matrices = TRUE
+        )
     )
 }
 
@@ -90,6 +93,49 @@ me_validate_spec <- function(spec) {
         stop("data$min_coverage_ratio must be in [0, 1]")
     }
 
+    # Validate lookbacks
+    for (mod in c("vol", "pca")) {
+        if (!is.null(spec$risk[[mod]]$lookback) && spec$risk[[mod]]$lookback <= 0) {
+            stop(sprintf("risk$%s$lookback must be positive", mod))
+        }
+    }
+
+    if (!is.null(spec$risk$pca$k) && spec$risk$pca$k < 1) {
+        stop("risk$pca$k must be >= 1")
+    }
+
+    if (!is.null(spec$risk$resid$lambda) && spec$risk$resid$lambda < 0) {
+        stop("risk$resid$lambda must be >= 0")
+    }
+
+    if (!is.null(spec$signals$kalman$q_var) && spec$signals$kalman$q_var <= 0) {
+        stop("signals$kalman$q_var must be > 0")
+    }
+
+    if (!is.null(spec$signals$kalman$r_var) && spec$signals$kalman$r_var <= 0) {
+        stop("signals$kalman$r_var must be > 0")
+    }
+
+    # Validate gating parameter shapes
+    w0 <- spec$gating$w0
+    if (is.null(w0) || length(w0) != 3 || !all(c("kalman", "tsmom", "cash") %in% names(w0))) {
+        stop("gating$w0 must be a 3-element vector named c('kalman', 'tsmom', 'cash')")
+    }
+
+    W <- spec$gating$W
+    if (!is.null(W)) {
+        expected_state_names <- c("disp", "eta", "VoV")
+        if (nrow(W) != 3 || ncol(W) != length(expected_state_names)) {
+            stop("gating$W must be a 3 x 3 matrix")
+        }
+        if (!all(rownames(W) == c("kalman", "tsmom", "cash"))) {
+            stop("gating$W rownames must be exactly c('kalman', 'tsmom', 'cash')")
+        }
+        if (!all(colnames(W) == expected_state_names)) {
+            stop("gating$W colnames must be exactly c('disp', 'eta', 'VoV')")
+        }
+    }
+
     invisible(spec)
 }
 
@@ -104,24 +150,61 @@ me_validate_snapshot_artifact <- function(x) {
 
     if (!inherits(x$as_of_date, "Date")) stop("as_of_date must be a Date")
 
-    # Check target bounds
-    if (!is.data.frame(x$target_weights)) stop("target_weights must be a data.frame")
-    if (!all(c("symbol", "weight_target") %in% names(x$target_weights))) {
+    # Target bounds
+    tgt <- x$target_weights
+    if (!is.data.frame(tgt)) stop("target_weights must be a data.frame")
+    if (!all(c("symbol", "weight_target") %in% names(tgt))) {
         stop("target_weights must have 'symbol' and 'weight_target'")
     }
-    if (length(unique(x$target_weights$symbol)) != nrow(x$target_weights)) {
-        stop("Duplicate symbols in target_weights")
-    }
-    if (any(x$target_weights$weight_target < 0, na.rm = TRUE)) {
-        stop("Negative target weights are not allowed")
+    if (length(unique(tgt$symbol)) != nrow(tgt)) stop("Duplicate symbols in target_weights")
+    if (any(tgt$weight_target < 0, na.rm = TRUE)) stop("Negative target weights are not allowed")
+
+    if (!is.numeric(x$cash_weight) || length(x$cash_weight) != 1 ||
+        x$cash_weight < -1e-6 || x$cash_weight > 1 + 1e-6) {
+        stop("cash_weight must be scalar in [0,1]")
     }
 
-    if (!is.numeric(x$cash_weight) || x$cash_weight < -1e-6 || x$cash_weight > 1 + 1e-6) {
-        stop("cash_weight must be in [0,1]")
-    }
-
-    tot_w <- sum(x$target_weights$weight_target, na.rm = TRUE) + x$cash_weight
+    tot_w <- sum(tgt$weight_target, na.rm = TRUE) + x$cash_weight
     if (abs(tot_w - 1.0) > 1e-4) stop(sprintf("Weights sum to %f, not 1.0", tot_w))
+
+    # Gating consistency (if present)
+    gating <- x$gating
+    if (length(gating) > 0) {
+        req_g <- c("w_kalman", "w_tsmom", "w_cash", "gross_exposure")
+        if (!all(req_g %in% names(gating))) {
+            stop("Gating artifact missing required fields")
+        }
+        if (abs(gating$gross_exposure - (1 - gating$w_cash)) > 1e-6) {
+            stop("Gating consistency: gross_exposure != 1 - w_cash")
+        }
+        sum_gates <- gating$w_kalman + gating$w_tsmom + gating$w_cash
+        if (abs(sum_gates - 1.0) > 1e-6) {
+            stop("Gating consistency: softmax weights do not sum to 1")
+        }
+    }
+
+    # Risk consistency (only validate matrices if retained/present)
+    risk <- x$risk
+    if (length(risk) > 0) {
+        if (!is.null(risk$w_hrp)) {
+            risk_univ <- names(risk$w_hrp)
+            if (length(risk_univ) > 0 && !all(tgt$symbol %in% risk_univ)) {
+                stop("Portfolio target universe contains elements not in canonical risk universe")
+            }
+        }
+
+        if (!is.null(risk$sigma_t) && !is.null(risk$Sigma_total)) {
+            if (is.null(rownames(risk$Sigma_total)) || is.null(colnames(risk$Sigma_total))) {
+                stop("Sigma_total must have row/col names when retained")
+            }
+            if (!all(names(risk$sigma_t) == rownames(risk$Sigma_total))) {
+                stop("Risk artifact mismatch: sigma_t names do not align with Sigma_total rownames")
+            }
+            if (!is.null(risk$w_hrp) && !all(names(risk$w_hrp) == colnames(risk$Sigma_total))) {
+                stop("Risk artifact mismatch: w_hrp names do not align with Sigma_total colnames")
+            }
+        }
+    }
 
     invisible(x)
 }
@@ -153,9 +236,18 @@ me_make_data_adapter <- function(data_bundle_or_panel, aux = list()) {
         stop("data_bundle_or_panel must be a data.frame or a bundle list containing 'panel_adj_model'")
     }
 
-    req_cols <- c("symbol", "refdate", "close", "turnover", "qty", "asset_type")
+    req_cols <- c("symbol", "refdate", "open", "close", "turnover", "qty", "asset_type")
     missing <- setdiff(req_cols, names(dt))
     if (length(missing) > 0) stop("Panel missing fields: ", paste(missing, collapse = ", "))
+
+    # Canonical refdate type
+    if (!inherits(dt$refdate, "Date")) {
+        # Try safe coercion once
+        dt[, refdate := as.Date(refdate)]
+        if (any(is.na(dt$refdate))) {
+            stop("refdate must be coercible to Date without NA introduction")
+        }
+    }
 
     # Canonicalize
     data.table::setkeyv(dt, c("symbol", "refdate"))
@@ -317,20 +409,45 @@ me_residualize_returns <- function(R_window, pca_fit) {
 
 #' @export
 me_fit_residual_cov <- function(E_window, spec_resid) {
-    me_require(c("glasso", "Matrix"))
-
-    Sigma_eps <- cov(E_window, use = "pairwise.complete.obs")
+    use_glasso <- isTRUE(spec_resid$use_glasso)
     lambda <- spec_resid$lambda %||% 0.1
+
+    if (use_glasso) {
+        me_require("glasso")
+    }
+
+    # Sample residual covariance
+    Sigma_eps <- cov(E_window, use = "pairwise.complete.obs")
+    if (is.null(Sigma_eps) || any(!is.finite(Sigma_eps))) {
+        stop("Residual covariance contains non-finite values.")
+    }
+
+    # Ensure dimnames from residual matrix columns
+    dn <- list(colnames(E_window), colnames(E_window))
+    dimnames(Sigma_eps) <- dn
+
+    # Basic diagonal regularization before any inversion/optimization
+    d <- diag(Sigma_eps)
+    if (any(!is.finite(d)) || any(d <= 0)) {
+        bad <- !is.finite(d) | d <= 0
+        med_d <- median(d[is.finite(d) & d > 0], na.rm = TRUE)
+        if (!is.finite(med_d) || med_d <= 0) med_d <- 1e-6
+        d[bad] <- med_d
+        diag(Sigma_eps) <- d
+    }
+
     precision <- NULL
 
-    if (isTRUE(spec_resid$use_glasso)) {
-        # Fail loud if it somehow bypassed require
+    if (use_glasso) {
         gl <- glasso::glasso(Sigma_eps, rho = lambda)
         Sigma_eps <- gl$w
         precision <- gl$wi
-        dimnames(Sigma_eps) <- dimnames(precision) <- dimnames(cov(E_window))
+        dimnames(Sigma_eps) <- dn
+        dimnames(precision) <- dn
     } else {
-        diag(Sigma_eps) <- diag(Sigma_eps) + lambda * mean(diag(Sigma_eps), na.rm = TRUE)
+        ridge <- lambda * mean(diag(Sigma_eps), na.rm = TRUE)
+        if (!is.finite(ridge) || ridge < 0) ridge <- 0
+        diag(Sigma_eps) <- diag(Sigma_eps) + ridge
     }
 
     list(sigma_eps = Sigma_eps, precision = precision)
@@ -414,7 +531,7 @@ me_cov_sanity <- function(Sigma, repair = TRUE) {
 #' @export
 me_allocate_hrp <- function(Sigma, spec_hrp) {
     n <- ncol(Sigma)
-    if (n == 0) {
+    if (is.null(n) || n == 0) {
         return(numeric(0))
     }
     if (n == 1) {
@@ -423,18 +540,33 @@ me_allocate_hrp <- function(Sigma, spec_hrp) {
         return(w)
     }
 
-    s <- sqrt(diag(Sigma))
-    s[s == 0] <- 1e-8
+    # Symmetrize defensively
+    Sigma <- (Sigma + t(Sigma)) / 2
+
+    # Safe correlation conversion
+    s <- sqrt(pmax(diag(Sigma), 1e-12))
     R <- Sigma / (s %o% s)
-    R[R > 1] <- 1
-    R[R < -1] <- -1
 
-    dist_mat <- sqrt(0.5 * (1 - R))
-    dist_mat[is.na(dist_mat)] <- 0
+    # Numerical cleanup
+    R[!is.finite(R)] <- 0
+    R <- (R + t(R)) / 2
+    diag(R) <- 1
+    R <- pmin(pmax(R, -1), 1)
 
-    hc <- tryCatch(hclust(as.dist(dist_mat), method = "single"), error = function(e) NULL)
+    # Distance for HRP clustering
+    D <- 0.5 * (1 - R)
+    D[!is.finite(D)] <- 0
+    D[D < 0] <- 0
+    diag(D) <- 0
+
+    dist_mat <- sqrt(D)
+
+    hc <- tryCatch(
+        hclust(as.dist(dist_mat), method = "single"),
+        error = function(e) NULL
+    )
+
     if (is.null(hc)) {
-        # fallback to inverse variance if hclust fails
         w <- .inv_var_alloc(Sigma)
         names(w) <- colnames(Sigma)
         return(w)
@@ -460,6 +592,8 @@ me_run_risk_engine <- function(R_window, spec_risk) {
     E <- me_residualize_returns(R_clean, pca_fit)
     resid_res <- me_fit_residual_cov(E, spec_risk$resid)
     Sigma_eps <- resid_res$sigma_eps
+    Theta_eps <- resid_res$precision
+
     fac_res <- me_factor_cov(pca_fit$F, spec_risk$factor)
     Sigma_f <- fac_res$sigma_f
 
@@ -471,6 +605,12 @@ me_run_risk_engine <- function(R_window, spec_risk) {
 
     list(
         sigma_t = vols,
+        B_t = pca_fit$B,
+        F_t = pca_fit$F,
+        E_t = E,
+        Sigma_f = Sigma_f,
+        Sigma_eps = Sigma_eps,
+        Theta_eps = Theta_eps,
         Sigma_total = Sigma_repaired,
         w_hrp = w_hrp,
         diag = list(
@@ -495,44 +635,50 @@ me_run_risk_engine <- function(R_window, spec_risk) {
 
 #' @export
 me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
-  # 2-state Kalman filter (Level and Slope)
-  # State x_t = [l_t, b_t]'
-  # l_t = l_{t-1} + b_{t-1} + w_{l,t}
-  # b_t = b_{t-1} + w_{b,t}
-  # y_t = l_t + v_t
+  # 2-state local linear trend Kalman filter on log-prices
+  # State x_t = [level_t, slope_t]'
+  # level_t = level_{t-1} + slope_{t-1} + w1_t
+  # slope_t = slope_{t-1} + w2_t
+  # y_t = level_t + v_t
 
   n_assets <- ncol(prices_window)
-  T <- nrow(prices_window)
+  Tn <- nrow(prices_window)
+
   scores <- rep(0, n_assets)
   names(scores) <- colnames(prices_window)
 
-  if (T < 10) {
+  if (is.null(n_assets) || n_assets == 0 || Tn < 10) {
     return(scores)
   }
 
   q_var <- spec_kalman$q_var %||% 1e-4
   r_var <- spec_kalman$r_var %||% 1e-2
+  out_scale <- spec_kalman$scale %||% 1.0
 
-  # Transition Matrix
-  F_mat <- matrix(c(1, 0, 1, 1), nrow = 2, byrow = TRUE)
-
-  # Observation Matrix
+  # Correct local linear trend transition / observation matrices
+  F_mat <- matrix(c(
+    1, 1,
+    0, 1
+  ), nrow = 2, byrow = TRUE)
   H_mat <- matrix(c(1, 0), nrow = 1)
 
-  for (j in seq_len(n_assets)) {
-    y <- log(prices_window[, j]) # Use log-prices
-    valid <- !is.na(y)
-    if (sum(valid) < 10) next
-    y <- y[valid]
+  Q <- diag(c(q_var, q_var))
+  R_obs <- r_var
 
-    # Init state
+  I2 <- diag(2)
+
+  for (j in seq_len(n_assets)) {
+    y_raw <- prices_window[, j]
+
+    # Require finite positive prices before log
+    valid <- is.finite(y_raw) & !is.na(y_raw) & (y_raw > 0)
+    if (sum(valid) < 10) next
+
+    y <- log(y_raw[valid])
+
+    # Initialize state
     x_hat <- matrix(c(y[1], 0), nrow = 2)
     P <- diag(c(1, 1))
-
-    # Process Noise
-    Q <- diag(c(q_var, q_var))
-    # Obs Noise
-    R <- r_var
 
     for (i in 2:length(y)) {
       # Predict
@@ -540,27 +686,38 @@ me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
       P_pred <- F_mat %*% P %*% t(F_mat) + Q
 
       # Update
-      err <- y[i] - (H_mat %*% x_pred)[1, 1]
-      S <- (H_mat %*% P_pred %*% t(H_mat))[1, 1] + R
-      K <- P_pred %*% t(H_mat) / S
+      y_hat <- (H_mat %*% x_pred)[1, 1]
+      err <- y[i] - y_hat
+      S <- (H_mat %*% P_pred %*% t(H_mat))[1, 1] + R_obs
 
+      if (!is.finite(S) || S <= 0) next
+
+      K <- P_pred %*% t(H_mat) / S
       x_hat <- x_pred + K * err
-      P <- (diag(2) - K %*% H_mat) %*% P_pred
+
+      # Joseph-form covariance update (more numerically stable)
+      KH <- K %*% H_mat
+      P <- (I2 - KH) %*% P_pred %*% t(I2 - KH) + K %*% matrix(R_obs, 1, 1) %*% t(K)
     }
 
-    # Extract final slope estimate
-    slope <- x_hat[2, 1]
+    # Final latent slope is a daily log-return-like increment
+    slope_daily <- x_hat[2, 1]
+    if (!is.finite(slope_daily)) next
 
-    # Convert slope to daily return scale conceptually, then scale by asset vol
-    # vol is annualized. To normalize, compare annualized slope to annual vol
-    slope_ann <- slope * 252
-    vol_j <- sigma_t[names(sigma_t) == colnames(prices_window)[j]] %||% 0.2
-    if (vol_j == 0) vol_j <- 0.2
+    # Convert to annualized slope to match annualized sigma_t
+    slope_ann <- slope_daily * 252
+
+    sym_j <- colnames(prices_window)[j]
+    vol_j <- sigma_t[sym_j]
+    if (length(vol_j) != 1 || !is.finite(vol_j) || vol_j <= 0) {
+      vol_j <- median(sigma_t[is.finite(sigma_t) & sigma_t > 0], na.rm = TRUE)
+      if (!is.finite(vol_j) || vol_j <= 0) vol_j <- 0.2
+    }
 
     scores[j] <- slope_ann / vol_j
   }
 
-  .tanh_scale(scores, spec_kalman$scale %||% 1.0)
+  .tanh_scale(scores, out_scale)
 }
 
 #' @export
@@ -569,7 +726,9 @@ me_signal_tsmom <- function(R_window, sigma_t, spec_tsmom) {
   h <- min(h, nrow(R_window))
 
   if (h < 5) {
-    return(rep(0, ncol(R_window)))
+    v <- rep(0, ncol(R_window))
+    names(v) <- colnames(R_window)
+    return(v)
   }
 
   ret_cum <- apply(tail(R_window, h), 2, sum, na.rm = TRUE)
@@ -649,32 +808,53 @@ me_state_mode_dominance <- function(R_state_window) {
 }
 
 #' @export
-me_state_vov <- function(R_hist) {
-    if (nrow(R_hist) < 20) {
-        return(0)
-    }
-    keep <- colSums(is.na(R_hist)) == 0
-    R_clean <- R_hist[, keep, drop = FALSE]
-    if (ncol(R_clean) == 0) {
+me_state_vov <- function(R_hist, vol_lookback = 63L) {
+    # True VoV: median market vol series standard deviation
+    # R_hist must span (vov_lookback + vol_lookback - 1) days ideally
+
+    n_days <- nrow(R_hist)
+    if (n_days <= vol_lookback) {
         return(0)
     }
 
-    roll_vols <- apply(R_clean, 1, function(x) sd(x, na.rm = TRUE))
-    v <- sd(roll_vols, na.rm = TRUE) / (mean(roll_vols, na.rm = TRUE) + 1e-6)
-    if (is.na(v)) {
-        return(0)
+    # Rolling vol estimates per asset
+    v_tau <- numeric(n_days - vol_lookback + 1)
+
+    for (i in seq_along(v_tau)) {
+        # window for t
+        start_idx <- i
+        end_idx <- i + vol_lookback - 1
+
+        R_sub <- R_hist[start_idx:end_idx, , drop = FALSE]
+        # Keep strictly valid columns inside this rolling slice
+        keep <- colSums(is.na(R_sub)) == 0
+        if (sum(keep) < 2) {
+            v_tau[i] <- 0
+            next
+        }
+
+        R_clean <- R_sub[, keep, drop = FALSE]
+        # Volatility per asset in cross section
+        vols <- apply(R_clean, 2, sd, na.rm = TRUE) * sqrt(252)
+        # Market vol proxy on this day
+        v_tau[i] <- median(vols, na.rm = TRUE)
     }
-    v
+
+    # Return standard deviation of the median market vols over the state window
+    sd(v_tau, na.rm = TRUE)
 }
 
 #' @export
-me_build_market_state <- function(R_disp, R_eta, R_vov) {
+me_build_market_state <- function(R_disp, R_eta, R_vov, spec_market_state, vol_lookback) {
     r_t <- tail(R_disp, 1)[1, ]
-    c(
+    res <- c(
         disp = me_state_dispersion(r_t),
         eta = me_state_mode_dominance(R_eta),
-        VoV = me_state_vov(R_vov)
+        VoV = me_state_vov(R_vov, vol_lookback)
     )
+    # Ensure exact dimensions
+    if (is.na(res["VoV"])) res["VoV"] <- 0
+    res
 }
 
 #' @export
@@ -684,7 +864,8 @@ me_gating_softmax_linear <- function(m_t, spec_gating) {
     if (is.null(spec_gating$W)) {
         logits <- w0
     } else {
-        logits <- w0 + as.vector(spec_gating$W %*% m_t)
+        # Safe alignment using exact parameter mapping established in validation
+        logits <- w0 + as.vector(spec_gating$W %*% m_t[colnames(spec_gating$W)])
         names(logits) <- names(w0)
     }
 
@@ -701,8 +882,8 @@ me_gating_softmax_linear <- function(m_t, spec_gating) {
 }
 
 #' @export
-me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_gating) {
-    m_t <- me_build_market_state(R_disp, R_eta, R_vov)
+me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_market_state, spec_gating, vol_lookback = 63L) {
+    m_t <- me_build_market_state(R_disp, R_eta, R_vov, spec_market_state, vol_lookback)
     gating <- me_gating_softmax_linear(m_t, spec_gating)
 
     list(market_state = m_t, gating = gating)
@@ -737,9 +918,23 @@ me_combine_expert_scores <- function(signal_artifact, gating_artifact, spec_port
 
 #' @export
 me_score_to_tilt <- function(S_t, spec_tilt) {
+    # Formal cross-sectional standardisation and bounded tilt mapping
     max_tilt <- spec_tilt$max_tilt %||% 2.0
-    mult <- exp(S_t * log(max_tilt))
-    mult
+
+    mu <- mean(S_t, na.rm = TRUE)
+    sigma <- sd(S_t, na.rm = TRUE)
+
+    if (is.na(sigma) || sigma < 1e-8) {
+        z_t <- S_t * 0
+    } else {
+        z_t <- (S_t - mu) / sigma
+    }
+
+    # Bounded sigmoid mapping
+    lambda_tilt <- log(max_tilt)
+    mult <- exp(lambda_tilt * tanh(z_t))
+
+    list(mult = mult, z_t = z_t, mu = mu, sigma = sigma)
 }
 
 #' @export
@@ -791,10 +986,23 @@ me_apply_weight_caps <- function(w, spec_caps) {
 #' @export
 me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gating_artifact, spec_portfolio, prev_target = NULL) {
     g_t <- state_gating_artifact$gating$gross_exposure
-    w_hrp <- risk_artifact$w_hrp
+    w_hrp <- risk_artifact$w_hrp # canonical risk universe defines tradable subset
 
-    S_t <- me_combine_expert_scores(signal_artifact, state_gating_artifact$gating, spec_portfolio)
-    tilt_mult <- me_score_to_tilt(S_t, spec_portfolio$tilt)
+    # Extract scored elements strictly aligned with risk universe
+    aligned_signals <- list(
+        kalman = signal_artifact$kalman[names(w_hrp)],
+        tsmom = signal_artifact$tsmom[names(w_hrp)]
+    )
+    # Missing -> Neutral (0)
+    aligned_signals$kalman[is.na(aligned_signals$kalman)] <- 0
+    aligned_signals$tsmom[is.na(aligned_signals$tsmom)] <- 0
+
+    # Combine bounded signals into ensemble S_t
+    S_t <- me_combine_expert_scores(aligned_signals, state_gating_artifact$gating, spec_portfolio)
+
+    # Tilt computation: standardize S_t cross-sectionally and apply exponential tanh
+    tilt_res <- me_score_to_tilt(S_t, spec_portfolio$tilt)
+    tilt_mult <- tilt_res$mult
 
     w_tilted <- me_apply_tilt_to_baseline(w_hrp, tilt_mult, spec_portfolio)
     w_capped <- me_apply_weight_caps(w_tilted, spec_portfolio$caps)
@@ -816,6 +1024,11 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gati
         target_weights = tgt_table,
         cash_weight = w_cash,
         diag = list(
+            score_mean = tilt_res$mu,
+            score_sd = tilt_res$sigma,
+            neutralized_scores = sum(S_t == 0),
+            pre_norm_range = if (length(S_t) > 0) range(S_t, na.rm = TRUE) else c(0, 0),
+            post_norm_range = if (length(tilt_res$z_t) > 0) range(tilt_res$z_t, na.rm = TRUE) else c(0, 0),
             cap_hits = sum(w_capped >= (spec_portfolio$caps$max_weight %||% 1) - 1e-4),
             pre_cap_sum = sum(w_tilted),
             post_cap_sum = sum(w_capped),
@@ -835,6 +1048,8 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gati
 #' @export
 me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_target = NULL, aux = list()) {
     spec <- me_get_spec(spec)
+    me_validate_spec(spec)
+
     adapter <- me_make_data_adapter(data_bundle_or_panel, aux)
 
     cal <- adapter$calendar()
@@ -852,7 +1067,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
             target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
             cash_weight = 1.0,
             risk = list(), signals = list(), market_state = list(), gating = list(), portfolio_diag = list(),
-            meta = list(), warnings = character(0)
+            meta = list(warns = "No tradable symbols"), warnings = character(0)
         )
         me_validate_snapshot_artifact(res_empty)
         return(res_empty)
@@ -865,10 +1080,12 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
     lkb_disp <- spec$market_state$dispersion$lookback %||% 1L
     lkb_eta <- spec$market_state$eta$lookback %||% 63L
     lkb_vov <- spec$market_state$vov$lookback %||% 126L
+    lkb_vol <- spec$risk$vol$lookback %||% 63L
 
     warns <- character(0)
 
-    max_lkb <- max(lkb_kalman, lkb_tsmom, lkb_risk, lkb_disp, lkb_eta, lkb_vov) + 1
+    # vov depends on vol sequence spanning states
+    max_lkb <- max(lkb_kalman, lkb_tsmom, lkb_risk, lkb_disp, lkb_eta, lkb_vov + lkb_vol - 1) + 1
     prices_max <- adapter$price_matrix(as_of_date, lookback = max_lkb, symbols = syms, strict = FALSE)
     ret_max <- adapter$returns_matrix(as_of_date, lookback = max_lkb - 1, symbols = syms, strict = FALSE)
 
@@ -889,9 +1106,9 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
     R_tsmom <- .slice_mat(ret_max, lkb_tsmom)
     R_disp <- .slice_mat(ret_max, lkb_disp)
     R_eta <- .slice_mat(ret_max, lkb_eta)
-    R_vov <- .slice_mat(ret_max, lkb_vov)
+    R_vov <- .slice_mat(ret_max, lkb_vov + lkb_vol - 1)
 
-    # Execute
+    # Execute Risk Canonical Base First
     risk_artifact <- tryCatch(me_run_risk_engine(R_risk, spec$risk), error = function(e) {
         warns <<- c(warns, paste("Risk engine failed:", e$message))
         NULL
@@ -910,13 +1127,50 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
         return(res_err)
     }
 
+    # Exact alignment protocol: risk outputs govern the final cross-sectional universe
+    risk_univ <- names(risk_artifact$w_hrp)
     sigma_t <- risk_artifact$sigma_t
 
+    # Execute Signals and State using available data (subset cleanly downstream in portfolio)
     signal_artifact <- me_run_signal_engine(P_kalman, R_tsmom, sigma_t, spec$signals)
 
-    state_gating_artifact <- me_run_state_and_gating(R_disp, R_eta, R_vov, risk_artifact, spec$gating)
+    state_gating_artifact <- me_run_state_and_gating(R_disp, R_eta, R_vov, risk_artifact, spec$market_state, spec$gating, vol_lookback = lkb_vol)
 
     port_artifact <- me_build_portfolio_target(risk_artifact, signal_artifact, state_gating_artifact, spec$portfolio, prev_target)
+
+    if (nrow(port_artifact$target_weights) == 0 && port_artifact$cash_weight < 0.999) {
+        warns <- c(warns, "Portfolio target has no risky weights but cash_weight < 1.0 (unexpected pruning/cap path).")
+    }
+
+    if (nrow(port_artifact$target_weights) == 0 && port_artifact$cash_weight >= 0.999) {
+        warns <- c(warns, "Portfolio collapsed to cash (check gating logits, risk universe drops, and signal coverage).")
+    }
+
+    if (isFALSE(spec$meta$retain_windows)) {
+        risk_artifact$E_t <- NULL
+        risk_artifact$F_t <- NULL
+    }
+    if (isFALSE(spec$meta$retain_matrices)) {
+        risk_artifact$Sigma_f <- NULL
+        risk_artifact$Sigma_eps <- NULL
+        risk_artifact$Theta_eps <- NULL
+        risk_artifact$Sigma_total <- NULL
+    }
+
+    meta <- list(
+        spec_hash = me_hash_spec(spec),
+        universe_counts = list(
+            investable = length(syms),
+            risk_kept = length(risk_univ),
+            risk_dropped = length(risk_artifact$diag$dropped_assets)
+        ),
+        lookbacks_used = list(
+            kalman = lkb_kalman,
+            tsmom = lkb_tsmom,
+            risk = lkb_risk,
+            vov_window = lkb_vov + lkb_vol - 1
+        )
+    )
 
     res <- list(
         as_of_date = as_of_date,
@@ -928,7 +1182,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
         market_state = state_gating_artifact$market_state,
         gating = state_gating_artifact$gating,
         portfolio_diag = port_artifact$diag,
-        meta = list(),
+        meta = meta,
         warnings = warns
     )
 
