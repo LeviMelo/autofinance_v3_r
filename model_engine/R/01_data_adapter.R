@@ -14,9 +14,18 @@ me_make_data_adapter <- function(data_bundle_or_panel, aux = list()) {
         stop("data_bundle_or_panel must be a data.frame or a bundle list containing 'panel_adj_model'")
     }
 
-    req_cols <- c("symbol", "refdate", "close", "turnover", "qty", "asset_type")
+    req_cols <- c("symbol", "refdate", "open", "close", "turnover", "qty", "asset_type")
     missing <- setdiff(req_cols, names(dt))
     if (length(missing) > 0) stop("Panel missing fields: ", paste(missing, collapse = ", "))
+
+    # Canonical refdate type
+    if (!inherits(dt$refdate, "Date")) {
+        # Try safe coercion once
+        dt[, refdate := as.Date(refdate)]
+        if (any(is.na(dt$refdate))) {
+            stop("refdate must be coercible to Date without NA introduction")
+        }
+    }
 
     # Canonicalize
     data.table::setkeyv(dt, c("symbol", "refdate"))

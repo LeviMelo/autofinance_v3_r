@@ -30,3 +30,6 @@ playground/**/unzip_*/
 .Rproj.user/46DC9FEC/pcs/source-pane.pper
 .Rproj.user/46DC9FEC/pcs/windowlayoutstate.pper
 data_engine/R/codebase_dump_R.txt
+backtest_engine/codebase_dump_backtest_engine.txt
+data_engine/codebase_dump_data_engine.txt
+model_engine/codebase_dump_model_engine.txt

@@ -31,32 +31,53 @@ me_state_mode_dominance <- function(R_state_window) {
 }
 
 #' @export
-me_state_vov <- function(R_hist) {
-    if (nrow(R_hist) < 20) {
-        return(0)
-    }
-    keep <- colSums(is.na(R_hist)) == 0
-    R_clean <- R_hist[, keep, drop = FALSE]
-    if (ncol(R_clean) == 0) {
+me_state_vov <- function(R_hist, vol_lookback = 63L) {
+    # True VoV: median market vol series standard deviation
+    # R_hist must span (vov_lookback + vol_lookback - 1) days ideally
+
+    n_days <- nrow(R_hist)
+    if (n_days <= vol_lookback) {
         return(0)
     }
 
-    roll_vols <- apply(R_clean, 1, function(x) sd(x, na.rm = TRUE))
-    v <- sd(roll_vols, na.rm = TRUE) / (mean(roll_vols, na.rm = TRUE) + 1e-6)
-    if (is.na(v)) {
-        return(0)
+    # Rolling vol estimates per asset
+    v_tau <- numeric(n_days - vol_lookback + 1)
+
+    for (i in seq_along(v_tau)) {
+        # window for t
+        start_idx <- i
+        end_idx <- i + vol_lookback - 1
+
+        R_sub <- R_hist[start_idx:end_idx, , drop = FALSE]
+        # Keep strictly valid columns inside this rolling slice
+        keep <- colSums(is.na(R_sub)) == 0
+        if (sum(keep) < 2) {
+            v_tau[i] <- 0
+            next
+        }
+
+        R_clean <- R_sub[, keep, drop = FALSE]
+        # Volatility per asset in cross section
+        vols <- apply(R_clean, 2, sd, na.rm = TRUE) * sqrt(252)
+        # Market vol proxy on this day
+        v_tau[i] <- median(vols, na.rm = TRUE)
     }
-    v
+
+    # Return standard deviation of the median market vols over the state window
+    sd(v_tau, na.rm = TRUE)
 }
 
 #' @export
-me_build_market_state <- function(R_disp, R_eta, R_vov) {
+me_build_market_state <- function(R_disp, R_eta, R_vov, spec_market_state, vol_lookback) {
     r_t <- tail(R_disp, 1)[1, ]
-    c(
+    res <- c(
         disp = me_state_dispersion(r_t),
         eta = me_state_mode_dominance(R_eta),
-        VoV = me_state_vov(R_vov)
+        VoV = me_state_vov(R_vov, vol_lookback)
     )
+    # Ensure exact dimensions
+    if (is.na(res["VoV"])) res["VoV"] <- 0
+    res
 }
 
 #' @export
@@ -66,7 +87,8 @@ me_gating_softmax_linear <- function(m_t, spec_gating) {
     if (is.null(spec_gating$W)) {
         logits <- w0
     } else {
-        logits <- w0 + as.vector(spec_gating$W %*% m_t)
+        # Safe alignment using exact parameter mapping established in validation
+        logits <- w0 + as.vector(spec_gating$W %*% m_t[colnames(spec_gating$W)])
         names(logits) <- names(w0)
     }
 
@@ -83,8 +105,8 @@ me_gating_softmax_linear <- function(m_t, spec_gating) {
 }
 
 #' @export
-me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_gating) {
-    m_t <- me_build_market_state(R_disp, R_eta, R_vov)
+me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_market_state, spec_gating, vol_lookback = 63L) {
+    m_t <- me_build_market_state(R_disp, R_eta, R_vov, spec_market_state, vol_lookback)
     gating <- me_gating_softmax_linear(m_t, spec_gating)
 
     list(market_state = m_t, gating = gating)

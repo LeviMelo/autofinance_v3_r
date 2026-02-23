@@ -35,7 +35,7 @@ me_spec_default <- function() {
         market_state = list(
             dispersion = list(lookback = 1L),
             eta = list(lookback = 63L),
-            vov = list(lookback = 126L)
+            vov = list(lookback = 126L) # Note: requires R window of L + vol_lookback
         ),
         gating = list(
             w0 = c(kalman = 0, tsmom = 0, cash = -1),
@@ -45,7 +45,10 @@ me_spec_default <- function() {
             tilt = list(max_tilt = 2.0),
             caps = list(max_weight = 0.15)
         ),
-        meta = list()
+        meta = list(
+            retain_windows = TRUE,
+            retain_matrices = TRUE
+        )
     )
 }
 
@@ -75,6 +78,49 @@ me_validate_spec <- function(spec) {
         stop("data$min_coverage_ratio must be in [0, 1]")
     }
 
+    # Validate lookbacks
+    for (mod in c("vol", "pca")) {
+        if (!is.null(spec$risk[[mod]]$lookback) && spec$risk[[mod]]$lookback <= 0) {
+            stop(sprintf("risk$%s$lookback must be positive", mod))
+        }
+    }
+
+    if (!is.null(spec$risk$pca$k) && spec$risk$pca$k < 1) {
+        stop("risk$pca$k must be >= 1")
+    }
+
+    if (!is.null(spec$risk$resid$lambda) && spec$risk$resid$lambda < 0) {
+        stop("risk$resid$lambda must be >= 0")
+    }
+
+    if (!is.null(spec$signals$kalman$q_var) && spec$signals$kalman$q_var <= 0) {
+        stop("signals$kalman$q_var must be > 0")
+    }
+
+    if (!is.null(spec$signals$kalman$r_var) && spec$signals$kalman$r_var <= 0) {
+        stop("signals$kalman$r_var must be > 0")
+    }
+
+    # Validate gating parameter shapes
+    w0 <- spec$gating$w0
+    if (is.null(w0) || length(w0) != 3 || !all(c("kalman", "tsmom", "cash") %in% names(w0))) {
+        stop("gating$w0 must be a 3-element vector named c('kalman', 'tsmom', 'cash')")
+    }
+
+    W <- spec$gating$W
+    if (!is.null(W)) {
+        expected_state_names <- c("disp", "eta", "VoV")
+        if (nrow(W) != 3 || ncol(W) != length(expected_state_names)) {
+            stop("gating$W must be a 3 x 3 matrix")
+        }
+        if (!all(rownames(W) == c("kalman", "tsmom", "cash"))) {
+            stop("gating$W rownames must be exactly c('kalman', 'tsmom', 'cash')")
+        }
+        if (!all(colnames(W) == expected_state_names)) {
+            stop("gating$W colnames must be exactly c('disp', 'eta', 'VoV')")
+        }
+    }
+
     invisible(spec)
 }
 
@@ -89,24 +135,61 @@ me_validate_snapshot_artifact <- function(x) {
 
     if (!inherits(x$as_of_date, "Date")) stop("as_of_date must be a Date")
 
-    # Check target bounds
-    if (!is.data.frame(x$target_weights)) stop("target_weights must be a data.frame")
-    if (!all(c("symbol", "weight_target") %in% names(x$target_weights))) {
+    # Target bounds
+    tgt <- x$target_weights
+    if (!is.data.frame(tgt)) stop("target_weights must be a data.frame")
+    if (!all(c("symbol", "weight_target") %in% names(tgt))) {
         stop("target_weights must have 'symbol' and 'weight_target'")
     }
-    if (length(unique(x$target_weights$symbol)) != nrow(x$target_weights)) {
-        stop("Duplicate symbols in target_weights")
-    }
-    if (any(x$target_weights$weight_target < 0, na.rm = TRUE)) {
-        stop("Negative target weights are not allowed")
+    if (length(unique(tgt$symbol)) != nrow(tgt)) stop("Duplicate symbols in target_weights")
+    if (any(tgt$weight_target < 0, na.rm = TRUE)) stop("Negative target weights are not allowed")
+
+    if (!is.numeric(x$cash_weight) || length(x$cash_weight) != 1 ||
+        x$cash_weight < -1e-6 || x$cash_weight > 1 + 1e-6) {
+        stop("cash_weight must be scalar in [0,1]")
     }
 
-    if (!is.numeric(x$cash_weight) || x$cash_weight < -1e-6 || x$cash_weight > 1 + 1e-6) {
-        stop("cash_weight must be in [0,1]")
-    }
-
-    tot_w <- sum(x$target_weights$weight_target, na.rm = TRUE) + x$cash_weight
+    tot_w <- sum(tgt$weight_target, na.rm = TRUE) + x$cash_weight
     if (abs(tot_w - 1.0) > 1e-4) stop(sprintf("Weights sum to %f, not 1.0", tot_w))
+
+    # Gating consistency (if present)
+    gating <- x$gating
+    if (length(gating) > 0) {
+        req_g <- c("w_kalman", "w_tsmom", "w_cash", "gross_exposure")
+        if (!all(req_g %in% names(gating))) {
+            stop("Gating artifact missing required fields")
+        }
+        if (abs(gating$gross_exposure - (1 - gating$w_cash)) > 1e-6) {
+            stop("Gating consistency: gross_exposure != 1 - w_cash")
+        }
+        sum_gates <- gating$w_kalman + gating$w_tsmom + gating$w_cash
+        if (abs(sum_gates - 1.0) > 1e-6) {
+            stop("Gating consistency: softmax weights do not sum to 1")
+        }
+    }
+
+    # Risk consistency (only validate matrices if retained/present)
+    risk <- x$risk
+    if (length(risk) > 0) {
+        if (!is.null(risk$w_hrp)) {
+            risk_univ <- names(risk$w_hrp)
+            if (length(risk_univ) > 0 && !all(tgt$symbol %in% risk_univ)) {
+                stop("Portfolio target universe contains elements not in canonical risk universe")
+            }
+        }
+
+        if (!is.null(risk$sigma_t) && !is.null(risk$Sigma_total)) {
+            if (is.null(rownames(risk$Sigma_total)) || is.null(colnames(risk$Sigma_total))) {
+                stop("Sigma_total must have row/col names when retained")
+            }
+            if (!all(names(risk$sigma_t) == rownames(risk$Sigma_total))) {
+                stop("Risk artifact mismatch: sigma_t names do not align with Sigma_total rownames")
+            }
+            if (!is.null(risk$w_hrp) && !all(names(risk$w_hrp) == colnames(risk$Sigma_total))) {
+                stop("Risk artifact mismatch: w_hrp names do not align with Sigma_total colnames")
+            }
+        }
+    }
 
     invisible(x)
 }

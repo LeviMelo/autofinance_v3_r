@@ -41,20 +41,45 @@ me_residualize_returns <- function(R_window, pca_fit) {
 
 #' @export
 me_fit_residual_cov <- function(E_window, spec_resid) {
-    me_require(c("glasso", "Matrix"))
-
-    Sigma_eps <- cov(E_window, use = "pairwise.complete.obs")
+    use_glasso <- isTRUE(spec_resid$use_glasso)
     lambda <- spec_resid$lambda %||% 0.1
+
+    if (use_glasso) {
+        me_require("glasso")
+    }
+
+    # Sample residual covariance
+    Sigma_eps <- cov(E_window, use = "pairwise.complete.obs")
+    if (is.null(Sigma_eps) || any(!is.finite(Sigma_eps))) {
+        stop("Residual covariance contains non-finite values.")
+    }
+
+    # Ensure dimnames from residual matrix columns
+    dn <- list(colnames(E_window), colnames(E_window))
+    dimnames(Sigma_eps) <- dn
+
+    # Basic diagonal regularization before any inversion/optimization
+    d <- diag(Sigma_eps)
+    if (any(!is.finite(d)) || any(d <= 0)) {
+        bad <- !is.finite(d) | d <= 0
+        med_d <- median(d[is.finite(d) & d > 0], na.rm = TRUE)
+        if (!is.finite(med_d) || med_d <= 0) med_d <- 1e-6
+        d[bad] <- med_d
+        diag(Sigma_eps) <- d
+    }
+
     precision <- NULL
 
-    if (isTRUE(spec_resid$use_glasso)) {
-        # Fail loud if it somehow bypassed require
+    if (use_glasso) {
         gl <- glasso::glasso(Sigma_eps, rho = lambda)
         Sigma_eps <- gl$w
         precision <- gl$wi
-        dimnames(Sigma_eps) <- dimnames(precision) <- dimnames(cov(E_window))
+        dimnames(Sigma_eps) <- dn
+        dimnames(precision) <- dn
     } else {
-        diag(Sigma_eps) <- diag(Sigma_eps) + lambda * mean(diag(Sigma_eps), na.rm = TRUE)
+        ridge <- lambda * mean(diag(Sigma_eps), na.rm = TRUE)
+        if (!is.finite(ridge) || ridge < 0) ridge <- 0
+        diag(Sigma_eps) <- diag(Sigma_eps) + ridge
     }
 
     list(sigma_eps = Sigma_eps, precision = precision)
@@ -138,7 +163,7 @@ me_cov_sanity <- function(Sigma, repair = TRUE) {
 #' @export
 me_allocate_hrp <- function(Sigma, spec_hrp) {
     n <- ncol(Sigma)
-    if (n == 0) {
+    if (is.null(n) || n == 0) {
         return(numeric(0))
     }
     if (n == 1) {
@@ -147,18 +172,33 @@ me_allocate_hrp <- function(Sigma, spec_hrp) {
         return(w)
     }
 
-    s <- sqrt(diag(Sigma))
-    s[s == 0] <- 1e-8
+    # Symmetrize defensively
+    Sigma <- (Sigma + t(Sigma)) / 2
+
+    # Safe correlation conversion
+    s <- sqrt(pmax(diag(Sigma), 1e-12))
     R <- Sigma / (s %o% s)
-    R[R > 1] <- 1
-    R[R < -1] <- -1
 
-    dist_mat <- sqrt(0.5 * (1 - R))
-    dist_mat[is.na(dist_mat)] <- 0
+    # Numerical cleanup
+    R[!is.finite(R)] <- 0
+    R <- (R + t(R)) / 2
+    diag(R) <- 1
+    R <- pmin(pmax(R, -1), 1)
 
-    hc <- tryCatch(hclust(as.dist(dist_mat), method = "single"), error = function(e) NULL)
+    # Distance for HRP clustering
+    D <- 0.5 * (1 - R)
+    D[!is.finite(D)] <- 0
+    D[D < 0] <- 0
+    diag(D) <- 0
+
+    dist_mat <- sqrt(D)
+
+    hc <- tryCatch(
+        hclust(as.dist(dist_mat), method = "single"),
+        error = function(e) NULL
+    )
+
     if (is.null(hc)) {
-        # fallback to inverse variance if hclust fails
         w <- .inv_var_alloc(Sigma)
         names(w) <- colnames(Sigma)
         return(w)
@@ -184,6 +224,8 @@ me_run_risk_engine <- function(R_window, spec_risk) {
     E <- me_residualize_returns(R_clean, pca_fit)
     resid_res <- me_fit_residual_cov(E, spec_risk$resid)
     Sigma_eps <- resid_res$sigma_eps
+    Theta_eps <- resid_res$precision
+
     fac_res <- me_factor_cov(pca_fit$F, spec_risk$factor)
     Sigma_f <- fac_res$sigma_f
 
@@ -195,6 +237,12 @@ me_run_risk_engine <- function(R_window, spec_risk) {
 
     list(
         sigma_t = vols,
+        B_t = pca_fit$B,
+        F_t = pca_fit$F,
+        E_t = E,
+        Sigma_f = Sigma_f,
+        Sigma_eps = Sigma_eps,
+        Theta_eps = Theta_eps,
         Sigma_total = Sigma_repaired,
         w_hrp = w_hrp,
         diag = list(
