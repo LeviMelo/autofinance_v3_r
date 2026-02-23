@@ -3,10 +3,24 @@
 # --- RB3 Provider ---
 de_rb3_init <- function(cfg) {
   de_require("rb3")
+
+  # rb3 template registry appears to be initialized on package attach (.onAttach),
+  # not reliably by namespace load alone. `rb3::foo()` may fail with
+  # "not found in registry" unless rb3 is attached in the session.
+  if (!"package:rb3" %in% search()) {
+    ok <- suppressPackageStartupMessages(
+      require("rb3", character.only = TRUE, quietly = TRUE, warn.conflicts = FALSE)
+    )
+    if (!isTRUE(ok)) stop("Failed to attach package 'rb3' (required for template registry initialization).", call. = FALSE)
+  }
+
   cache_dir <- file.path(cfg$cache_dir, "rb3")
   if (!dir.exists(cache_dir)) dir.create(cache_dir, recursive = TRUE)
   options(rb3.cachedir = normalizePath(cache_dir, winslash = "/", mustWork = FALSE))
+
+  # Keep this; harmless and may initialize/update cache state
   try(rb3::rb3_bootstrap(), silent = TRUE)
+
   invisible(TRUE)
 }
 
