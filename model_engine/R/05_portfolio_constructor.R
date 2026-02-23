@@ -124,7 +124,7 @@ me_apply_weight_caps <- function(w, spec_caps) {
 
 #' @export
 me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gating_artifact, spec_portfolio, prev_target = NULL) {
-    g_t <- state_gating_artifact$gating$gross_exposure
+    g_t <- as.numeric(state_gating_artifact$gating$gross_exposure)
     w_hrp <- risk_artifact$w_hrp # canonical risk universe defines tradable subset
 
     # Extract scored elements strictly aligned with risk universe
@@ -153,7 +153,7 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gati
     cap_iters <- attr(w_capped, "cap_iters") %||% 0L
 
     w_final_risky <- g_t * w_capped
-    w_cash <- 1 - g_t
+    w_cash <- as.numeric(1 - g_t)
 
     w_final_risky[w_final_risky < 1e-4] <- 0
 

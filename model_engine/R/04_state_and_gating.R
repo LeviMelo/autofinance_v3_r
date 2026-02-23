@@ -95,11 +95,17 @@ me_gating_softmax_linear <- function(m_t, spec_gating) {
     exp_logits <- exp(logits - max(logits))
     probs <- exp_logits / sum(exp_logits)
 
+    # Use [[ ]] or unname() so scalars are true scalars, not named remnants
+    w_kalman <- as.numeric(probs[["kalman"]])
+    w_tsmom <- as.numeric(probs[["tsmom"]])
+    w_cash <- as.numeric(probs[["cash"]])
+    gross_exposure <- as.numeric(1.0 - w_cash)
+
     list(
-        w_kalman = probs["kalman"],
-        w_tsmom = probs["tsmom"],
-        w_cash = probs["cash"],
-        gross_exposure = 1.0 - probs["cash"],
+        w_kalman = w_kalman,
+        w_tsmom = w_tsmom,
+        w_cash = w_cash,
+        gross_exposure = gross_exposure,
         logits = logits
     )
 }

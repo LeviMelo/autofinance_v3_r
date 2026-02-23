@@ -150,7 +150,13 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
     sigma_t <- risk_artifact$sigma_t
 
     # Execute Signals and State using available data (subset cleanly downstream in portfolio)
-    signal_artifact <- me_run_signal_engine(P_kalman, R_tsmom, sigma_t, spec$signals)
+    signal_artifact <- withCallingHandlers(
+        me_run_signal_engine(P_kalman, R_tsmom, sigma_t, spec$signals),
+        warning = function(w) {
+            warns <<- c(warns, paste("Signal engine warning:", conditionMessage(w)))
+            invokeRestart("muffleWarning")
+        }
+    )
 
     sdg <- signal_artifact$diag
     if (isTRUE(sdg$both_all_zero)) {
@@ -160,7 +166,16 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, prev_
         if (isTRUE(sdg$tsmom_all_zero)) .push_warn("TSMOM signal returned all-zero scores.")
     }
 
-    state_gating_artifact <- me_run_state_and_gating(R_disp, R_eta, R_vov, risk_artifact, spec$market_state, spec$gating, vol_lookback = lkb_vol)
+    state_gating_artifact <- withCallingHandlers(
+        me_run_state_and_gating(
+            R_disp, R_eta, R_vov, risk_artifact, spec$market_state, spec$gating,
+            vol_lookback = lkb_vol
+        ),
+        warning = function(w) {
+            warns <<- c(warns, paste("State/Gating warning:", conditionMessage(w)))
+            invokeRestart("muffleWarning")
+        }
+    )
 
     sgd <- state_gating_artifact$diag
     if (isTRUE(sgd$eta_likely_defaulted)) .push_warn("Market-state eta likely defaulted/neutral due to insufficient clean data.")
