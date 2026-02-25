@@ -1,931 +1,123 @@
-# README_data_engine
+## `README_data_engine.md`
 
-## Overview
+# data_engine (B3 OHLCV + Corporate Actions Adjustment Engine)
 
-This module is the **data engine** of a personal market analysis / portfolio optimization pipeline (R-based), focused on building a **clean, adjusted, auditable OHLCV panel** for B3-listed assets (equities, FIIs, ETFs, BDRs), with:
+## What this module is
 
-* raw price universe ingestion (via `rb3`)
-* corporate actions ingestion (via Yahoo; chart API or `quantmod`)
-* split validation / snapping against raw price gaps
-* normalized event table construction (including manual overrides)
-* split + dividend adjustment factor application
-* debug/audit artifacts for traceability
-* optional per-symbol diagnostic features (returns, vol, drawdown, Amihud)
+`data_engine` is the upstream data/adjustment component of the `autofinance_v3_r` project.
 
-This is not just a downloader; it is a **contract-driven ETL + adjustment engine** with explicit validation, caching, quarantine, and diagnostics.
+It builds an **auditable, adjusted daily panel** for B3 assets (equities, FIIs, ETFs, BDRs), combining:
+
+- B3 market data ingestion (via `rb3`)
+- schema normalization
+- liquidity/activity field normalization
+- corporate actions fetch (Yahoo chart API or `quantmod`)
+- split validation/snapping against raw price gaps
+- normalized events table generation
+- split + dividend adjustment application
+- debug/audit artifacts for traceability
+- optional diagnostic symbol features (returns, volatility, drawdown, Amihud, trade-size metrics)
+
+This module is intentionally **contract-driven** and returns both **model-ready outputs** and **audit/debug artifacts**.
+
+---
+
+## What changed (important liquidity semantics update)
+
+The engine now explicitly carries **three canonical activity/liquidity fields** from COTAHIST/rb3:
+
+- `traded_value` → monetary traded value (BRL)
+- `traded_units` → quantity traded (units/contracts, depending instrument convention)
+- `n_trades` → number of trades (print count / trade count)
+
+For backward compatibility, the engine still provides legacy aliases:
+
+- `turnover` = `traded_value`
+- `qty` = `traded_units`
+
+### Migration note (very important)
+If any downstream logic previously interpreted `qty` as “number of trades”, that is **incorrect**.
+
+- Use `n_trades` for trade count
+- Use `qty` / `traded_units` for units traded
+
+This matters for liquidity metrics (e.g., Amihud, average trade size, turnover filters).
 
 ---
 
 ## What this module produces
 
-The main pipeline entrypoint (`de_run_data_engine`) returns a bundle containing:
+Main entrypoint: `de_run_data_engine(...)`
 
-* **Model-ready adjusted panel** (`panel_adj_model`)
-* **Debug panel with raw + intermediate adjusted columns** (`panel_adj_debug`)
-* **Normalized applied events** (`events_apply`)
-* **Raw and corrected corp actions** (`corp_actions_raw`, `corp_actions_apply`)
-* **Quarantined split events** (`corp_actions_quarantine`)
-* **Split validation audit** (`split_audit`)
-* **Candidate prefilter audit** (`prefilter_audit`)
-* **Adjustment timeline (factor trail)** (`adjustments_timeline`)
-* **Residual jump audit** (`residual_jump_audit`)
-* **Optional diagnostics/features** (`features_diag`)
-* **Meta/config/run info** (`meta`)
+It returns a list (bundle) with:
 
-This is a strong design choice: the engine returns both the final output **and the provenance** needed to debug it.
+- `universe_raw`
+- `panel_adj_model`
+- `panel_adj_debug`
+- `events_apply`
+- `corp_actions_raw`
+- `corp_actions_apply`
+- `corp_actions_quarantine`
+- `split_audit`
+- `prefilter_audit`
+- `adjustments_timeline`
+- `residual_jump_audit`
+- `features_diag` (or `NULL` if disabled)
+- `meta`
 
----
+### Core outputs you will usually use downstream
 
-## Architectural summary
-
-### Pipeline stages (high-level)
-
-1. **Build raw universe** from B3 market data (`rb3`)
-2. **Select corporate-action candidates** using liquidity/trading coverage filters (+ optional forced symbols)
-3. **Fetch corporate actions** (Yahoo chart API or quantmod), with validated caching
-4. **Validate/snap Yahoo splits** against observed raw gaps
-5. **Merge/manualize and normalize events** into a compact `events_apply` table
-6. **Apply split and dividend adjustments** to OHLC
-7. **Compute residual jump diagnostics** and assign adjustment states
-8. **Optionally compute diagnostic features** (returns, volatility, drawdown, Amihud)
+- **`panel_adj_model`**: compact adjusted OHLC + liquidity/activity + adjustment state (model-facing)
+- **`panel_adj_debug`**: raw OHLC + split-adjusted OHLC + final adjusted OHLC + liquidity/activity + adjustment state (debug-facing)
+- **`features_diag`**: optional symbol-level QA/diagnostic metrics (not a full rolling feature engine)
 
 ---
 
-## Project structure (module map)
+## What this module does *not* do
 
-### `R/00_contracts.R`
+This module is upstream and should remain focused on **data correctness + adjustments**.
 
-Defines schema contracts and validators:
+It does **not** implement:
 
-* required columns per table
-* type checks
-* domain checks (e.g., positive prices, allowed enums)
-* duplicate key checks
+- trading no-lookahead semantics
+- strategy investability rules for backtests/models
+- portfolio constraints or position sizing
+- execution simulation
+- alpha model logic
 
-### `R/01_config.R`
-
-Default configuration, config validation, override merging, canonicalization, directory creation.
-
-### `R/02_utils.R`
-
-Helpers:
-
-* package checks
-* logging
-* weekday/bizdays sequence helpers
-
-### `R/03_providers.R`
-
-Data providers:
-
-* `rb3` setup/fetch (yearly/window)
-* Yahoo symbol mapping
-* Yahoo chart API events fetch
-* Yahoo `quantmod` split/dividend fetch
-* retry/backoff logic for rate limits
-
-### `R/04_universe.R`
-
-Transforms raw `rb3` output into a standardized raw universe:
-
-* schema normalization
-* liquidity proxy unification
-* deduplication by `(symbol, refdate)`
-* yearly/window builders
-
-### `R/05_corp_actions.R`
-
-Corporate actions pipeline:
-
-* candidate selection + audit
-* CA registry build with cache modes
-* split gap validation / snapping
-* event normalization + manual events integration
-
-### `R/06_adjuster.R`
-
-Core adjustment math:
-
-* split factors
-* dividend factors
-* dividend “rescue” scaling
-* adjusted panel + debug panel + audits
-
-### `R/07_diagnostics_features.R`
-
-Optional end-of-window symbol diagnostics:
-
-* horizon returns
-* realized vol
-* drawdown / ulcer index
-* Amihud illiquidity
-
-### `R/08_pipeline.R`
-
-Orchestrator (`de_run_data_engine`) that wires all steps together.
-
-### `fixtures/manual_events_template.csv`
-
-Template for manually supplied events (file listed, contents not shown in prompt).
-
-### `tests/test_adjuster_cases.R`, `tests/test_smoke_data_engine.R`
-
-Tests are listed, but contents were **not provided** here, so only their intent can be inferred from filenames.
+Those belong in downstream engines (model/backtest).
 
 ---
 
-## Core data contracts (schemas)
+## Directory structure (module map)
 
-The module is explicitly contract-driven. `de_contracts` defines canonical column sets.
-
-### 1) `universe_raw`
-
-Raw standardized market data panel before adjustments.
-
-Columns:
-
-* `symbol`
-* `refdate`
-* `asset_type`
-* `open`, `high`, `low`, `close`
-* `turnover`
-* `qty`
-
-### 2) `corp_actions_raw`
-
-Raw corporate actions registry (Yahoo/manual-like records before event aggregation).
-
-Columns:
-
-* `symbol`
-* `yahoo_symbol`
-* `refdate`
-* `action_type` (`dividend` / `split`)
-* `value`
-* `source`
-
-### 3) `events_apply`
-
-Normalized event table used by the adjuster (one row per symbol/date):
-
-* `split_value` (multiplicative price factor; e.g., 2:1 split => `0.5`)
-* `div_cash` (cash dividend amount)
-* source lineage flags
-
-Columns:
-
-* `symbol`
-* `refdate`
-* `split_value`
-* `div_cash`
-* `source_mask`
-* `has_manual`
-
-### 4) `panel_adj_model`
-
-Final model-facing adjusted panel (compact).
-
-Columns:
-
-* `symbol`
-* `refdate`
-* `asset_type`
-* `open`, `high`, `low`, `close` (adjusted)
-* `turnover`
-* `qty`
-* `adjustment_state`
-
-### 5) `panel_adj_debug`
-
-Debug/audit panel preserving raw and intermediate columns.
-
-Includes:
-
-* raw OHLC (`open_raw`, `high_raw`, ...)
-* split-adjusted OHLC (`open_adj_split`, ...)
-* final adjusted OHLC (renamed back to `open/high/low/close`)
-* `turnover`, `qty`
-* `adjustment_state`
+```text
+/data_engine/
+  fixtures/manual_events_template.csv
+  R/00_contracts.R
+  R/01_config.R
+  R/02_utils.R
+  R/03_providers.R
+  R/04_universe.R
+  R/05_corp_actions.R
+  R/06_adjuster.R
+  R/07_diagnostics_features.R
+  R/08_pipeline.R
+  README_data_engine.md
+  tests/test_adjuster_cases.R
+  tests/test_smoke_data_engine.R
+````
 
 ---
 
-## Validation philosophy (important design feature)
+## Dependencies
 
-`de_validate_contract()` is intentionally designed to be **pure**:
-
-* it validates schema/types/domains/dupes
-* it **does not sort rows** or enforce physical row order
-
-This separation is very good engineering practice:
-
-* validators check truth, not representation
-* builders own ordering responsibilities
-
-### What gets validated
-
-* Presence of required columns
-* Basic type constraints:
-
-  * `symbol` must be character
-  * `refdate` must be `Date`
-* Price domain constraints:
-
-  * OHLC > 0 (where present)
-* `asset_type` enum (`equity`, `fii`, `etf`, `bdr`)
-* `action_type` enum (`dividend`, `split`)
-* CA value domains:
-
-  * split values > 0, finite
-  * dividend values >= 0, finite
-* `events_apply` domains:
-
-  * `split_value > 0`
-  * `div_cash >= 0`
-* Duplicate key check on `(symbol, refdate)` for most tables
-
-  * **explicitly skipped for `corp_actions_raw`**, which can legitimately have multiple actions per symbol/date
-
----
-
-## Configuration system (`R/01_config.R`)
-
-The config layer is robust and well-validated.
-
-### `de_config_default()`
-
-Provides sensible defaults for:
-
-* data scope (`years`, `include_types`)
-* directories (`cache_dir`, `raw_dir`, `logs_dir`)
-* liquidity filters
-* CA prefilter diagnostics
-* CA fetch/cache behavior
-* split validation controls
-* residual jump tolerance
-* feature horizons
-
-### Key config parameters (semantics)
-
-#### Universe / selection
-
-* `years`: defaults to current year and previous year
-* `include_types`: asset classes to include
-* `min_turnover`: minimum median turnover for CA candidate eligibility
-* `min_days_traded_ratio`: minimum trading-day coverage ratio
-
-#### CA prefilter diagnostics (not strict selection)
-
-* `ca_prefilter_liq_window_days`
-* `ca_prefilter_jump_log_thr`
-* `ca_prefilter_gap_*` per asset type
-
-These create audit flags like “has positive jump” / “has negative gap”.
-
-#### Corporate actions fetch/cache
-
-* `ca_fetch_mode`: `"chart"` or `"quantmod"`
-* `ca_cache_mode`:
-
-  * `"batch"`: cache one validated CA table per request hash
-  * `"by_symbol"`: per-symbol exact window cache (debug/inspection-friendly)
-  * `"none"`: no CA caching
-
-#### Split validation / snapping
-
-* `enable_split_gap_validation`
-* `split_gap_tol_log`
-* `split_gap_max_forward_days`
-* `split_gap_max_back_days`
-* `split_gap_use_open`
-
-#### Post-adjustment diagnostics
-
-* `adj_residual_jump_tol_log`
-
-#### Feature engineering
-
-* `feature_horizons_days` (default: 21, 63, 126, 252)
-
-### `de_validate_config()`
-
-Strict checks:
-
-* enum validation
-* logical flags
-* directory strings
-* numeric bounds
-* integer windows/horizons
-* optional `years` vector sanity
-
-### `de_get_config(overrides)`
-
-* merges user overrides safely (rejects unknown keys)
-* validates config
-* canonicalizes vectors (`unique`, sorted, integer-cast)
-* creates required directories
-
-This makes the engine safer for iterative experimentation.
-
----
-
-## Utilities (`R/02_utils.R`)
-
-Small but practical helper layer.
-
-### Highlights
-
-* `%||%`: NULL-coalescing operator
-* `de_require(pkgs)`: explicit dependency gate with useful error message
-* `de_log()`, `de_log_cfg()`: simple pipeline logging
-* `de_weekdays_only()`: weekday filter
-* `de_make_bizdays_seq()`: B3 business-day sequence via `bizdays::bizseq`, with error wrapping
-
----
-
-## Provider layer (`R/03_providers.R`)
-
-## 1) RB3 (B3 market data)
-
-### `de_rb3_init(cfg)`
-
-* sets `rb3` cache dir under `cfg$cache_dir/rb3`
-* configures `options(rb3.cachedir=...)`
-* attempts `rb3_bootstrap()`
-
-### `de_rb3_fetch_yearly_lazy(year, cfg)`
-
-* fetches yearly cotahist via `rb3`
-* fallback path if `fetch_marketdata` fails
-* returns filtered data for exact year window
-
-### `de_rb3_fetch_window_lazy(start_date, end_date, cfg)`
-
-* fetches daily cotahist for a business-day sequence
-* fallback loops per date if bulk fetch fails
-* returns requested date range only
-
-**Note:** These functions return `rb3`/lazy outputs that are later standardized in universe builders.
-
----
-
-## 2) Yahoo corporate actions
-
-### `de_yahoo_symbol(symbol)`
-
-Maps B3 ticker to Yahoo ticker:
-
-* uppercases / trims
-* appends `.SA` unless symbol already contains `.`
-
-### `de_yahoo_with_retry(fun, ...)`
-
-Retry wrapper with exponential backoff + jitter for rate limits:
-
-* retries only for 429 / rate-limit-like errors
-* returns `NULL` on non-retryable failure
-
-### `de_yahoo_fetch_chart_events_one(yahoo_symbol, from, to)`
-
-Direct Yahoo Chart API fetch (`events=div|splits`):
-
-* uses `curl` + `jsonlite`
-* parses dividends and splits
-* converts split event into **price factor orientation**:
-
-  * `pf = denominator / numerator`
-  * e.g., 2:1 split => `1/2 = 0.5`
-* returns typed `data.table`
-
-### `de_yahoo_fetch_splits_quantmod_one()` / `de_yahoo_fetch_dividends_quantmod_one()`
-
-Alternative fetch path via `quantmod`:
-
-* splits and dividends fetched separately
-* dividends call uses `split.adjust = TRUE`
-* outputs standardized CA rows
-
----
-
-## Universe building (`R/04_universe.R`)
-
-This layer converts `rb3` outputs into a stable raw universe contract.
-
-## Key strengths in this file
-
-### 1) Schema resilience via column aliasing
-
-`de_select_min_cols()` maps multiple possible column names to canonical columns:
-
-* `symbol/ticker`
-* `refdate/date`
-* OHLC aliases (including Portuguese names)
-* volume/quantity aliases
-
-This is excellent defensive coding against provider schema variation.
-
-### 2) Liquidity unification
-
-`de_unify_liquidity()` creates:
-
-* `qty`
-* `turnover`
-
-`turnover` is computed from:
-
-1. `vol_fin` if available and valid
-2. fallback `qty * close`
-
-### 3) Global deduplication on `(symbol, refdate)`
-
-`de_dedupe_symbol_date()`:
-
-* sorts by `asset_type, symbol, refdate`
-* if duplicates exist, keeps the “best” row using descending priority:
-
-  * turnover
-  * qty
-  * close
-* restores order
-
-This is a pragmatic dedupe heuristic for noisy provider outputs.
-
-### 4) Asset-type-specific processing
-
-`de_process_rb3_lazy_df()`:
-
-* applies `rb3::cotahist_filter_*` per included type
-* collects each subset
-* standardizes and tags `asset_type`
-* removes invalid rows (`close > 0`, non-missing symbol/date)
-
-### Builders
-
-* `de_build_universe_year(year, include_types, cfg)`
-* `de_build_universe_window(start_date, end_date, cfg)` ✅ includes dedupe + validation
-* `de_build_universe(years, cfg)` ✅ merges years, dedupes globally, validates
-
----
-
-## Corporate actions and events (`R/05_corp_actions.R`)
-
-This is one of the most important files in the module. It does more than fetching—it performs **selection, cache hygiene, validation, split sanity checks, and event normalization**.
-
----
-
-## A) Candidate selection (`de_select_ca_candidates`)
-
-Goal: avoid fetching CA for every symbol in the universe.
-
-### Selection logic (strict)
-
-Based on recent liquidity/trading coverage:
-
-* median turnover >= `min_turnover`
-* traded-day ratio >= `min_days_traded_ratio`
-
-### Force-in override
-
-`force_symbols` are sanitized and included regardless of liquidity filters.
-
-### Diagnostic audit (not strict filtering)
-
-Computes symbol-level booleans:
-
-* `has_positive_jump`
-* `has_negative_gap`
-
-Using:
-
-* log-return threshold for positive jumps
-* asset-type-specific simple-return gap thresholds for negative gaps
-
-Returns:
-
-* `candidates`: symbols selected for CA fetch
-* `prefilter_audit`: symbol-level audit table (includes forced and non-forced)
-
-This separation of **selection vs audit flags** is very good design.
-
----
-
-## B) CA registry build (`de_build_ca_registry`)
-
-This function builds the raw corporate actions table for candidate symbols.
-
-### Notable design features
-
-#### 1) Strictly typed empty tables
-
-It defines `empty_ca_tbl()` and uses it consistently.
-This avoids downstream breakage in no-event / no-candidate paths.
-
-#### 2) Validated cache loading
-
-Both batch and symbol caches are:
-
-* read
-* normalized
-* **validated against contract**
-  before reuse.
-
-Corrupt or stale caches are automatically rebuilt.
-
-#### 3) Cache modes
-
-* **batch**: one file for the whole request hash `(symbols, from, to, fetch_mode)`
-* **by_symbol**: one file per symbol + exact window hash
-* **none**: no cache usage
-
-#### 4) Empty-result caching
-
-Even empty results are cached (including typed schema) to prevent refetch storms.
-
-#### 5) Stale extra-column hygiene
-
-`normalize_ca_tbl()` drops extra columns from caches (e.g., accidental debug leakage) and restores canonical column order.
-
----
-
-## C) Split validation / snapping (`de_fix_yahoo_splits_by_raw_gap`)
-
-This is a standout feature. Yahoo split dates/factors can be noisy or misoriented; this function validates them against raw price action.
-
-### What it does
-
-For Yahoo split rows:
-
-1. Looks around vendor date in a configurable window:
-
-   * backward days: `split_gap_max_back_days`
-   * forward days: `split_gap_max_forward_days`
-2. Computes observed gap ratio using:
-
-   * `open / previous close` (if enabled)
-   * else `close / previous close`
-3. Compares observed ratio to **both**:
-
-   * `value`
-   * `1/value`
-4. Chooses best match by minimum `abs(log(obs) - log(candidate))`
-5. Classifies split:
-
-   * `kept` (good match within tolerance)
-   * `unverified` (no match found, but not automatically dropped)
-   * `rejected` (bad mismatch)
-   * `dup` (duplicate validated split same symbol/effective date/value)
-
-### Outputs
-
-* `corp_actions_apply`: corrected CA set for application
-* `split_audit`: detailed evaluation results
-* `quarantine`: rejected/duplicate splits
-
-### Why this matters
-
-It protects the adjusted panel from:
-
-* wrong effective dates
-* inverted split factors
-* duplicate vendor events
-* spurious split entries
-
-This is exactly the kind of robustness a production-quality adjustment engine needs.
-
----
-
-## D) Event normalization (`de_build_events`)
-
-Converts row-level CA records (possibly multiple rows per day) into one normalized event row per `(symbol, refdate)`.
-
-### Behavior
-
-* optionally appends `manual_events` if enabled
-* deduplicates exact duplicate CA rows
-* aggregates:
-
-  * splits by product (`prod(value)`)
-  * dividends by sum (`sum(value)`)
-* constructs `source_mask`
-* normalizes repeated source labels (e.g., `yahoo+yahoo -> yahoo`)
-* sets `has_manual`
-* validates final `events_apply` contract
-
-### Event semantics
-
-* `split_value`: multiplicative **price factor**
-
-  * no split => `1`
-* `div_cash`: cash dividend
-
-  * no dividend => `0`
-
-### Manual events
-
-The fixture suggests a template exists (`fixtures/manual_events_template.csv`), but its exact column contents were not shown. Based on the code path, manual events are expected to be compatible with CA rows (at least `symbol`, `refdate`, `action_type`, `value`, and optionally `source`/`yahoo_symbol`).
-
----
-
-## Adjustment engine (`R/06_adjuster.R`)
-
-This is the mathematical core of the module.
-
-## Helper: reverse cumulative product (exclusive)
-
-`de_rev_cumprod_exclusive(x)` computes the product of **future** factors only (exclusive of current row), per symbol.
-
-This is the right tool for building **backward adjustment factors** that scale historical prices to the most recent basis.
-
----
-
-## `de_apply_adjustments(universe_raw, events_apply, cfg)`
-
-Merges events into raw universe and computes adjustment factors.
-
-### Step 1 — merge and fill defaults
-
-For rows without events:
-
-* `split_value = 1`
-* `div_cash = 0`
-* `source_mask = "none"`
-* `has_manual = FALSE`
-
-### Step 2 — split adjustment
-
-Per symbol:
-
-* `split_factor_cum = reverse_cumprod_exclusive(split_value)`
-
-Then:
-
-* `*_adj_split = *raw * split_factor_cum`
-
-This aligns pre-split history to post-split scale.
-
-### Step 3 — dividend adjustment
-
-Uses split-adjusted close to compute dividend factor events.
-
-* `close_prev = lag(close_adj_split)`
-* initialize:
-
-  * `div_factor_event = 1`
-  * `div_cash_eff = div_cash`
-
-#### Dividend rescue (basis mismatch handling)
-
-If `div_cash >= close_prev` on a dividend row (which is usually invalid), the code attempts a **rescue**:
-
-* scales dividend by `split_factor_cum`
-* accepts rescue if scaled dividend is valid (`0 <= scaled < close_prev`)
-
-This is a smart practical fix for mixed vendor conventions (split-adjusted vs non-adjusted dividend values).
-
-#### Boundary handling (truncated windows)
-
-First visible row per symbol may have a dividend but no `close_prev`:
-
-* flagged as `issue_div_boundary = TRUE`
-* not treated as a generic invalid dividend issue
-
-#### Bad dividend rows
-
-Rows are flagged `issue_div = TRUE` if dividend factor cannot be safely computed (excluding boundary case).
-
-#### Dividend factor event
-
-For valid dividend rows:
-
-* `div_factor_event = (close_prev - div_cash_eff) / close_prev`
-
-Then:
-
-* `div_factor_cum = reverse_cumprod_exclusive(div_factor_event)`
-
-### Step 4 — final factor and adjusted OHLC
-
-* `adj_factor_final = split_factor_cum * div_factor_cum`
-* final adjusted OHLC = raw OHLC × `adj_factor_final`
-
-### Step 5 — timeline audit
-
-Returns a row-level `adjustments_timeline` containing:
-
-* event inputs
-* effective dividend value
-* split/dividend cumulative factors
-* final factor
-* source lineage
-* issue flags
-
-This is excellent for postmortem debugging.
-
----
-
-## `de_build_panel_adjusted(...)`
-
-Wraps the adjustment computation and constructs final outputs.
-
-### Adjustment state classification
-
-Starts at symbol level using events and issue flags:
-
-* `no_actions`
-* `dividend_only`
-* `split_only`
-* `split_dividend`
-* `manual_override`
-
-### Residual jump safety net
-
-Even after adjustments, the engine checks for suspicious jumps:
-
-* computes max absolute log-return on adjusted close per symbol
-* flags if `>= adj_residual_jump_tol_log`
-
-Creates:
-
-* `residual_jump_audit`
-* symbol-level residual jump date and magnitude
-
-### Final suspect states
-
-State may be overwritten to:
-
-* `suspect_dividend_factor`
-* `suspect_residual_jump`
-* `suspect_both`
-
-This is useful because it distinguishes:
-
-* event topology (split/dividend/manual)
-  from
-* quality/suspicion outcome.
-
-### Two-panel output design
-
-* `panel_adj_model`: compact, model-facing
-* `panel_adj_debug`: raw + intermediate + final adjusted columns
-
-This split is a strong pattern for quantitative pipelines.
-
----
-
-## Diagnostic features (`R/07_diagnostics_features.R`)
-
-Optional, lightweight symbol-level diagnostics computed from `panel_adj_model`.
-
-## `de_compute_symbol_diag_features(dt_sym, horizons_days)`
-
-Requires at least 30 observations; otherwise returns `NULL`.
-
-### Computes
-
-For the last row (end-of-window snapshot):
-
-* `ret_{h}d` for each horizon
-* `vol_cc_{h}d` (annualized SD of log close-close returns)
-* `max_dd` (max drawdown)
-* `ulcer_index`
-* `amihud` (mean `|ret| / turnover`)
-
-### Notes
-
-* Uses adjusted close from `panel_adj_model`
-* `amihud` uses simple returns and `turnover > 0`
-* returns a **single-row** summary per symbol
-
-## `de_build_features_diag(panel_adj_model, cfg)`
-
-* orders by `(symbol, refdate)`
-* trims each symbol to only the necessary tail window (`max_horizon + 1`)
-* applies per-symbol feature computation
-* returns consolidated feature table
-
-This is intentionally diagnostic/QA-oriented, not yet a full alpha feature factory.
-
----
-
-## Main entrypoint (`R/08_pipeline.R`)
-
-## `de_run_data_engine(...)`
-
-### Supported input modes (mutually exclusive)
-
-1. **Year mode**
-
-   * `years = ...`
-2. **Window mode**
-
-   * `start_date`, `end_date`
-
-The function explicitly rejects invalid combinations:
-
-* years + window together ❌
-* only one of start/end ❌
-* start > end ❌
-
-### Parameters
-
-* `force_symbols`: ensure CA fetch for specified symbols
-* `manual_events`: optional manual CA/event rows
-* `overrides`: config overrides list
-* `build_diag_features`: toggle diagnostics features
-
-### Execution sequence
-
-1. Validate input mode
-2. Build and log config
-3. Build raw universe
-4. Select CA candidates
-5. Fetch CA registry
-6. Validate/snap splits (optional)
-7. Build normalized events
-8. Apply adjustments / build panels
-9. Build diagnostic features (optional)
-10. Return bundle
-
-### Output bundle (returned list)
-
-* `panel_adj_model`
-* `panel_adj_debug`
-* `events_apply`
-* `corp_actions_raw`
-* `corp_actions_apply`
-* `corp_actions_quarantine`
-* `split_audit`
-* `prefilter_audit`
-* `adjustments_timeline`
-* `residual_jump_audit`
-* `features_diag`
-* `meta` (config, run timestamp, row counts)
-
----
-
-## Engineering strengths of this module
-
-## 1) Contract-driven design
-
-Schemas are explicit and enforced early.
-
-## 2) Auditable by construction
-
-It returns debug tables, timelines, split audits, quarantines, and residual jump diagnostics.
-
-## 3) Practical resilience to vendor issues
-
-* Yahoo retries
-* split date/factor snapping
-* dividend basis rescue
-* validated cache reuse
-* empty typed caches
-
-## 4) Clear separation of concerns
-
-Providers, normalization, validation, adjustment math, diagnostics, orchestration are separated across files.
-
-## 5) Model vs debug outputs
-
-Prevents contaminating model consumers with debug columns while preserving full traceability.
-
----
-
-## Important implementation nuances / caveats
-
-## 1) `corp_actions_raw` duplicates are allowed
-
-This is intentional because multiple actions can occur on the same symbol/date.
-
-## 2) Sorting is not a validator concern
-
-Builders must ensure row ordering; validators stay pure.
-
-## 3) Adjustment applies to OHLC only
-
-`turnover` and `qty` are carried through but not adjusted.
-
-## 4) Dividend boundary rows
-
-Dividend events on the first visible row of a truncated window are flagged (`issue_div_boundary`) because prior close is unavailable.
-
-## 5) `manual_override` vs suspect states
-
-`manual_override` is assigned initially, but later suspect labels (`suspect_*`) can overwrite the final `adjustment_state` if issues are detected. This is not necessarily wrong, but it is a semantic choice worth documenting.
-
-## 6) Feature layer is diagnostic, not full research feature engine
-
-It computes one snapshot row per symbol (end-of-window), not a rolling time-indexed feature matrix.
-
----
-
-## Dependency expectations (inferred from code)
-
-Core packages referenced across files:
+### Core runtime dependencies
 
 * `data.table`
 * `dplyr`
 
-Optional/feature/provider packages:
+### Provider / infra dependencies
 
 * `rb3`
 * `bizdays`
@@ -935,117 +127,477 @@ Optional/feature/provider packages:
 * `quantmod`
 * `zoo`
 
-The engine uses explicit `de_require()` checks in many paths, which helps fail fast.
+> Notes:
+>
+> * `rb3` is attached (not just namespace-loaded) by the engine because of template registry initialization behavior.
+> * `bizdays` must support the `"Brazil/B3"` calendar in your environment.
 
 ---
 
-## Inferred usage examples (README-ready)
+## How to load the module in R
 
-### Example 1 — Year-based build
+This is a script-based module (not a packaged R library yet), so source files in order.
+
+### Option A — source all files (recommended during development)
+
+```r
+r_files <- sort(list.files("data_engine/R", pattern = "\\.R$", full.names = TRUE))
+for (f in r_files) source(f)
+```
+
+### Option B — source explicitly
+
+```r
+source("data_engine/R/00_contracts.R")
+source("data_engine/R/01_config.R")
+source("data_engine/R/02_utils.R")
+source("data_engine/R/03_providers.R")
+source("data_engine/R/04_universe.R")
+source("data_engine/R/05_corp_actions.R")
+source("data_engine/R/06_adjuster.R")
+source("data_engine/R/07_diagnostics_features.R")
+source("data_engine/R/08_pipeline.R")
+```
+
+---
+
+## Main entrypoint: `de_run_data_engine(...)`
+
+### Signature
+
+```r
+de_run_data_engine(
+  years = NULL,
+  start_date = NULL, end_date = NULL,
+  force_symbols = NULL,
+  manual_events = NULL,
+  overrides = NULL,
+  build_diag_features = TRUE
+)
+```
+
+### Input modes (mutually exclusive)
+
+You must choose **one** mode:
+
+#### 1) Year mode
+
+```r
+res <- de_run_data_engine(years = 2024:2025)
+```
+
+#### 2) Window mode
+
+```r
+res <- de_run_data_engine(
+  start_date = "2025-01-01",
+  end_date   = "2025-12-31"
+)
+```
+
+### Invalid combinations (rejected by design)
+
+* `years` + `start_date/end_date` together ❌
+* only `start_date` without `end_date` (or vice versa) ❌
+* `start_date > end_date` ❌
+
+---
+
+## Usage examples
+
+## Example 1 — Basic year-based build
 
 ```r
 res <- de_run_data_engine(
   years = 2024:2025,
   overrides = list(
-    min_turnover = 1e6,
     ca_fetch_mode = "chart",
     ca_cache_mode = "batch"
   )
 )
 
 panel <- res$panel_adj_model
+str(panel)
 ```
 
-### Example 2 — Date-window build with forced symbols and manual events
+---
+
+## Example 2 — Date-window build with custom liquidity threshold
 
 ```r
-manual_events <- data.table::data.table(
-  symbol = c("PETR4"),
-  refdate = as.Date(c("2025-03-10")),
-  action_type = c("dividend"),
-  value = c(0.72),
-  source = c("manual")
+res <- de_run_data_engine(
+  start_date = "2025-01-01",
+  end_date   = "2025-12-31",
+  overrides = list(
+    min_turnover = 1e6,
+    min_days_traded_ratio = 0.75
+  )
+)
+
+panel <- res$panel_adj_model
+head(panel)
+```
+
+---
+
+## Example 3 — Forcing CA fetch for specific symbols
+
+Useful when a symbol is illiquid and would otherwise be excluded from CA candidate selection.
+
+```r
+res <- de_run_data_engine(
+  years = 2025,
+  force_symbols = c("PETR4", "VALE3")
+)
+```
+
+---
+
+## Example 4 — Manual events (e.g., patching vendor gaps)
+
+```r
+library(data.table)
+
+manual_events <- data.table(
+  symbol = c("PETR4", "PETR4"),
+  refdate = as.Date(c("2025-03-10", "2025-05-15")),
+  action_type = c("dividend", "split"),
+  value = c(0.72, 0.5),   # split uses price-factor orientation (2:1 split => 0.5)
+  source = c("manual", "manual")
 )
 
 res <- de_run_data_engine(
   start_date = "2025-01-01",
   end_date   = "2025-12-31",
-  force_symbols = c("PETR4", "VALE3"),
   manual_events = manual_events,
-  overrides = list(
-    enable_manual_events = TRUE,
-    enable_split_gap_validation = TRUE
-  )
+  overrides = list(enable_manual_events = TRUE)
 )
 ```
 
 ---
 
-## What the tests/fixtures likely cover (inference only)
+## Reading the outputs quickly (developer workflow)
 
-The file names suggest:
+### 1) Model-facing adjusted panel
 
-* `test_adjuster_cases.R`: adjustment math edge cases (splits/dividends/boundaries/suspects)
-* `test_smoke_data_engine.R`: end-to-end pipeline smoke execution
-* `fixtures/manual_events_template.csv`: template for manual corporate actions/events ingestion
+```r
+panel <- res$panel_adj_model
+names(panel)
+```
 
-However, since their contents were not included in the prompt, this README summary cannot document exact test assertions or fixture schema line-by-line.
+Expect (minimum contract):
+
+* `symbol`, `refdate`, `asset_type`
+* adjusted `open`, `high`, `low`, `close`
+* `traded_value`, `traded_units`, `n_trades`
+* `turnover`, `qty` (legacy aliases)
+* `adjustment_state`
+
+### 2) Debug panel (trace raw → split-adjusted → final-adjusted)
+
+```r
+dbg <- res$panel_adj_debug
+names(dbg)
+```
+
+Includes (at least):
+
+* raw OHLC: `open_raw`, `high_raw`, `low_raw`, `close_raw`
+* split-adjusted OHLC: `open_adj_split`, ...
+* final adjusted OHLC: `open`, `high`, `low`, `close`
+* liquidity/activity canonical fields + aliases
+* `adjustment_state`
+
+### 3) Split audit / quarantine
+
+```r
+res$split_audit
+res$corp_actions_quarantine
+```
+
+Use this to inspect Yahoo split date/factor validation behavior.
+
+### 4) Residual jump audit
+
+```r
+res$residual_jump_audit[residual_jump_flag == TRUE]
+```
+
+Flags symbols with suspicious residual jumps even after adjustments.
+
+### 5) Diagnostic features
+
+```r
+res$features_diag
+```
+
+A single-row per symbol diagnostic snapshot (if `build_diag_features = TRUE`).
 
 ---
 
-## Recommended future README additions (if you want to harden documentation further)
+## Liquidity and activity fields (canonical semantics)
 
-If you plan to make this module reusable by others (or future-you), add:
+This is the most common source of downstream mistakes, so keep this pinned.
 
-1. **Concrete schemas for manual events**
+### Canonical fields (preferred)
 
-   * exact required/optional columns
-   * examples for split and dividend rows
+* `traded_value`: monetary traded value (BRL)
+* `traded_units`: quantity traded
+* `n_trades`: number of trades
 
-2. **Split factor convention note (very explicit)**
+### Legacy aliases (kept for compatibility)
 
-   * “price factor orientation” examples:
+* `turnover` = `traded_value`
+* `qty` = `traded_units`
 
-     * 2:1 split → `0.5`
-     * 1:2 reverse split → `2.0`
+### Practical implications
 
-3. **State machine documentation**
+* **Amihud illiquidity** should use `traded_value` (monetary denominator), not trade count
+* **Average trade size (units)** = `traded_units / n_trades`
+* **Average trade size (BRL)** = `traded_value / n_trades`
 
-   * all `adjustment_state` values + precedence semantics
+---
 
-4. **Known Yahoo quirks**
+## Corporate action conventions (critical)
 
-   * date shifts, factor inversions, missing events, rate-limit behavior
+### `action_type`
 
-5. **Performance notes**
+Allowed values:
 
-   * expected runtime by universe size
-   * when to use `batch` vs `by_symbol` cache mode
+* `"dividend"`
+* `"split"`
 
-6. **Reproducibility notes**
+### Split value orientation
 
-   * cache invalidation strategy
-   * dependency versions
-   * calendar assumptions (`Brazil/B3`)
+`split` values are stored as **price-factor orientation**:
+
+* 2:1 split → `0.5`
+* 1:2 reverse split → `2.0`
+
+This is the convention used in `events_apply$split_value` and adjustment math.
+
+---
+
+## Manual events format (what to pass)
+
+`manual_events` should be CA-like rows compatible with the CA pipeline.
+
+### Minimum recommended columns
+
+* `symbol` (character)
+* `refdate` (`Date`)
+* `action_type` (`"dividend"` or `"split"`)
+* `value` (numeric)
+* `source` (character; usually `"manual"`)
+
+### Optional
+
+* `yahoo_symbol` (not required for manual rows)
+
+### Tip
+
+If reading from CSV, make sure `refdate` is converted to `Date` before calling the engine.
+
+---
+
+## Configuration (`overrides`) — common knobs
+
+Pass a named list to `overrides = list(...)`.
+
+### Commonly changed options
+
+* `include_types`: `c("equity","fii","etf","bdr")`
+* `min_turnover`
+* `min_days_traded_ratio`
+* `ca_fetch_mode`: `"chart"` or `"quantmod"`
+* `ca_cache_mode`: `"batch"`, `"by_symbol"`, `"none"`
+* `enable_manual_events`
+* `enable_split_gap_validation`
+* `split_gap_tol_log`
+* `adj_residual_jump_tol_log`
+* `feature_horizons_days`
+
+### Example
+
+```r
+res <- de_run_data_engine(
+  years = 2025,
+  overrides = list(
+    include_types = c("equity", "fii", "etf"),
+    ca_fetch_mode = "chart",
+    ca_cache_mode = "batch",
+    enable_split_gap_validation = TRUE,
+    feature_horizons_days = c(21L, 63L, 126L, 252L)
+  )
+)
+```
+
+### Safety feature
+
+Unknown override keys are rejected (the engine fails fast instead of silently ignoring typos).
+
+---
+
+## Contract-driven validation (design philosophy)
+
+The engine uses explicit schema contracts (`de_contracts`) and validation via `de_validate_contract()`.
+
+Validation covers:
+
+* required columns
+* types/domains (e.g., Date, positive prices)
+* allowed enums (`asset_type`, `action_type`)
+* duplicate `(symbol, refdate)` keys for most tables
+
+### Important exception
+
+`corp_actions_raw` is allowed to have duplicate `(symbol, refdate)` because multiple corporate actions can occur on the same date.
+
+### Important design nuance
+
+Validators are intentionally **pure**:
+
+* they validate
+* they do **not** reorder rows
+
+Row ordering is the responsibility of builder functions.
+
+---
+
+## Pipeline summary (high level)
+
+1. Build raw universe from `rb3`
+2. Normalize schema + liquidity/activity fields
+3. Select CA candidates from recent liquidity/trading coverage
+4. Fetch CA from Yahoo (with cache)
+5. Validate/snap Yahoo splits against raw price gaps
+6. Build normalized `events_apply`
+7. Apply split + dividend adjustments
+8. Build adjusted panels + audits
+9. Optionally build `features_diag`
+
+---
+
+## Diagnostics and audit artifacts (why they matter)
+
+This engine is intentionally “audit-heavy”. Keep and inspect these when debugging data quality issues:
+
+* `prefilter_audit`: why symbols were/weren’t CA candidates
+* `split_audit`: split validation status (`kept`, `unverified`, `rejected`, `dup`)
+* `corp_actions_quarantine`: rejected/duplicate split rows
+* `adjustments_timeline`: per-row factors and issue flags
+* `residual_jump_audit`: post-adjustment suspicious jump detection
+* `panel_adj_debug`: raw + intermediate + final OHLC trail
+
+---
+
+## Adjustment states (`panel_adj_model$adjustment_state`)
+
+Expected values include:
+
+* `no_actions`
+* `dividend_only`
+* `split_only`
+* `split_dividend`
+* `manual_override`
+* `suspect_dividend_factor`
+* `suspect_residual_jump`
+* `suspect_both`
+
+### Precedence nuance
+
+`manual_override` can be overwritten later by `suspect_*` labels if residual issues are detected. This is intentional: suspicion flags take precedence in final labeling.
+
+---
+
+## `features_diag` (what it is and what it is not)
+
+`features_diag` is a **symbol-level diagnostic snapshot** (one row per symbol, end-of-window), not a rolling time-indexed feature panel.
+
+Typical columns:
+
+* `symbol`, `end_refdate`, `n_obs`
+* `ret_{h}d`
+* `vol_cc_{h}d`
+* `max_dd`
+* `ulcer_index`
+* `amihud`
+* `avg_trade_size_units` (when possible)
+* `avg_trade_size_brl` (when possible)
+
+It is primarily for QA / quick diagnostics.
+
+---
+
+## Troubleshooting
+
+### 1) “Missing required packages...”
+
+Install the packages listed in Dependencies and retry.
+
+### 2) `rb3` errors / template registry issues
+
+The engine attempts to attach `rb3` internally. If `rb3` still fails, restart R and retry after reinstall/update.
+
+### 3) Yahoo rate-limit behavior
+
+The Yahoo fetch layer retries rate-limit errors with backoff, but heavy runs may still fail. Re-run later or use cache (`ca_cache_mode = "batch"`).
+
+### 4) Empty or sparse outputs
+
+Common causes:
+
+* strict date window too small
+* too restrictive `include_types`
+* no available rb3 data in the requested window
+* very high liquidity thresholds (for CA candidates)
+
+### 5) Suspicious `adjustment_state`
+
+Inspect:
+
+* `res$split_audit`
+* `res$adjustments_timeline`
+* `res$residual_jump_audit`
+* `res$panel_adj_debug[symbol == "..."]`
+
+---
+
+## Tests
+
+Included tests:
+
+* `tests/test_adjuster_cases.R`
+* `tests/test_smoke_data_engine.R`
+
+Run them in your dev workflow after changing:
+
+* adjustment math
+* CA fetch/normalization logic
+* contracts/schema
+* liquidity semantics
+
+---
+
+## Recommended downstream usage policy
+
+Use `panel_adj_model` as the canonical downstream input for modeling/backtesting, and treat:
+
+* `adjustment_state`
+* `residual_jump_audit`
+* `prefilter_audit`
+
+as **downstream filtering/auditing signals**, not as reasons to mutate upstream data construction logic.
+
+That keeps the data engine clean, reproducible, and strategy-agnostic.
 
 ---
 
 ## Bottom line
 
-This is a **well-structured, robust data-adjustment module** for a quant pipeline, with unusually strong attention to:
+`data_engine` is not a simple downloader. It is a **contract-validated, auditable adjustment pipeline** with explicit handling for real-world vendor quirks (Yahoo CA noise, split date/factor mismatch, dividend basis mismatch, cache corruption/staleness).
 
-* schema contracts
-* vendor error handling
-* auditability
-* adjustment correctness diagnostics
-* operational caching hygiene
+Use it as the stable upstream foundation for the model/backtest engines.
 
-It already reads like a serious internal production component rather than a prototype script collection.
+---
 
-If you want, I can also turn this into a **more formal README format** with:
-
-* installation section
-* dependency matrix
-* function reference index
-* output schemas as explicit markdown tables
-* “design rationale” and “failure modes” sections.
