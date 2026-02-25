@@ -392,12 +392,30 @@ me_cluster_z <- function(s, labels, eps = 1e-8) {
 me_run_graph_pipeline <- function(risk_artifact, spec_graph = list(),
                                   prev_P_bar = NULL, prev_labels = NULL) {
     Theta <- risk_artifact$Theta_eps
+
     if (is.null(Theta) || ncol(Theta) < 3) {
-        n <- length(risk_artifact$w_hrp)
-        syms <- names(risk_artifact$w_hrp)
+        syms <- NULL
+
+        if (!is.null(Theta) && is.matrix(Theta)) {
+            syms <- colnames(Theta)
+        }
+        if (is.null(syms) || length(syms) == 0) {
+            Sigma_ref <- risk_artifact$Sigma_risk_1 %||% risk_artifact$Sigma_total
+            if (!is.null(Sigma_ref) && is.matrix(Sigma_ref)) syms <- colnames(Sigma_ref)
+        }
+        if ((is.null(syms) || length(syms) == 0) && !is.null(risk_artifact$w_baseline)) {
+            syms <- names(risk_artifact$w_baseline)
+        }
+        if ((is.null(syms) || length(syms) == 0) && !is.null(risk_artifact$w_hrp)) {
+            syms <- names(risk_artifact$w_hrp) # backward-compat fallback only
+        }
+
+        syms <- syms %||% character(0)
+        n <- length(syms)
+
         return(list(
             P = NULL, P_bar = NULL, mask = NULL, operators = NULL,
-            clustering = list(labels = setNames(rep(1L, n), syms), K = 1L),
+            clustering = list(labels = setNames(rep(1L, n), syms), K = if (n > 0) 1L else 0L),
             diag = list(skipped = TRUE, reason = "no_precision_matrix")
         ))
     }

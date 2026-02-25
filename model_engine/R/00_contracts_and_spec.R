@@ -48,7 +48,7 @@ me_spec_default <- function() {
                 lookback = 252L
             ),
             resid = list(
-                use_glasso = FALSE,
+                use_glasso = TRUE,
                 lambda     = 0.1
             ),
             factor = list(),
@@ -115,9 +115,13 @@ me_spec_default <- function() {
 
         # ── meta section ──
         meta = list(
-            retain_windows  = FALSE,
-            retain_matrices = FALSE,
-            mode            = "production"
+            retain_windows         = FALSE,
+            retain_matrices        = FALSE,
+            mode                   = "production",
+            strict_fallbacks       = FALSE,
+            strict_warnings        = FALSE,
+            strict_architecture    = FALSE,
+            capture_stage_warnings = TRUE
         )
     )
 }
@@ -273,6 +277,22 @@ me_validate_spec <- function(spec) {
         stop("portfolio$max_turnover must be in [0, 1]")
     }
 
+    # ---- meta section ----
+    m <- spec$meta
+    bool_fields <- c(
+        "retain_windows", "retain_matrices",
+        "strict_fallbacks", "strict_warnings",
+        "strict_architecture", "capture_stage_warnings"
+    )
+    for (nm in bool_fields) {
+        if (!is.null(m[[nm]]) && (!is.logical(m[[nm]]) || length(m[[nm]]) != 1L || is.na(m[[nm]]))) {
+            stop(sprintf("meta$%s must be TRUE/FALSE", nm))
+        }
+    }
+    if (!is.null(m$mode) && (!is.character(m$mode) || length(m$mode) != 1L)) {
+        stop("meta$mode must be a length-1 character string")
+    }
+
     invisible(spec)
 }
 
@@ -317,18 +337,28 @@ me_validate_snapshot_artifact <- function(x) {
         }
     }
 
-    # Risk universe alignment
+    # Risk universe alignment (covariance-based, not HRP-based)
     risk <- x$risk
-    if (!is.null(risk$w_hrp) && length(risk$w_hrp) > 0) {
-        risk_univ <- names(risk$w_hrp)
-        if (!all(tgt$symbol %in% risk_univ)) {
-            stop("Some target symbols are not in risk universe")
+    Sigma_ref <- risk$Sigma_risk_H %||% risk$Sigma_total %||% risk$Sigma_risk_1
+
+    if (!is.null(Sigma_ref)) {
+        if (!is.matrix(Sigma_ref)) stop("Risk covariance must be a matrix")
+        if (nrow(Sigma_ref) != ncol(Sigma_ref)) stop("Risk covariance must be square")
+        if (is.null(rownames(Sigma_ref)) || is.null(colnames(Sigma_ref))) {
+            stop("Risk covariance must have rownames and colnames")
         }
-        # Sigma_total alignment
-        if (!is.null(risk$Sigma_total)) {
-            if (!all(names(risk$w_hrp) == colnames(risk$Sigma_total))) {
-                stop("w_hrp names do not align with Sigma_total colnames")
-            }
+        if (!identical(rownames(Sigma_ref), colnames(Sigma_ref))) {
+            stop("Risk covariance rownames/colnames must match and be in same order")
+        }
+        if (nrow(tgt) > 0 && !all(tgt$symbol %in% colnames(Sigma_ref))) {
+            stop("Some target symbols are not in risk covariance universe")
+        }
+    }
+
+    # Optional baseline alignment check (transitional; not architecture-defining)
+    if (!is.null(risk$w_baseline) && length(risk$w_baseline) > 0 && !is.null(Sigma_ref)) {
+        if (!all(names(risk$w_baseline) %in% colnames(Sigma_ref))) {
+            stop("risk$w_baseline symbols are not contained in risk covariance universe")
         }
     }
 

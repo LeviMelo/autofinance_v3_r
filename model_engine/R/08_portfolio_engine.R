@@ -312,13 +312,23 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
                                       forecast_artifact = NULL,
                                       graph_artifact = NULL,
                                       prev_target = NULL) {
-    w_hrp <- risk_artifact$w_hrp
     gating <- state_gating_artifact$gating
     gross_exposure <- gating$gross_exposure
     w_cash <- gating$w_cash
     max_weight <- spec_portfolio$caps$max_weight %||% 0.15
 
-    risk_univ <- names(w_hrp)
+    Sigma <- risk_artifact$Sigma_risk_H %||% risk_artifact$Sigma_total %||% risk_artifact$Sigma_risk_1
+    if (is.null(Sigma)) {
+        stop("me_build_portfolio_target: risk artifact missing covariance matrix (Sigma_risk_H / Sigma_total / Sigma_risk_1).")
+    }
+    if (!is.matrix(Sigma) || nrow(Sigma) != ncol(Sigma)) {
+        stop("me_build_portfolio_target: risk covariance must be square matrix.")
+    }
+    if (is.null(rownames(Sigma)) || is.null(colnames(Sigma)) || !identical(rownames(Sigma), colnames(Sigma))) {
+        stop("me_build_portfolio_target: risk covariance must have matching row/col names in same order.")
+    }
+
+    risk_univ <- colnames(Sigma)
     n_risk <- length(risk_univ)
 
     if (n_risk == 0) {
@@ -330,6 +340,22 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
             target_weights = tgt_df, cash_weight = 1.0,
             diag = list(n_risk = 0, method = "empty")
         ))
+    }
+
+    # Transitional baseline (legacy internals allowed; contracts no longer depend on HRP)
+    w_baseline <- risk_artifact$w_baseline %||% risk_artifact$w_hrp
+    if (is.null(w_baseline) || length(w_baseline) == 0) {
+        w_baseline <- setNames(rep(1 / n_risk, n_risk), risk_univ)
+    } else {
+        wb <- setNames(rep(0, n_risk), risk_univ)
+        common_wb <- intersect(risk_univ, names(w_baseline))
+        wb[common_wb] <- w_baseline[common_wb]
+        if (sum(wb) <= 0) {
+            wb[] <- 1 / n_risk
+        } else {
+            wb <- wb / sum(wb)
+        }
+        w_baseline <- wb
     }
 
     # ── Choose optimization path ──
@@ -347,9 +373,8 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         alpha_aligned[intersect(names(alpha), risk_univ)] <-
             alpha[intersect(names(alpha), risk_univ)]
 
-        Sigma <- risk_artifact$Sigma_total
         opt <- me_qp_optimize(
-            Sigma, alpha_aligned, w_hrp, gross_exposure,
+            Sigma, alpha_aligned, w_baseline, gross_exposure,
             spec_portfolio, prev_target
         )
         w_target <- opt$w
@@ -362,7 +387,7 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
             combined[intersect(names(combined), risk_univ)]
 
         w_target <- .tilt_allocation(
-            alpha_aligned, w_hrp, gross_exposure,
+            alpha_aligned, w_baseline, gross_exposure,
             max_weight, spec_portfolio
         )
         method <- "tilt_signal"
@@ -413,7 +438,8 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
             n_risk = n_risk, n_active = nrow(tgt_df),
             gross_exposure = actual_risky,
             method = method,
-            max_weight_used = max_weight
+            max_weight_used = max_weight,
+            baseline_method = risk_artifact$baseline_method %||% "unknown"
         )
     )
 }

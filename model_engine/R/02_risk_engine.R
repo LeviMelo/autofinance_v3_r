@@ -85,17 +85,38 @@ me_fit_residual_cov <- function(E_window, spec_resid) {
     precision <- NULL
     Sigma_eps <- S_eps
 
+    glasso_requested <- use_glasso
+    glasso_used <- FALSE
+    precision_method <- "ridge_inverse"
+    precision_fallback <- FALSE
+    fallback_reason <- NULL
+
     if (use_glasso && n >= 3) {
-        me_require("glasso")
-        gl <- tryCatch(
-            glasso::glasso(S_eps, rho = lambda, penalize.diagonal = FALSE),
-            error = function(e) NULL
-        )
-        if (!is.null(gl)) {
-            Sigma_eps <- gl$w
-            precision <- gl$wi
-            dimnames(precision) <- dimnames(S_eps)
+        if (requireNamespace("glasso", quietly = TRUE)) {
+            gl <- tryCatch(
+                glasso::glasso(S_eps, rho = lambda, penalize.diagonal = FALSE),
+                error = function(e) e
+            )
+            if (!inherits(gl, "error") && !is.null(gl)) {
+                Sigma_eps <- gl$w
+                precision <- gl$wi
+                glasso_used <- TRUE
+                precision_method <- "glasso"
+            } else {
+                precision_fallback <- TRUE
+                fallback_reason <- if (inherits(gl, "error")) {
+                    paste("glasso_failed:", gl$message)
+                } else {
+                    "glasso_failed_unknown"
+                }
+            }
+        } else {
+            precision_fallback <- TRUE
+            fallback_reason <- "glasso_package_not_installed"
         }
+    } else if (use_glasso && n < 3) {
+        precision_fallback <- TRUE
+        fallback_reason <- "glasso_skipped_n_lt_3"
     }
 
     if (is.null(precision)) {
@@ -104,12 +125,36 @@ me_fit_residual_cov <- function(E_window, spec_resid) {
         if (!is.finite(ridge) || ridge < 0) ridge <- 1e-6
         Sigma_eps_r <- Sigma_eps
         diag(Sigma_eps_r) <- diag(Sigma_eps_r) + ridge
-        precision <- tryCatch(solve(Sigma_eps_r), error = function(e) diag(1 / diag(Sigma_eps_r)))
-        dimnames(precision) <- dimnames(S_eps)
+
+        precision <- tryCatch(
+            solve(Sigma_eps_r),
+            error = function(e) {
+                d <- diag(Sigma_eps_r)
+                d[!is.finite(d) | d <= 0] <- 1
+                diag(1 / d)
+            }
+        )
+
+        if (precision_method != "glasso") {
+            precision_method <- "ridge_inverse"
+        }
+        if (is.null(fallback_reason) && use_glasso) {
+            fallback_reason <- "glasso_not_used_ridge_inverse_applied"
+        }
     }
 
     dimnames(Sigma_eps) <- dimnames(S_eps)
-    list(sigma_eps = Sigma_eps, precision = precision)
+    dimnames(precision) <- dimnames(S_eps)
+
+    list(
+        sigma_eps = Sigma_eps,
+        precision = precision,
+        glasso_requested = glasso_requested,
+        glasso_used = glasso_used,
+        precision_method = precision_method,
+        precision_fallback = isTRUE(precision_fallback) || (!glasso_used && glasso_requested),
+        fallback_reason = fallback_reason
+    )
 }
 
 # ── Total covariance assembly ─────────────────────────────────────────────────
@@ -224,20 +269,64 @@ me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
     }
 
     # Distance matrix from correlation
-    cor_mat <- tryCatch(cov2cor(Sigma), error = function(e) NULL)
-    if (is.null(cor_mat)) {
+    cor_mat <- tryCatch(cov2cor(Sigma), error = function(e) e)
+    if (inherits(cor_mat, "error") || is.null(cor_mat)) {
         w <- .inv_var_alloc(Sigma)
         names(w) <- colnames(Sigma)
         attr(w, "allocator_method") <- "inv_var_fallback"
         attr(w, "allocator_fallback") <- TRUE
-        attr(w, "allocator_reason") <- "cov2cor_failed"
+        attr(w, "allocator_reason") <- if (inherits(cor_mat, "error")) {
+            paste("cov2cor_failed:", cor_mat$message)
+        } else {
+            "cov2cor_failed_unknown"
+        }
         return(w)
     }
+
+    if (!is.matrix(cor_mat) || nrow(cor_mat) != ncol(cor_mat)) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- sprintf(
+            "cor_mat_not_square:%sx%s", NROW(cor_mat), NCOL(cor_mat)
+        )
+        return(w)
+    }
+
+    if (is.null(rownames(cor_mat)) || is.null(colnames(cor_mat)) ||
+        !identical(rownames(cor_mat), colnames(cor_mat))) {
+        dimnames(cor_mat) <- dimnames(Sigma)
+    }
+
     cor_mat[!is.finite(cor_mat)] <- 0
     diag(cor_mat) <- 1
-    dist_mat <- sqrt(pmax(0, (1 - cor_mat) / 2))
+    cor_mat <- (cor_mat + t(cor_mat)) / 2
 
-    hc <- tryCatch(hclust(as.dist(dist_mat), method = "ward.D2"),
+    dist_mat <- sqrt(pmax(0, (1 - cor_mat) / 2))
+    if (!is.matrix(dist_mat) || nrow(dist_mat) != ncol(dist_mat)) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- sprintf(
+            "dist_mat_not_square:%sx%s", NROW(dist_mat), NCOL(dist_mat)
+        )
+        return(w)
+    }
+    dimnames(dist_mat) <- dimnames(Sigma)
+
+    dist_obj <- tryCatch(as.dist(dist_mat), error = function(e) e)
+    if (inherits(dist_obj, "error")) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- paste("as.dist_failed:", dist_obj$message)
+        return(w)
+    }
+
+    hc <- tryCatch(hclust(dist_obj, method = "ward.D2"),
         error = function(e) e
     )
 
@@ -246,7 +335,7 @@ me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
         names(w) <- colnames(Sigma)
         attr(w, "allocator_method") <- "inv_var_fallback"
         attr(w, "allocator_fallback") <- TRUE
-        attr(w, "allocator_reason") <- paste("hclust failed:", hc$message)
+        attr(w, "allocator_reason") <- paste("hclust_failed:", hc$message)
         return(w)
     }
 
@@ -292,20 +381,37 @@ me_run_risk_engine <- function(R_window, spec_risk) {
     fac_cov <- me_factor_cov(pca_fit$F, spec_risk$factor)
     Sigma_f <- fac_cov$sigma_f
 
-    # 5. Residual covariance
+    # 5. Residual covariance / precision
     resid_cov <- me_fit_residual_cov(E, spec_risk$resid)
     Sigma_eps <- resid_cov$sigma_eps
     Theta_eps <- resid_cov$precision
 
-    # 6. Total covariance
+    # 6. Total covariance (daily)
     Sigma_total <- me_assemble_total_cov(pca_fit, Sigma_f, Sigma_eps)
 
     # 7. Sanity
     sanity <- me_cov_sanity(Sigma_total, repair = TRUE)
     Sigma_total <- sanity$Sigma
 
-    # 8. HRP
+    # 8. Baseline allocator (legacy HRP baseline; transitional only)
     w_hrp <- me_allocate_hrp(Sigma_total, spec_risk$hrp)
+    w_baseline <- w_hrp
+
+    # 9. Risk covariance objects (daily + horizon-scaled approximation if provided)
+    H <- spec_risk$horizon$H %||% 1L
+    H <- as.integer(H)
+    if (!is.finite(H) || H < 1L) H <- 1L
+
+    Sigma_risk_1 <- Sigma_total
+    Sigma_risk_H <- H * Sigma_risk_1
+
+    pca_var_explained <- tryCatch(
+        {
+            denom <- sum(svd(scale(R_clean, scale = FALSE))$d^2)
+            if (!is.finite(denom) || denom <= 0) NA_real_ else sum(pca_fit$d^2) / denom
+        },
+        error = function(e) NA_real_
+    )
 
     list(
         sigma_t = vols,
@@ -315,7 +421,18 @@ me_run_risk_engine <- function(R_window, spec_risk) {
         Sigma_f = Sigma_f,
         Sigma_eps = Sigma_eps,
         Theta_eps = Theta_eps,
-        Sigma_total = Sigma_total,
+
+        # Transitional + architecture-facing risk covariance slots
+        Sigma_total = Sigma_total, # backward-compatible alias (daily)
+        Sigma_risk_1 = Sigma_risk_1,
+        Sigma_risk_H = Sigma_risk_H,
+
+        # Transitional baseline slots
+        w_baseline = w_baseline,
+        baseline_method = attr(w_hrp, "allocator_method") %||% "unknown",
+        baseline_is_legacy = TRUE,
+
+        # Backward-compatible legacy alias (do not use as contract source)
         w_hrp = w_hrp,
         diag = list(
             n_obs_input = n_obs,
@@ -325,11 +442,19 @@ me_run_risk_engine <- function(R_window, spec_risk) {
             dropped_assets = dropped,
             frac_assets_dropped = length(dropped) / n_input,
             pca_k = pca_fit$k,
-            pca_var_explained = sum(pca_fit$d^2) / sum(svd(scale(R_clean, scale = FALSE))$d^2),
+            pca_var_explained = pca_var_explained,
             was_repaired = sanity$was_repaired,
             min_eigenvalue = sanity$min_eigenvalue,
+            residual_precision_method = resid_cov$precision_method %||% "unknown",
+            residual_precision_fallback = isTRUE(resid_cov$precision_fallback),
+            residual_precision_fallback_reason = resid_cov$fallback_reason %||% NA_character_,
+            glasso_requested = isTRUE(resid_cov$glasso_requested),
+            glasso_used = isTRUE(resid_cov$glasso_used),
             allocator_method = attr(w_hrp, "allocator_method") %||% "unknown",
-            allocator_fallback = isTRUE(attr(w_hrp, "allocator_fallback"))
+            allocator_fallback = isTRUE(attr(w_hrp, "allocator_fallback")),
+            allocator_fallback_reason = attr(w_hrp, "allocator_reason") %||% NA_character_,
+            horizon_H = H,
+            horizon_covariance_method = if (H > 1L) "scaled_daily_covariance" else "daily_covariance"
         )
     )
 }
