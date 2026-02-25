@@ -9,6 +9,128 @@
     tail(mat, min(n, nrow(mat)))
 }
 
+.me_append_feature_snapshot_history <- function(model_state, as_of_date,
+                                                feature_artifact, risk_univ,
+                                                spec_forecast = list()) {
+    fh <- NULL
+    if (!is.null(model_state) && is.list(model_state$feature_history)) {
+        fh <- model_state$feature_history
+    }
+    if (is.null(fh) || !is.list(fh)) fh <- list()
+
+    fh$schema <- "asset_feature_snapshots_v1"
+    if (is.null(fh$snapshots) || !is.list(fh$snapshots)) {
+        fh$snapshots <- list()
+    }
+
+    # Build aligned asset x feature matrix snapshot
+    X <- feature_artifact$X
+    if (is.null(X)) {
+        X <- matrix(0,
+            nrow = length(risk_univ), ncol = 0,
+            dimnames = list(risk_univ, character(0))
+        )
+    } else {
+        if (!is.matrix(X)) X <- as.matrix(X)
+        if (is.null(rownames(X))) {
+            stop("feature_artifact$X must have rownames (symbols) for feature history accumulation")
+        }
+        feat_names <- colnames(X)
+        if (is.null(feat_names)) {
+            feat_names <- paste0("f", seq_len(ncol(X)))
+            colnames(X) <- feat_names
+        }
+
+        X_aligned <- matrix(0,
+            nrow = length(risk_univ), ncol = ncol(X),
+            dimnames = list(risk_univ, colnames(X))
+        )
+        common_syms <- intersect(risk_univ, rownames(X))
+        if (length(common_syms) > 0 && ncol(X) > 0) {
+            X_aligned[common_syms, ] <- X[common_syms, , drop = FALSE]
+        }
+        X <- X_aligned
+    }
+
+    fh$snapshots[[length(fh$snapshots) + 1L]] <- list(
+        as_of_date = as.Date(as_of_date),
+        X = X
+    )
+
+    # De-duplicate by date (keep latest for same date)
+    snap_dates <- vapply(
+        fh$snapshots,
+        function(s) as.character(s$as_of_date %||% NA),
+        character(1)
+    )
+    if (anyDuplicated(snap_dates)) {
+        keep_idx <- !duplicated(snap_dates, fromLast = TRUE)
+        fh$snapshots <- fh$snapshots[keep_idx]
+    }
+
+    # Optional retention cap (defaults to 252 snapshots)
+    keep_n <- as.integer(spec_forecast$history_snapshots_keep %||% 252L)
+    if (!is.finite(keep_n) || keep_n < 2L) keep_n <- 252L
+    if (length(fh$snapshots) > keep_n) {
+        fh$snapshots <- tail(fh$snapshots, keep_n)
+    }
+
+    fh$n_snapshots <- length(fh$snapshots)
+    fh$last_as_of_date <- as.Date(as_of_date)
+
+    fh
+}
+
+.me_extract_forecast_history_input <- function(model_state) {
+    out <- list(
+        X_hist_window = NULL,
+        status = "none",
+        reason = NULL
+    )
+
+    if (is.null(model_state) || !is.list(model_state)) {
+        return(out)
+    }
+
+    # Reject legacy direct matrix path explicitly (off-spec)
+    if (is.matrix(model_state$X_hist_window)) {
+        out$status <- "legacy_matrix_rejected"
+        out$reason <- "model_state$X_hist_window is a legacy matrix input (off-spec for asset-level forecast training)"
+        return(out)
+    }
+
+    fh <- model_state$feature_history
+    if (!is.list(fh)) {
+        return(out)
+    }
+
+    # Reject legacy matrix nested under feature_history too
+    if (is.matrix(fh$X_hist_window)) {
+        out$status <- "legacy_matrix_rejected"
+        out$reason <- "model_state$feature_history$X_hist_window is a legacy matrix input (off-spec)"
+        return(out)
+    }
+
+    # Future-compatible accepted location (not yet produced by this patch)
+    if (is.list(fh$training_panel) && !is.null(fh$training_panel$X_hist_window)) {
+        out$X_hist_window <- fh$training_panel$X_hist_window
+        out$status <- "panel_available"
+        out$reason <- NULL
+        return(out)
+    }
+
+    if (is.list(fh$snapshots) && length(fh$snapshots) > 0) {
+        out$status <- "snapshots_present_panel_missing"
+        out$reason <- sprintf(
+            "%d feature snapshots present, but no asset-level training_panel builder is implemented",
+            length(fh$snapshots)
+        )
+        return(out)
+    }
+
+    out
+}
+
 #' @export
 me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
                             prev_target = NULL, model_state = NULL,
@@ -154,7 +276,12 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
                     symbol = character(0),
                     weight_target = numeric(0),
                     stringsAsFactors = FALSE
-                )
+                ),
+                feature_history = if (!is.null(model_state) && is.list(model_state$feature_history)) {
+                    model_state$feature_history
+                } else {
+                    NULL
+                }
             ),
             warnings = warns
         )
@@ -358,24 +485,55 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     # ══════════════════════════════════════════════════════════════════════════
 
     spec_forecast <- spec$forecast %||% list()
-    X_hist_window <- NULL
 
-    # Optional future-compatible locations for feature history in model_state
-    if (!is.null(model_state) && is.matrix(model_state$X_hist_window)) {
-        X_hist_window <- model_state$X_hist_window
+    # Persist architecture-aligned feature snapshots (asset x feature matrix per date)
+    feature_history_out <- .run_stage(
+        "feature_history",
+        .me_append_feature_snapshot_history(
+            model_state = model_state,
+            as_of_date = as_of_date,
+            feature_artifact = feature_artifact,
+            risk_univ = risk_univ,
+            spec_forecast = spec_forecast
+        )
+    )
+
+    if (is.null(feature_history_out)) {
+        .fb(
+            "feature_history", "feature_history_append_failed",
+            "Failed to append feature snapshot history; carrying forward prior feature_history if any"
+        )
+        if (!is.null(model_state) && is.list(model_state$feature_history)) {
+            feature_history_out <- model_state$feature_history
+        }
     }
-    if (!is.null(model_state) && is.list(model_state$feature_history) &&
-        is.matrix(model_state$feature_history$X_hist_window)) {
-        X_hist_window <- model_state$feature_history$X_hist_window
-    }
+
+    # Forecast input extraction (architecture-enforced)
+    # Only accept a future explicit asset-level training_panel object.
+    fh_extract <- .me_extract_forecast_history_input(model_state)
+    X_hist_window <- fh_extract$X_hist_window
 
     forecast_artifact <- NULL
     if (is.null(X_hist_window)) {
-        .fb(
-            "forecast", "missing_feature_history",
-            "Forecast stage skipped: X_hist_window not provided/implemented"
-        )
-        .archv("Forecast feature history panel (X_hist_window) is not implemented/available")
+        if (identical(fh_extract$status, "legacy_matrix_rejected")) {
+            .fb(
+                "forecast", "legacy_x_hist_window_rejected",
+                fh_extract$reason %||% "Legacy X_hist_window matrix rejected"
+            )
+            .archv("Legacy matrix X_hist_window forecast input rejected (requires asset-level training panel object)")
+        } else if (identical(fh_extract$status, "snapshots_present_panel_missing")) {
+            .fb(
+                "forecast", "training_panel_builder_missing",
+                fh_extract$reason %||% "Feature snapshots present but training_panel builder missing"
+            )
+            .archv("Feature snapshot history exists, but asset-level forecast training panel builder is not implemented")
+        } else {
+            .fb(
+                "forecast", "missing_feature_history",
+                "Forecast stage skipped: no asset-level feature history/training_panel available"
+            )
+            .archv("Forecast feature history panel (asset-level training_panel) is not implemented/available")
+        }
     } else {
         forecast_artifact <- .run_stage(
             "forecast",
@@ -457,7 +615,18 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         glasso_residual_precision_configured = isTRUE(spec$risk$resid$use_glasso),
         glasso_residual_precision_used = isTRUE(risk_artifact$diag$glasso_used),
         horizon_covariance_available = !is.null(risk_artifact$Sigma_risk_H),
-        forecast_feature_history_available = !is.null(X_hist_window),
+
+        # History / forecast architecture status
+        feature_snapshot_history_available = !is.null(feature_history_out) &&
+            is.list(feature_history_out$snapshots) &&
+            length(feature_history_out$snapshots) > 0,
+        feature_snapshot_history_count = if (!is.null(feature_history_out) &&
+            is.list(feature_history_out$snapshots)) {
+            length(feature_history_out$snapshots)
+        } else {
+            0L
+        },
+        forecast_feature_history_available = !is.null(X_hist_window), # strict: training panel input available
         forecast_stage_executed = !is.null(forecast_artifact),
         forecast_asset_level_training_implemented = FALSE,
         legacy_hrp_alias_present = !is.null(risk_artifact$w_hrp)
@@ -475,7 +644,13 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         ),
         feature_info = list(
             n_features = feature_artifact$diag$n_features %||% 0,
-            groups     = feature_artifact$feature_groups %||% list()
+            groups = feature_artifact$feature_groups %||% list(),
+            snapshot_history_count = if (!is.null(feature_history_out) &&
+                is.list(feature_history_out$snapshots)) {
+                length(feature_history_out$snapshots)
+            } else {
+                0L
+            }
         ),
         forecast_info = if (!is.null(forecast_artifact)) forecast_artifact$diag else list(stage = "skipped"),
         graph_info = if (!is.null(graph_artifact)) graph_artifact$diag else list(),
@@ -530,7 +705,8 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
             } else {
                 NULL
             },
-            prev_target = port_artifact$target_weights
+            prev_target = port_artifact$target_weights,
+            feature_history = feature_history_out
         ),
         warnings = unique(warns)
     )

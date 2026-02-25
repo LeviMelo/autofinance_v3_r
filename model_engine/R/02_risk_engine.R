@@ -303,7 +303,14 @@ me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
     diag(cor_mat) <- 1
     cor_mat <- (cor_mat + t(cor_mat)) / 2
 
-    dist_mat <- sqrt(pmax(0, (1 - cor_mat) / 2))
+    # NOTE: pmax() can drop matrix dimensions; preserve matrix shape explicitly.
+    dist_mat <- (1 - cor_mat) / 2
+    dist_mat[!is.finite(dist_mat)] <- 0
+    dist_mat[dist_mat < 0] <- 0
+    dist_mat <- sqrt(dist_mat)
+
+    # Reassert matrix structure + dimnames explicitly (defensive against dim drop)
+    dist_mat <- as.matrix(dist_mat)
     if (!is.matrix(dist_mat) || nrow(dist_mat) != ncol(dist_mat)) {
         w <- .inv_var_alloc(Sigma)
         names(w) <- colnames(Sigma)
@@ -315,6 +322,7 @@ me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
         return(w)
     }
     dimnames(dist_mat) <- dimnames(Sigma)
+    diag(dist_mat) <- 0
 
     dist_obj <- tryCatch(as.dist(dist_mat), error = function(e) e)
     if (inherits(dist_obj, "error")) {
