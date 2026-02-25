@@ -1,234 +1,373 @@
 #' @title Model Engine — Signal Engine
-#' @description Trend experts, factor trends, signal scalarization.
-#' Implements architecture.md §§7-8: Kalman, TSMOM (raw/residual), factor trends.
+#' @description Architecture §7-8: Kalman (recursive per-asset), multiscale TSMOM (raw/residual),
+#' factor trends, signal scalarization with recursive weights.
 
 .tanh_scale <- function(x, scale = 1.0) tanh(x / scale)
 
-# ── Kalman filter signal (§7) ─────────────────────────────────────────────────
+# ── §7.2 Recursive Kalman filter update (per-asset) ──────────────────────────
 
 #' @export
-me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
+me_kalman_step <- function(x_hat_prev, P_prev, y_new, Q, R) {
+    # Single-step local-level Kalman filter
+    # State: x_t = x_{t-1} + w, w ~ N(0, Q)
+    # Obs:   y_t = x_t + v,   v ~ N(0, R)
+    # Returns: x_hat, P, slope estimate, innovation, innovation_var_ratio
+
+    # Predict
+    x_pred <- x_hat_prev
+    P_pred <- P_prev + Q
+
+    # Update
+    innov <- y_new - x_pred
+    S <- P_pred + R # Innovation variance
+    K_gain <- P_pred / S # Kalman gain
+
+    x_hat <- x_pred + K_gain * innov
+    P_new <- (1 - K_gain) * P_pred
+
+    # Innovation-based diagnostics
+    innov_var_ratio <- if (S > 0) innov^2 / S else 0
+
+    list(
+        x_hat = x_hat,
+        P = P_new,
+        slope = innov * K_gain, # Simple slope proxy
+        slope_var = P_new, # Uncertainty in state
+        innovation = innov,
+        innov_var_ratio = innov_var_ratio
+    )
+}
+
+#' @export
+me_signal_kalman <- function(prices_window, sigma_t, spec_kalman,
+                             kalman_states = NULL) {
     n_assets <- ncol(prices_window)
-    Tn <- nrow(prices_window)
-    scores <- rep(0, n_assets)
-    names(scores) <- colnames(prices_window)
-    if (is.null(n_assets) || n_assets == 0 || Tn < 10) {
-        return(scores)
-    }
+    syms <- colnames(prices_window)
+    scale <- spec_kalman$scale %||% 1.0
+    Q <- spec_kalman$q_var %||% 1e-4
+    R <- spec_kalman$r_var %||% 1e-2
+    use_recursive <- isTRUE(spec_kalman$recursive %||% TRUE)
 
-    q_var <- spec_kalman$q_var %||% 1e-4
-    r_var <- spec_kalman$r_var %||% 1e-2
-    out_scale <- spec_kalman$scale %||% 1.0
-
-    F_mat <- matrix(c(1, 0, 1, 1), nrow = 2, byrow = FALSE)
-    H_mat <- matrix(c(1, 0), nrow = 1)
-    Q <- diag(c(q_var, q_var))
-    I2 <- diag(2)
+    kalman_out <- setNames(rep(0, n_assets), syms)
+    kalman_slope <- setNames(rep(0, n_assets), syms)
+    kalman_uncertainty <- setNames(rep(0, n_assets), syms)
+    kalman_innovation <- setNames(rep(0, n_assets), syms)
+    kalman_innov_ratio <- setNames(rep(0, n_assets), syms)
+    states_out <- list()
 
     for (j in seq_len(n_assets)) {
-        y_raw <- prices_window[, j]
-        valid <- is.finite(y_raw) & !is.na(y_raw) & (y_raw > 0)
-        if (sum(valid) < 10) next
-        y <- log(y_raw[valid])
-
-        x_hat <- matrix(c(y[1], 0), nrow = 2)
-        P <- diag(c(1, 1))
-
-        for (i in 2:length(y)) {
-            x_pred <- F_mat %*% x_hat
-            P_pred <- F_mat %*% P %*% t(F_mat) + Q
-            y_hat <- (H_mat %*% x_pred)[1, 1]
-            err <- y[i] - y_hat
-            S <- (H_mat %*% P_pred %*% t(H_mat))[1, 1] + r_var
-            if (!is.finite(S) || S <= 0) next
-            K <- P_pred %*% t(H_mat) / S
-            x_hat <- x_pred + K * err
-            KH <- K %*% H_mat
-            P <- (I2 - KH) %*% P_pred %*% t(I2 - KH) + K %*% matrix(r_var, 1, 1) %*% t(K)
+        sym <- syms[j]
+        p_series <- prices_window[, j]
+        valid <- which(is.finite(p_series) & p_series > 0)
+        if (length(valid) < 5) {
+            states_out[[sym]] <- list(x_hat = 0, P = R)
+            next
         }
+        y <- log(p_series[valid])
 
-        slope_daily <- x_hat[2, 1]
-        if (!is.finite(slope_daily)) next
-        slope_ann <- slope_daily * 252
-        vol_j <- sigma_t[colnames(prices_window)[j]]
-        if (length(vol_j) != 1 || !is.finite(vol_j) || vol_j <= 0) {
-            vol_j <- max(median(sigma_t[is.finite(sigma_t) & sigma_t > 0], na.rm = TRUE), 0.2)
+        if (use_recursive && !is.null(kalman_states) && !is.null(kalman_states[[sym]])) {
+            # Recursive: single-step update from previous state
+            ks <- kalman_states[[sym]]
+            y_last <- y[length(y)]
+            step <- me_kalman_step(ks$x_hat, ks$P, y_last, Q, R)
+
+            raw <- y_last - step$x_hat
+            vol_j <- sigma_t[sym]
+            if (!is.finite(vol_j) || vol_j <= 0) vol_j <- 0.01
+            kalman_out[sym] <- .tanh_scale(raw / (vol_j / sqrt(252) + 1e-8), scale)
+            kalman_slope[sym] <- step$slope
+            kalman_uncertainty[sym] <- step$slope_var
+            kalman_innovation[sym] <- step$innovation
+            kalman_innov_ratio[sym] <- step$innov_var_ratio
+            states_out[[sym]] <- list(x_hat = step$x_hat, P = step$P)
+        } else {
+            # Batch initialization: run full Kalman from scratch
+            x_hat <- y[1]
+            P <- R
+            for (i in 2:length(y)) {
+                step <- me_kalman_step(x_hat, P, y[i], Q, R)
+                x_hat <- step$x_hat
+                P <- step$P
+            }
+            raw <- y[length(y)] - x_hat
+            vol_j <- sigma_t[sym]
+            if (!is.finite(vol_j) || vol_j <= 0) vol_j <- 0.01
+            kalman_out[sym] <- .tanh_scale(raw / (vol_j / sqrt(252) + 1e-8), scale)
+            kalman_slope[sym] <- step$slope
+            kalman_uncertainty[sym] <- step$slope_var
+            kalman_innovation[sym] <- step$innovation
+            kalman_innov_ratio[sym] <- step$innov_var_ratio
+            states_out[[sym]] <- list(x_hat = x_hat, P = P)
         }
-        scores[j] <- slope_ann / vol_j
     }
-    .tanh_scale(scores, out_scale)
+
+    list(
+        signal = kalman_out,
+        slope = kalman_slope,
+        uncertainty = kalman_uncertainty,
+        innovation = kalman_innovation,
+        innov_var_ratio = kalman_innov_ratio,
+        kalman_states_out = states_out
+    )
 }
 
-# ── TSMOM signal (§7) ────────────────────────────────────────────────────────
+# ── §7.1 TSMOM (multiscale, raw + residual) ─────────────────────────────────
 
+.tsmom_single <- function(R_col, sigma, horizon, scale) {
+    n <- length(R_col)
+    if (n < horizon || horizon < 1) {
+        return(0)
+    }
+    cum <- sum(R_col[(n - horizon + 1):n], na.rm = TRUE)
+    denom <- if (is.finite(sigma) && sigma > 0) sigma / sqrt(252) * sqrt(horizon) else 1
+    .tanh_scale(cum / (denom + 1e-8), scale)
+}
+
+#' Single-horizon TSMOM (legacy compat)
 #' @export
 me_signal_tsmom <- function(R_window, sigma_t, spec_tsmom) {
-    if (is.null(dim(R_window)) || ncol(R_window) == 0) {
-        return(setNames(numeric(0), character(0)))
-    }
-
-    h <- min(spec_tsmom$horizon %||% 252L, nrow(R_window))
-    out_scale <- spec_tsmom$scale %||% 2.0
-    if (h < 5) {
-        return(setNames(rep(0, ncol(R_window)), colnames(R_window)))
-    }
-
+    horizon <- min(spec_tsmom$horizon %||% 252L, nrow(R_window))
+    horizon <- max(1L, horizon)
+    scale <- spec_tsmom$scale %||% 2.0
+    n_assets <- ncol(R_window)
     syms <- colnames(R_window)
-    sigma_aligned <- sigma_t[syms]
-    sigma_fb <- max(median(sigma_t[is.finite(sigma_t) & sigma_t > 0], na.rm = TRUE), 0.2)
-    bad <- !is.finite(sigma_aligned) | sigma_aligned <= 0
-    if (any(bad)) sigma_aligned[bad] <- sigma_fb
 
-    ret_cum <- colSums(tail(R_window, h), na.rm = TRUE)
-    denom <- sigma_aligned * sqrt(h / 252)
-    denom[!is.finite(denom) | denom <= 0] <- sigma_fb * sqrt(h / 252)
-    scores <- ret_cum / denom
-    scores[!is.finite(scores)] <- 0
-    .tanh_scale(scores, out_scale)
-}
-
-#' Residual TSMOM on PCA residuals
-#' @export
-me_signal_residual_tsmom <- function(E_window, sigma_t, spec_tsmom) {
-    me_signal_tsmom(E_window, sigma_t, spec_tsmom)
-}
-
-# ── Factor trend signals (§7, §11.3) ─────────────────────────────────────────
-
-#' @export
-me_signal_factor_trends <- function(F_window, spec_factor = list()) {
-    # g_bar: per-factor cumulative return (trend summary)
-    if (is.null(F_window) || nrow(F_window) < 5) {
-        return(NULL)
+    out <- setNames(rep(0, n_assets), syms)
+    for (j in seq_len(n_assets)) {
+        out[j] <- .tsmom_single(R_window[, j], sigma_t[j], horizon, scale)
     }
-    k <- ncol(F_window)
-    h <- min(spec_factor$horizon %||% 63L, nrow(F_window))
-
-    g_bar <- colSums(tail(F_window, h), na.rm = TRUE)
-    # Normalize by factor vol
-    fvol <- apply(F_window, 2, sd, na.rm = TRUE) * sqrt(252)
-    fvol[fvol <= 0 | !is.finite(fvol)] <- 1
-    g_bar <- g_bar / fvol
-    names(g_bar) <- colnames(F_window)
-    g_bar
+    out
 }
 
-#' Factor-projected continuation: phi_facproj = B_i^T * g_bar
+#' §7.1 Multiscale TSMOM: returns n_assets × n_horizons matrix
 #' @export
-me_signal_factor_projection <- function(B_t, g_bar) {
-    if (is.null(B_t) || is.null(g_bar)) {
-        return(NULL)
-    }
-    k <- min(ncol(B_t), length(g_bar))
-    proj <- B_t[, 1:k, drop = FALSE] %*% g_bar[1:k]
-    out <- as.vector(proj)
-    names(out) <- rownames(B_t)
-    .tanh_scale(out, 2.0)
-}
+me_signal_tsmom_multiscale <- function(R_window, sigma_t, horizons = c(21, 63, 126, 252),
+                                       scale = 2.0) {
+    n_assets <- ncol(R_window)
+    Tn <- nrow(R_window)
+    syms <- colnames(R_window)
 
-# ── Signal alignment ──────────────────────────────────────────────────────────
+    hor <- pmin(horizons, Tn)
+    hor <- hor[hor >= 1]
+    if (length(hor) == 0) hor <- min(21, Tn)
 
-#' @export
-me_align_signal_vectors <- function(...) {
-    lst <- list(...)
-    syms <- unique(unlist(lapply(lst, names)))
-    if (length(syms) == 0) {
-        return(list())
-    }
-    aligned <- lapply(lst, function(v) {
-        res <- setNames(rep(0, length(syms)), syms)
-        idx <- intersect(names(v), syms)
-        res[idx] <- v[idx]
-        res
-    })
-    aligned
-}
+    result <- matrix(0, n_assets, length(hor),
+        dimnames = list(syms, paste0("tsmom_h", hor))
+    )
 
-# ── Signal scalarization (§8) ─────────────────────────────────────────────────
-
-#' @export
-me_scalarize_signals <- function(signal_artifact, weights = NULL) {
-    # Combine multiple signal channels into per-family scalars
-    # s_mom = weighted combo of tsmom + res_tsmom
-    # s_kal = kalman
-    # s_fac = factor_projection
-
-    kal <- signal_artifact$kalman
-    tsmom <- signal_artifact$tsmom
-    res_tsmom <- signal_artifact$res_tsmom
-    fac_proj <- signal_artifact$factor_projection
-
-    s_kal <- kal
-    s_mom <- tsmom
-    if (!is.null(res_tsmom)) {
-        common <- intersect(names(s_mom), names(res_tsmom))
-        s_mom[common] <- 0.6 * s_mom[common] + 0.4 * res_tsmom[common]
-    }
-    s_fac <- fac_proj
-
-    list(s_mom = s_mom, s_kal = s_kal, s_fac = s_fac)
-}
-
-# ── Full signal engine orchestrator ───────────────────────────────────────────
-
-#' @export
-me_run_signal_engine <- function(prices_window, R_window, sigma_t,
-                                 spec_signals, E_window = NULL,
-                                 B_t = NULL, F_window = NULL) {
-    if (is.null(dim(prices_window)) || is.null(dim(R_window))) {
-        stop("prices_window and R_window must be matrices")
-    }
-
-    common <- Reduce(intersect, list(
-        colnames(prices_window),
-        colnames(R_window), names(sigma_t)
-    ))
-    if (length(common) == 0) stop("Signal engine: zero common symbols")
-
-    P_use <- prices_window[, common, drop = FALSE]
-    R_use <- R_window[, common, drop = FALSE]
-    sigma_use <- sigma_t[common]
-
-    kalman_scores <- me_signal_kalman(P_use, sigma_use, spec_signals$kalman)
-    tsmom_scores <- me_signal_tsmom(R_use, sigma_use, spec_signals$tsmom)
-
-    res_tsmom_scores <- NULL
-    if (!is.null(E_window) && ncol(E_window) > 0) {
-        e_common <- intersect(common, colnames(E_window))
-        if (length(e_common) > 0) {
-            res_tsmom_scores <- me_signal_residual_tsmom(
-                E_window[, e_common, drop = FALSE], sigma_use[e_common],
-                spec_signals$tsmom
+    for (j in seq_len(n_assets)) {
+        for (h_idx in seq_along(hor)) {
+            result[j, h_idx] <- .tsmom_single(
+                R_window[, j], sigma_t[j],
+                hor[h_idx], scale
             )
         }
     }
+    result
+}
 
-    factor_projection <- NULL
-    g_bar <- NULL
-    if (!is.null(B_t) && !is.null(F_window)) {
-        g_bar <- me_signal_factor_trends(F_window, spec_signals$factor %||% list())
-        if (!is.null(g_bar)) {
-            factor_projection <- me_signal_factor_projection(B_t, g_bar)
+#' §7.1 Residual TSMOM multiscale: on r^⊥ = D_t e_t
+#' @export
+me_signal_tsmom_residual_multiscale <- function(E_window, D_t_daily,
+                                                horizons = c(21, 63, 126, 252),
+                                                scale = 2.0) {
+    # E_window: standardized residuals; D_t_daily: daily vol per asset
+    n_assets <- ncol(E_window)
+    Tn <- nrow(E_window)
+    syms <- colnames(E_window)
+
+    # Unstandardize residuals: r^⊥ = D * e
+    R_resid <- E_window
+    if (!is.null(D_t_daily)) {
+        d_vec <- D_t_daily[syms]
+        d_vec[!is.finite(d_vec) | d_vec <= 0] <- 1e-4
+        for (j in seq_len(n_assets)) R_resid[, j] <- E_window[, j] * d_vec[j]
+    }
+
+    # Vol of residual returns (for normalization)
+    sigma_resid <- apply(R_resid, 2, sd, na.rm = TRUE) * sqrt(252)
+    sigma_resid[!is.finite(sigma_resid) | sigma_resid <= 0] <- 1e-4
+
+    me_signal_tsmom_multiscale(R_resid, sigma_resid, horizons, scale)
+}
+
+# ── §7.3 Factor trend signals ───────────────────────────────────────────────
+
+#' @export
+me_signal_factor_trend <- function(F_window, spec_factor = list()) {
+    horizons <- spec_factor$horizons %||% c(21L, 63L)
+    k <- ncol(F_window)
+    Tn <- nrow(F_window)
+
+    factor_sigs <- matrix(0, k, length(horizons),
+        dimnames = list(colnames(F_window), paste0("h", horizons))
+    )
+
+    for (c_idx in seq_len(k)) {
+        f_series <- F_window[, c_idx]
+        f_sd <- sd(f_series, na.rm = TRUE)
+        if (!is.finite(f_sd) || f_sd <= 0) f_sd <- 1
+
+        for (h_idx in seq_along(horizons)) {
+            h <- min(horizons[h_idx], Tn)
+            if (h < 1) next
+            cum <- sum(f_series[(Tn - h + 1):Tn], na.rm = TRUE)
+            factor_sigs[c_idx, h_idx] <- .tanh_scale(cum / (f_sd * sqrt(h) + 1e-8), 2.0)
         }
     }
 
-    sig_list <- list(kalman = kalman_scores, tsmom = tsmom_scores)
-    if (!is.null(res_tsmom_scores)) sig_list$res_tsmom <- res_tsmom_scores
-    if (!is.null(factor_projection)) sig_list$factor_projection <- factor_projection
-    aligned <- do.call(me_align_signal_vectors, sig_list)
+    factor_sigs
+}
 
-    result <- list(
-        kalman = aligned$kalman, tsmom = aligned$tsmom,
-        res_tsmom = aligned$res_tsmom,
-        factor_projection = aligned$factor_projection,
-        g_bar = g_bar,
-        diag = list(
-            kalman_coverage = sum(aligned$kalman != 0),
-            tsmom_coverage = sum(aligned$tsmom != 0),
-            n_common = length(common),
-            kalman_all_zero = all(aligned$kalman == 0),
-            tsmom_all_zero = all(aligned$tsmom == 0)
+# ── §7.4 Signal scalarization with recursive weights ─────────────────────────
+
+#' @export
+me_scalarize_signals <- function(signal_list, R_window, sigma_t, omega_prev = NULL,
+                                 spec_scalar = list()) {
+    # signal_list: named list of named numeric vectors (signal name → per-asset values)
+    # Returns: scalarized per-asset signals + updated weights
+
+    n_assets <- ncol(R_window)
+    syms <- colnames(R_window)
+    lambda_omega <- spec_scalar$lambda_omega %||% 0.95
+    ridge_lambda <- spec_scalar$ridge_lambda %||% 0.01
+
+    # Build signal matrix: n_assets × n_signals
+    sig_names <- names(signal_list)
+    n_sig <- length(sig_names)
+    S_mat <- matrix(0, n_assets, n_sig, dimnames = list(syms, sig_names))
+    for (s_idx in seq_along(sig_names)) {
+        sv <- signal_list[[s_idx]]
+        sv_aligned <- sv[syms]
+        sv_aligned[!is.finite(sv_aligned)] <- 0
+        S_mat[, s_idx] <- sv_aligned
+    }
+
+    # Compute cross-sectional ridge regression for scalarization weights
+    # Target: next-period XS rank of returns (simple proxy)
+    y_target <- R_window[nrow(R_window), ]
+    y_target <- y_target[syms]
+    y_target[!is.finite(y_target)] <- 0
+    y_target <- rank(y_target) / (n_assets + 1) - 0.5 # XS rank centered
+
+    # Ridge fit: omega = (S'S + lambda I)^{-1} S' y
+    StS <- t(S_mat) %*% S_mat + ridge_lambda * diag(n_sig)
+    Sty <- t(S_mat) %*% y_target
+    omega_new <- tryCatch(
+        as.vector(solve(StS, Sty)),
+        error = function(e) rep(1 / n_sig, n_sig)
+    )
+    names(omega_new) <- sig_names
+
+    # Recursive smoothing with previous weights
+    if (!is.null(omega_prev) && length(omega_prev) == n_sig) {
+        omega_prev_aligned <- omega_prev[sig_names]
+        if (all(is.finite(omega_prev_aligned))) {
+            omega_new <- lambda_omega * omega_prev_aligned + (1 - lambda_omega) * omega_new
+        }
+    }
+
+    # Compute scalarized signal per asset
+    s_scalar <- as.vector(S_mat %*% omega_new)
+    names(s_scalar) <- syms
+
+    list(
+        s_scalar = s_scalar,
+        omega = omega_new,
+        S_mat = S_mat
+    )
+}
+
+# ── Full signal engine orchestrator ──────────────────────────────────────────
+
+#' @export
+me_run_signal_engine <- function(prices_window, R_window, risk_artifact,
+                                 spec_signals, model_state = NULL) {
+    sigma_t <- risk_artifact$sigma_t
+    syms <- colnames(R_window)
+    n_assets <- length(syms)
+
+    # Extract recursive states
+    kalman_states <- if (!is.null(model_state)) model_state$kalman_states else NULL
+    scalar_weights <- if (!is.null(model_state)) model_state$scalar_weights else NULL
+
+    # ── 1. Kalman (§7.2) ──
+    kal <- me_signal_kalman(prices_window, sigma_t, spec_signals$kalman,
+        kalman_states = kalman_states
+    )
+    s_kal <- kal$signal
+
+    # ── 2. TSMOM single-horizon (legacy compat) ──
+    s_mom <- me_signal_tsmom(R_window, sigma_t, spec_signals$tsmom)
+
+    # ── 3. Multiscale TSMOM raw (§7.1) ──
+    tsmom_horizons <- spec_signals$tsmom$horizons %||% c(21, 63, 126, 252)
+    tsmom_multi <- me_signal_tsmom_multiscale(
+        R_window, sigma_t,
+        horizons = tsmom_horizons,
+        scale = spec_signals$tsmom$scale %||% 2.0
+    )
+
+    # ── 4. Residual TSMOM multiscale (§7.1) ──
+    D_t_daily <- NULL
+    ewma_state <- if (!is.null(model_state)) model_state$ewma_vol_state else NULL
+    if (!is.null(ewma_state)) {
+        D_t_daily <- sqrt(me_pi_map_vector(ewma_state, syms, init_val = 1e-4))
+    }
+    resid_tsmom_multi <- NULL
+    if (!is.null(risk_artifact$E_t) && ncol(risk_artifact$E_t) >= 3) {
+        resid_tsmom_multi <- me_signal_tsmom_residual_multiscale(
+            risk_artifact$E_t, D_t_daily,
+            horizons = tsmom_horizons,
+            scale = spec_signals$tsmom$scale %||% 2.0
+        )
+    }
+
+    # ── 5. Factor trend (§7.3) ──
+    s_fac <- rep(0, n_assets)
+    names(s_fac) <- syms
+    factor_trends <- NULL
+    if (!is.null(risk_artifact$F_t) && !is.null(risk_artifact$B_t)) {
+        spec_factor <- spec_signals$factor %||% list()
+        factor_trends <- me_signal_factor_trend(risk_artifact$F_t, spec_factor)
+        # Project factor trends back to asset space: B × latest factor trend vector
+        f_trend_latest <- factor_trends[, 1, drop = TRUE] # shortest horizon
+        f_proj <- as.vector(risk_artifact$B_t %*% f_trend_latest)
+        names(f_proj) <- rownames(risk_artifact$B_t)
+        s_fac <- f_proj[syms]
+        s_fac[!is.finite(s_fac)] <- 0
+    }
+
+    # ── 6. Signal scalarization (§7.4) ──
+    signal_list <- list(mom = s_mom, kal = s_kal, fac = s_fac)
+    spec_scalar <- spec_signals$scalarization %||% list()
+    scalar_result <- me_scalarize_signals(
+        signal_list, R_window, sigma_t,
+        omega_prev = if (!is.null(scalar_weights)) scalar_weights$omega_combined else NULL,
+        spec_scalar = spec_scalar
+    )
+
+    list(
+        s_mom = s_mom,
+        s_kal = s_kal,
+        s_fac = s_fac,
+        s_scalar = scalar_result$s_scalar,
+
+        # Multiscale features (for feature engine)
+        tsmom_multi = tsmom_multi,
+        resid_tsmom_multi = resid_tsmom_multi,
+        factor_trends = factor_trends,
+
+        # Richer Kalman outputs
+        kalman_slope = kal$slope,
+        kalman_uncertainty = kal$uncertainty,
+        kalman_innovation = kal$innovation,
+        kalman_innov_ratio = kal$innov_var_ratio,
+
+        # Recursive state outputs
+        signal_state_out = list(
+            kalman_states = kal$kalman_states_out,
+            scalar_weights = list(omega_combined = scalar_result$omega)
         )
     )
-    result
 }

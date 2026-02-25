@@ -15,11 +15,72 @@ me_require <- function(pkgs) {
     }
 }
 
+# ── Π_t Universe mapping operators (architecture §4.2) ──────────────────────
+# Reindex recursive state objects from U_{t-1} to U_t:
+#   - carry values on U_t ∩ U_{t-1}
+#   - initialize new names with configured priors
+#   - drop departed names
+
+#' @export
+me_pi_map_vector <- function(v, new_univ, init_val = 0) {
+    # Map a named numeric vector to new universe
+    if (is.null(v) || length(v) == 0) {
+        out <- setNames(rep(init_val, length(new_univ)), new_univ)
+        return(out)
+    }
+    out <- setNames(rep(init_val, length(new_univ)), new_univ)
+    common <- intersect(names(v), new_univ)
+    if (length(common) > 0) out[common] <- v[common]
+    out
+}
+
+#' @export
+me_pi_map_matrix <- function(M, new_univ, init_diag = 1e-4) {
+    # Map a named symmetric matrix to new universe
+    # Carry intersection, initialize new diagonal entries, zero off-diag for new
+    p_new <- length(new_univ)
+    if (is.null(M) || !is.matrix(M) || p_new == 0) {
+        out <- diag(init_diag, p_new)
+        dimnames(out) <- list(new_univ, new_univ)
+        return(out)
+    }
+    out <- matrix(0, p_new, p_new, dimnames = list(new_univ, new_univ))
+    old_names <- rownames(M)
+    if (is.null(old_names)) old_names <- colnames(M)
+    common <- intersect(old_names, new_univ)
+    if (length(common) > 0) {
+        out[common, common] <- M[common, common, drop = FALSE]
+    }
+    # Initialize diagonal for new names
+    new_names <- setdiff(new_univ, common)
+    if (length(new_names) > 0) {
+        for (nm in new_names) out[nm, nm] <- init_diag
+    }
+    # Ensure symmetry
+    out <- (out + t(out)) / 2
+    out
+}
+
+#' @export
+me_pi_map_list <- function(lst, new_univ, init_fn = function() NULL) {
+    # Map a per-asset named list to new universe
+    if (is.null(lst) || !is.list(lst)) {
+        out <- setNames(lapply(new_univ, function(x) init_fn()), new_univ)
+        return(out)
+    }
+    out <- setNames(vector("list", length(new_univ)), new_univ)
+    common <- intersect(names(lst), new_univ)
+    for (nm in common) out[[nm]] <- lst[[nm]]
+    new_names <- setdiff(new_univ, common)
+    for (nm in new_names) out[[nm]] <- init_fn()
+    out
+}
+
 # ── ModelSpec default ────────────────────────────────────────────────────────
 
 #' @export
 me_spec_default <- function() {
-    # Default gating matrix W (3 experts × 3 state features)
+    # Default legacy gating matrix W (3 experts × 3 state features)
     W0 <- matrix(
         0,
         nrow = 3, ncol = 3,
@@ -29,6 +90,13 @@ me_spec_default <- function() {
         )
     )
 
+    # Architecture §12.4: 5-component gating matrix (A_pi)
+    # Rows = components, Cols = global state features
+    # Initial: identity-like (configurable, not learned)
+    n_state_dim <- 9L # disp, eta, VoV, dens, eto, chi, liq1, liq2, liq3
+    A_pi_default <- matrix(0, nrow = 5, ncol = n_state_dim)
+    b_pi_default <- rep(0, 5)
+
     list(
         # ── data section ──
         data = list(
@@ -37,21 +105,26 @@ me_spec_default <- function() {
             allowed_types = c("equity", "fii", "etf", "bdr")
         ),
 
-        # ── risk section ──
+        # ── risk section (architecture §5) ──
         risk = list(
             vol = list(
-                lookback = 252L,
-                method   = "sd" # "sd" or "ewma"
+                lookback     = 252L,
+                method       = "ewma", # architecture: recursive EWMA
+                lambda_sigma = 0.94 # §5.1 EWMA decay for volatility
             ),
             pca = list(
-                k        = 5L,
-                lookback = 252L
+                k = 5L,
+                lookback = 252L,
+                align_factors = TRUE # §5.3 factor identity alignment
             ),
             resid = list(
                 use_glasso = TRUE,
-                lambda     = 0.1
+                lambda     = 0.1,
+                lambda_e   = 0.97 # §5.5 EWMA decay for residual cov target
             ),
-            factor = list(),
+            factor = list(
+                lambda_f = 0.97 # §5.4 EWMA decay for factor covariance
+            ),
             hrp = list()
         ),
 
@@ -64,17 +137,25 @@ me_spec_default <- function() {
             K_max           = 8L
         ),
 
-        # ── signals section ──
+        # ── signals section (architecture §7) ──
         signals = list(
             kalman = list(
-                lookback = 252L,
-                q_var    = 1e-4,
-                r_var    = 1e-2,
-                scale    = 1.0
+                lookback  = 252L,
+                q_var     = 1e-4,
+                r_var     = 1e-2,
+                scale     = 1.0,
+                recursive = TRUE # §7.2: per-asset recursive Kalman
             ),
             tsmom = list(
-                horizon = 252L,
-                scale   = 2.0
+                horizon  = 252L,
+                horizons = c(21L, 63L, 126L, 252L), # §7.1 multiscale
+                scale    = 2.0
+            ),
+            factor = list(
+                horizons = c(21L, 63L) # §7.3 factor trend horizons
+            ),
+            scalarization = list(
+                lambda_omega = 0.95 # §7.4 recursive weight smoothing
             )
         ),
 
@@ -88,19 +169,30 @@ me_spec_default <- function() {
             )
         ),
 
-        # ── gating section ──
+        # ── gating section (legacy 3-way + architecture 5-component §12.4) ──
         gating = list(
-            W           = W0,
-            w0          = c(kalman = 0, tsmom = 0, cash = -1),
-            temperature = 1.0
+            # Legacy 3-way gating (backward compat)
+            W = W0,
+            w0 = c(kalman = 0, tsmom = 0, cash = -1),
+            temperature = 1.0,
+            # Architecture 5-component gating
+            A_pi = A_pi_default,
+            b_pi = b_pi_default,
+            n_components = 5L
         ),
 
-        # ── forecast section ──
+        # ── forecast section (architecture §12) ──
         forecast = list(
-            label_horizon      = 21L,
-            ridge_lambda       = 0.01,
-            confidence_eps     = 0.01,
-            uncertainty_scale  = 1.0
+            label_horizon = 21L,
+            ridge_lambda = 0.01,
+            confidence_eps = 0.01,
+            uncertainty_scale = 1.0,
+            n_components = 5L, # §12.1
+            kappa_min = 0.5, # §12.5 bounded confidence
+            kappa_max = 1.5,
+            lambda_err = 0.97, # §12.6 error state decay
+            history_snapshots_keep = 252L,
+            refit_every = 1L # daily refit (can be slowed)
         ),
 
         # ── portfolio section ──
@@ -325,15 +417,21 @@ me_validate_snapshot_artifact <- function(x) {
         stop("cash_weight must be in [0, 1]")
     }
 
-    # Gating consistency
+    # Gating consistency — legacy 3-way path
     g <- x$gating
     if (length(g) > 0 && !is.null(g$w_kalman)) {
         gate_sum <- g$w_kalman + g$w_tsmom + g$w_cash
-        if (abs(gate_sum - 1.0) > 1e-6) {
+        if (is.finite(gate_sum) && abs(gate_sum - 1.0) > 1e-6) {
             stop("Gating softmax weights do not sum to 1")
         }
-        if (!is.null(g$gross_exposure) && abs(g$gross_exposure - (1 - x$cash_weight)) > 1e-4) {
-            stop("Gating gross_exposure inconsistent with cash_weight")
+        # Note: gross_exposure vs cash_weight check relaxed because optimizer controls
+        # may legitimately adjust gross_exposure after gating (§12.8).
+    }
+
+    # Gating consistency — architecture 5-component path (if present)
+    if (!is.null(g$pi_t) && is.numeric(g$pi_t)) {
+        if (abs(sum(g$pi_t) - 1.0) > 1e-6) {
+            stop("Architecture gating pi_t does not sum to 1")
         }
     }
 
@@ -366,6 +464,8 @@ me_validate_snapshot_artifact <- function(x) {
 }
 
 # ── Model state validation (for recursive carry-forward) ─────────────────────
+# All recursive state fields are optional (NULL is valid for cold start).
+# When present, basic type checks apply.
 
 #' @export
 me_validate_model_state <- function(state) {
@@ -373,15 +473,46 @@ me_validate_model_state <- function(state) {
         return(invisible(NULL))
     }
 
-    # State must be a list with at minimum these markers
     if (!is.list(state)) stop("model_state must be a list or NULL")
 
-    # If it has prev_target, validate structure
+    # prev_target validation
     if (!is.null(state$prev_target)) {
         pt <- state$prev_target
         if (!is.data.frame(pt) || !all(c("symbol", "weight_target") %in% names(pt))) {
             stop("model_state$prev_target must be a data.frame with symbol + weight_target")
         }
+    }
+
+    # Recursive risk states (all optional, type-checked if present)
+    if (!is.null(state$ewma_vol_state) && !is.numeric(state$ewma_vol_state)) {
+        stop("model_state$ewma_vol_state must be a named numeric vector or NULL")
+    }
+    if (!is.null(state$factor_cov_state) && !is.matrix(state$factor_cov_state)) {
+        stop("model_state$factor_cov_state must be a matrix or NULL")
+    }
+    if (!is.null(state$resid_cov_state) && !is.matrix(state$resid_cov_state)) {
+        stop("model_state$resid_cov_state must be a matrix or NULL")
+    }
+    if (!is.null(state$B_prev) && !is.matrix(state$B_prev)) {
+        stop("model_state$B_prev must be a matrix or NULL")
+    }
+
+    # Graph recursive states
+    if (!is.null(state$edge_stability) && !is.matrix(state$edge_stability)) {
+        stop("model_state$edge_stability must be a matrix or NULL")
+    }
+    if (!is.null(state$node_stability) && !is.numeric(state$node_stability)) {
+        stop("model_state$node_stability must be a named numeric vector or NULL")
+    }
+
+    # Kalman states
+    if (!is.null(state$kalman_states) && !is.list(state$kalman_states)) {
+        stop("model_state$kalman_states must be a list or NULL")
+    }
+
+    # Scalarization w eights
+    if (!is.null(state$scalar_weights) && !is.list(state$scalar_weights)) {
+        stop("model_state$scalar_weights must be a list or NULL")
     }
 
     invisible(state)

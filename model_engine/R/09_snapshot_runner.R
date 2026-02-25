@@ -11,14 +11,15 @@
 
 .me_append_feature_snapshot_history <- function(model_state, as_of_date,
                                                 feature_artifact, risk_univ,
-                                                spec_forecast = list()) {
+                                                spec_forecast = list(),
+                                                date_idx = NULL) {
     fh <- NULL
     if (!is.null(model_state) && is.list(model_state$feature_history)) {
         fh <- model_state$feature_history
     }
     if (is.null(fh) || !is.list(fh)) fh <- list()
 
-    fh$schema <- "asset_feature_snapshots_v1"
+    fh$schema <- "asset_feature_snapshots_v2"
     if (is.null(fh$snapshots) || !is.list(fh$snapshots)) {
         fh$snapshots <- list()
     }
@@ -52,8 +53,12 @@
         X <- X_aligned
     }
 
-    fh$snapshots[[length(fh$snapshots) + 1L]] <- list(
+    # Include date index for training panel builder
+    snap_idx <- length(fh$snapshots) + 1L
+    fh$snapshots[[snap_idx]] <- list(
         as_of_date = as.Date(as_of_date),
+        date = as.character(as_of_date),
+        date_idx = date_idx %||% snap_idx,
         X = X
     )
 
@@ -68,7 +73,7 @@
         fh$snapshots <- fh$snapshots[keep_idx]
     }
 
-    # Optional retention cap (defaults to 252 snapshots)
+    # Retention cap
     keep_n <- as.integer(spec_forecast$history_snapshots_keep %||% 252L)
     if (!is.finite(keep_n) || keep_n < 2L) keep_n <- 252L
     if (length(fh$snapshots) > keep_n) {
@@ -81,56 +86,6 @@
     fh
 }
 
-.me_extract_forecast_history_input <- function(model_state) {
-    out <- list(
-        X_hist_window = NULL,
-        status = "none",
-        reason = NULL
-    )
-
-    if (is.null(model_state) || !is.list(model_state)) {
-        return(out)
-    }
-
-    # Reject legacy direct matrix path explicitly (off-spec)
-    if (is.matrix(model_state$X_hist_window)) {
-        out$status <- "legacy_matrix_rejected"
-        out$reason <- "model_state$X_hist_window is a legacy matrix input (off-spec for asset-level forecast training)"
-        return(out)
-    }
-
-    fh <- model_state$feature_history
-    if (!is.list(fh)) {
-        return(out)
-    }
-
-    # Reject legacy matrix nested under feature_history too
-    if (is.matrix(fh$X_hist_window)) {
-        out$status <- "legacy_matrix_rejected"
-        out$reason <- "model_state$feature_history$X_hist_window is a legacy matrix input (off-spec)"
-        return(out)
-    }
-
-    # Future-compatible accepted location (not yet produced by this patch)
-    if (is.list(fh$training_panel) && !is.null(fh$training_panel$X_hist_window)) {
-        out$X_hist_window <- fh$training_panel$X_hist_window
-        out$status <- "panel_available"
-        out$reason <- NULL
-        return(out)
-    }
-
-    if (is.list(fh$snapshots) && length(fh$snapshots) > 0) {
-        out$status <- "snapshots_present_panel_missing"
-        out$reason <- sprintf(
-            "%d feature snapshots present, but no asset-level training_panel builder is implemented",
-            length(fh$snapshots)
-        )
-        return(out)
-    }
-
-    out
-}
-
 #' @export
 me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
                             prev_target = NULL, model_state = NULL,
@@ -139,8 +94,6 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     me_validate_spec(spec)
     me_validate_model_state(model_state)
 
-    # Convenience: if caller passed model_state but forgot prev_target separately,
-    # recover it from state.
     if (is.null(prev_target) && !is.null(model_state) && !is.null(model_state$prev_target)) {
         prev_target <- model_state$prev_target
     }
@@ -225,7 +178,6 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     syms_investable <- .run_stage("investability", adapter$investability_snapshot(as_of_date, spec$data))
     if (is.null(syms_investable)) syms_investable <- character(0)
 
-    # Admissible universe = investable ∪ previous holdings (architecture-consistent transitional patch)
     eps_hold <- 1e-8
     syms_prev_hold <- character(0)
     if (!is.null(prev_target) && is.data.frame(prev_target) &&
@@ -245,10 +197,12 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         architecture_flags <- list(
             glasso_residual_precision_configured = isTRUE(spec$risk$resid$use_glasso),
             glasso_residual_precision_used = FALSE,
-            horizon_covariance_available = FALSE,
-            forecast_feature_history_available = FALSE,
+            standardized_path_used = FALSE,
+            factor_alignment_used = FALSE,
+            recursive_factor_cov_used = FALSE,
+            recursive_resid_target_used = FALSE,
             forecast_stage_executed = FALSE,
-            forecast_asset_level_training_implemented = FALSE,
+            forecast_method = "none",
             legacy_hrp_alias_present = FALSE
         )
 
@@ -270,8 +224,8 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
                 architecture_violations = architecture_violations
             ),
             model_state_out = list(
-                prev_P_bar = NULL,
-                prev_labels = NULL,
+                prev_P_bar = if (!is.null(model_state)) model_state$prev_P_bar else NULL,
+                prev_labels = if (!is.null(model_state)) model_state$prev_labels else NULL,
                 prev_target = data.frame(
                     symbol = character(0),
                     weight_target = numeric(0),
@@ -281,7 +235,20 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
                     model_state$feature_history
                 } else {
                     NULL
-                }
+                },
+                # Carry forward all recursive states on empty
+                ewma_vol_state = if (!is.null(model_state)) model_state$ewma_vol_state else NULL,
+                factor_cov_state = if (!is.null(model_state)) model_state$factor_cov_state else NULL,
+                resid_cov_state = if (!is.null(model_state)) model_state$resid_cov_state else NULL,
+                B_prev = if (!is.null(model_state)) model_state$B_prev else NULL,
+                edge_stability = if (!is.null(model_state)) model_state$edge_stability else NULL,
+                node_stability = if (!is.null(model_state)) model_state$node_stability else NULL,
+                prev_M = if (!is.null(model_state)) model_state$prev_M else NULL,
+                kalman_states = if (!is.null(model_state)) model_state$kalman_states else NULL,
+                scalar_weights = if (!is.null(model_state)) model_state$scalar_weights else NULL,
+                component_model_fits = if (!is.null(model_state)) model_state$component_model_fits else NULL,
+                component_error_states = if (!is.null(model_state)) model_state$component_error_states else NULL,
+                forecast_step = if (!is.null(model_state)) model_state$forecast_step else NULL
             ),
             warnings = warns
         )
@@ -300,7 +267,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         spec$risk$pca$lookback %||% 252L
     )
     lkb_kalman <- spec$signals$kalman$lookback %||% 252L
-    lkb_tsmom <- spec$signals$tsmom$horizon %||% 252L
+    lkb_tsmom <- max(spec$signals$tsmom$horizons %||% 252L)
     lkb_disp <- spec$market_state$dispersion$lookback %||% 63L
     lkb_eta <- spec$market_state$eta$lookback %||% 126L
     lkb_vov <- spec$market_state$vov$lookback %||% 63L
@@ -332,16 +299,25 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     R_eta <- .slice_mat(ret_max, lkb_eta)
     R_vov <- .slice_mat(ret_max, lkb_vov + lkb_vol - 1)
 
+    # Volume matrix (if available from adapter)
+    vol_window <- .run_stage("volume_matrix", tryCatch(
+        adapter$price_matrix(as_of_date, max_lkb + 1, "volume", syms, strict = FALSE),
+        error = function(e) NULL
+    ))
+
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 1: Risk Engine
+    # STAGE 1: Risk Engine (§5) — with recursive states
     # ══════════════════════════════════════════════════════════════════════════
 
-    risk_artifact <- .run_stage("risk", me_run_risk_engine(R_risk, spec$risk))
+    risk_artifact <- .run_stage(
+        "risk",
+        me_run_risk_engine(R_risk, spec$risk, model_state = model_state)
+    )
     if (is.null(risk_artifact)) {
         return(.empty_result())
     }
 
-    # Ensure horizon covariance exists and matches forecast horizon (default scaled approximation)
+    # Ensure horizon covariance matches forecast horizon
     H_fc <- as.integer(spec$forecast$label_horizon %||% 1L)
     if (!is.finite(H_fc) || H_fc < 1L) H_fc <- 1L
 
@@ -350,12 +326,9 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     }
     if (is.null(risk_artifact$Sigma_risk_H) && !is.null(risk_artifact$Sigma_risk_1)) {
         risk_artifact$Sigma_risk_H <- H_fc * risk_artifact$Sigma_risk_1
-        .w(sprintf("Risk covariance horizon approximation applied: Sigma_risk_H = %d * Sigma_risk_1", H_fc))
     } else if (!is.null(risk_artifact$Sigma_risk_1) && !is.null(risk_artifact$Sigma_risk_H) &&
         H_fc > 1L && identical(risk_artifact$Sigma_risk_H, risk_artifact$Sigma_risk_1)) {
-        # If risk engine returned only daily covariance aliased into H slot, rescale here
         risk_artifact$Sigma_risk_H <- H_fc * risk_artifact$Sigma_risk_1
-        .w(sprintf("Risk covariance horizon slot rescaled to forecast horizon H=%d", H_fc))
     }
 
     rd <- risk_artifact$diag %||% list()
@@ -386,7 +359,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     if (is.null(risk_univ)) risk_univ <- names(risk_artifact$w_baseline %||% risk_artifact$w_hrp)
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 2: Graph and Structure (§§5-6, 9-10)
+    # STAGE 2: Graph and Structure (§§5-6, 9-10) — with recursive states
     # ══════════════════════════════════════════════════════════════════════════
 
     prev_P_bar <- if (!is.null(model_state)) model_state$prev_P_bar else NULL
@@ -395,7 +368,9 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     spec_graph <- spec$graph %||% list()
     graph_artifact <- .run_stage(
         "graph",
-        me_run_graph_pipeline(risk_artifact, spec_graph, prev_P_bar, prev_labels)
+        me_run_graph_pipeline(risk_artifact, spec_graph, prev_P_bar, prev_labels,
+            model_state = model_state
+        )
     )
     if (is.null(graph_artifact)) {
         .fb("graph", "graph_stage_failed", "Graph stage failed; continuing without graph features")
@@ -404,7 +379,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 3: Signal Engine (§§7-8)
+    # STAGE 3: Signal Engine (§§7-8) — with recursive Kalman + scalarization
     # ══════════════════════════════════════════════════════════════════════════
 
     P_sig <- P_kalman[, intersect(colnames(P_kalman), risk_univ), drop = FALSE]
@@ -412,81 +387,117 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
 
     signal_artifact <- .run_stage(
         "signal",
-        me_run_signal_engine(P_sig, R_sig, risk_artifact$sigma_t,
+        me_run_signal_engine(P_sig, R_sig, risk_artifact,
             spec$signals,
-            E_window = risk_artifact$E_t,
-            B_t = risk_artifact$B_t,
-            F_window = risk_artifact$F_t
+            model_state = model_state
         )
     )
 
     if (is.null(signal_artifact)) {
         .fb("signal", "signal_engine_failed", "Signal engine failed; using zero signals")
         signal_artifact <- list(
-            kalman = setNames(rep(0, length(risk_univ)), risk_univ),
-            tsmom = setNames(rep(0, length(risk_univ)), risk_univ),
-            diag = list(kalman_all_zero = TRUE, tsmom_all_zero = TRUE, n_common = length(risk_univ))
+            s_mom = setNames(rep(0, length(risk_univ)), risk_univ),
+            s_kal = setNames(rep(0, length(risk_univ)), risk_univ),
+            s_fac = setNames(rep(0, length(risk_univ)), risk_univ),
+            s_scalar = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_slope = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_uncertainty = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_innovation = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_innov_ratio = setNames(rep(0, length(risk_univ)), risk_univ),
+            diag = list(n_common = length(risk_univ)),
+            signal_state_out = list()
         )
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 4: State and Gating (§11.5, §12.4)
+    # STAGE 4: State and Gating (§11.5, §12.4) — extended m_t + 5-comp gating
     # ══════════════════════════════════════════════════════════════════════════
 
-    state_gating_artifact <- .run_stage(
-        "state_gating",
-        me_run_state_and_gating(
-            R_disp, R_eta, R_vov, risk_artifact,
-            spec$market_state, spec$gating, lkb_vol
+    # Build extended m_t (pass full return window — each sub-state uses own lookback)
+    graph_diag_for_state <- if (!is.null(graph_artifact)) graph_artifact$diag else NULL
+    market_state_vec <- .run_stage(
+        "market_state",
+        me_build_market_state_vector(ret_max, spec$market_state,
+            graph_diag = graph_diag_for_state
+        )
+    )
+    if (is.null(market_state_vec)) {
+        market_state_vec <- c(
+            disp = 0, eta = 0, VoV = 0, dens = 0, eto = 0, chi = 0,
+            liq_avg = 0, liq_disp = 0, liq_trend = 0
+        )
+    }
+
+    # Legacy 3-way gating
+    legacy_gating <- .run_stage(
+        "legacy_gating",
+        me_softmax_gating(market_state_vec, spec$gating)
+    )
+    if (is.null(legacy_gating)) {
+        legacy_gating <- list(w_kalman = 0.5, w_tsmom = 0.5, w_cash = 0, gross_exposure = 1.0)
+    }
+
+    # Architecture 5-component gating
+    arch_gating <- .run_stage(
+        "arch_gating",
+        me_softmax_gating_5c(market_state_vec, spec$gating)
+    )
+
+    # Optimizer controls
+    opt_controls <- .run_stage(
+        "optimizer_controls",
+        me_optimizer_controls(market_state_vec, spec$portfolio)
+    )
+
+    state_gating_artifact <- list(
+        market_state = market_state_vec,
+        gating = legacy_gating,
+        arch_gating = arch_gating,
+        optimizer_controls = opt_controls,
+        diag = list(
+            dispersion = market_state_vec["disp"],
+            eta = market_state_vec["eta"],
+            vov = market_state_vec["VoV"]
         )
     )
 
-    if (is.null(state_gating_artifact)) {
-        .fb("state_gating", "state_gating_failed", "State/gating failed; using neutral gating fallback")
-        state_gating_artifact <- list(
-            market_state = c(disp = 0, eta = 0, VoV = 0),
-            gating = list(
-                w_kalman = 0.5,
-                w_tsmom = 0.5,
-                w_cash = 0.0,
-                gross_exposure = 1.0,
-                softmax_weights = c(kalman = 0.5, tsmom = 0.5, cash = 0.0)
-            ),
-            diag = list(dispersion = 0, eta = 0, vov = 0)
-        )
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 5: Feature Engine (§11) — architecture-aligned
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Prepare volume window for liquidity features
+    vol_feat_window <- NULL
+    if (!is.null(vol_window) && ncol(vol_window) > 0) {
+        vol_feat_window <- vol_window[, intersect(colnames(vol_window), risk_univ), drop = FALSE]
     }
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 5: Feature Engine (§11)
-    # ══════════════════════════════════════════════════════════════════════════
+    P_feat <- prices_max[, intersect(colnames(prices_max), risk_univ), drop = FALSE]
 
     feature_artifact <- .run_stage(
         "feature",
-        me_run_feature_engine(
+        me_assemble_features(
             signal_artifact, risk_artifact, graph_artifact,
-            state_gating_artifact, adapter, as_of_date,
-            risk_univ
+            market_state_vec, P_feat,
+            volume_window = vol_feat_window
         )
     )
 
     if (is.null(feature_artifact)) {
         .fb("feature", "feature_engine_failed", "Feature engine failed; using empty feature matrix")
         feature_artifact <- list(
-            X = matrix(0, length(risk_univ), 0, dimnames = list(risk_univ, NULL)),
-            feature_names = character(0),
-            feature_groups = list(),
-            diag = list(n_features = 0)
+            X = data.frame(matrix(0, length(risk_univ), 0, dimnames = list(risk_univ, NULL))),
+            groups = list(),
+            n_features = 0
         )
     }
 
     # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 6: Forecast Engine (§12)
-    # Truthful behavior: do NOT call fake forecast path if no feature history exists
+    # STAGE 6: Forecast Engine (§12) — 5-component panel architecture
     # ══════════════════════════════════════════════════════════════════════════
 
     spec_forecast <- spec$forecast %||% list()
 
-    # Persist architecture-aligned feature snapshots (asset x feature matrix per date)
+    # Persist feature snapshots
     feature_history_out <- .run_stage(
         "feature_history",
         .me_append_feature_snapshot_history(
@@ -501,69 +512,63 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     if (is.null(feature_history_out)) {
         .fb(
             "feature_history", "feature_history_append_failed",
-            "Failed to append feature snapshot history; carrying forward prior feature_history if any"
+            "Failed to append feature snapshot history"
         )
         if (!is.null(model_state) && is.list(model_state$feature_history)) {
             feature_history_out <- model_state$feature_history
         }
     }
 
-    # Forecast input extraction (architecture-enforced)
-    # Only accept a future explicit asset-level training_panel object.
-    fh_extract <- .me_extract_forecast_history_input(model_state)
-    X_hist_window <- fh_extract$X_hist_window
-
-    forecast_artifact <- NULL
-    if (is.null(X_hist_window)) {
-        if (identical(fh_extract$status, "legacy_matrix_rejected")) {
-            .fb(
-                "forecast", "legacy_x_hist_window_rejected",
-                fh_extract$reason %||% "Legacy X_hist_window matrix rejected"
-            )
-            .archv("Legacy matrix X_hist_window forecast input rejected (requires asset-level training panel object)")
-        } else if (identical(fh_extract$status, "snapshots_present_panel_missing")) {
-            .fb(
-                "forecast", "training_panel_builder_missing",
-                fh_extract$reason %||% "Feature snapshots present but training_panel builder missing"
-            )
-            .archv("Feature snapshot history exists, but asset-level forecast training panel builder is not implemented")
-        } else {
-            .fb(
-                "forecast", "missing_feature_history",
-                "Forecast stage skipped: no asset-level feature history/training_panel available"
-            )
-            .archv("Forecast feature history panel (asset-level training_panel) is not implemented/available")
-        }
+    # Build feature history list for panel builder
+    fh_snapshots <- if (!is.null(feature_history_out) &&
+        is.list(feature_history_out$snapshots)) {
+        feature_history_out$snapshots
     } else {
-        forecast_artifact <- .run_stage(
-            "forecast",
-            me_run_forecast_engine(
-                X_current = feature_artifact$X,
-                R_window = R_risk,
-                X_hist_window = X_hist_window,
-                gating_artifact = state_gating_artifact,
-                risk_artifact = risk_artifact,
-                spec_forecast = spec_forecast
-            )
-        )
+        NULL
+    }
 
-        if (is.null(forecast_artifact)) {
-            .fb("forecast", "forecast_engine_failed", "Forecast engine failed; portfolio will use signal fallback path")
-        } else if (!is.null(forecast_artifact$diag$reason)) {
-            # Surface all explicit forecast fallback/degrade reasons
+    # Build R_history for panel labels
+    R_history <- ret_max # Full available return history
+
+    forecast_artifact <- .run_stage(
+        "forecast",
+        me_run_forecast_engine(
+            feature_artifact = feature_artifact,
+            risk_artifact = risk_artifact,
+            graph_artifact = graph_artifact,
+            signal_artifact = signal_artifact,
+            market_state_vec = market_state_vec,
+            spec_forecast = spec_forecast,
+            spec_gating = spec$gating,
+            feature_history = fh_snapshots,
+            R_history = R_history,
+            model_state = model_state
+        )
+    )
+
+    if (is.null(forecast_artifact)) {
+        .fb("forecast", "forecast_engine_failed", "Forecast engine failed; portfolio will use signal fallback path")
+    } else {
+        fc_diag <- forecast_artifact$diag %||% list()
+        if (grepl("FALLBACK", fc_diag$method %||% "", fixed = TRUE)) {
             .fb(
-                "forecast", paste0("forecast_diag_", forecast_artifact$diag$reason),
-                sprintf("Forecast engine reported reason='%s'", forecast_artifact$diag$reason)
+                "forecast", paste0("forecast_", fc_diag$method),
+                sprintf("Forecast: %s (reason: %s)", fc_diag$method, fc_diag$reason %||% "")
             )
         }
     }
 
-    # Current forecast engine is still off-spec conceptually (time-level training vs asset-level panel)
-    .w("[ARCH] Current forecast engine implementation is scaffold/off-spec for asset-level matured training panel")
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 7: Portfolio Construction (§§13-14) — consume μ_eff
+    # ══════════════════════════════════════════════════════════════════════════
 
-    # ══════════════════════════════════════════════════════════════════════════
-    # STAGE 7: Portfolio Construction (§§13-14)
-    # ══════════════════════════════════════════════════════════════════════════
+    # Liquidity features for caps (if available)
+    liq_features_for_port <- NULL
+    if (!is.null(feature_artifact$X) && "f_liquidity" %in% colnames(feature_artifact$X)) {
+        liq_features_for_port <- list(
+            f_liquidity = feature_artifact$X[, "f_liquidity"]
+        )
+    }
 
     port_artifact <- .run_stage(
         "portfolio",
@@ -572,7 +577,9 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
             spec$portfolio,
             forecast_artifact = forecast_artifact,
             graph_artifact = graph_artifact,
-            prev_target = prev_target
+            prev_target = prev_target,
+            optimizer_controls = opt_controls,
+            liquidity_features = liq_features_for_port
         )
     )
 
@@ -582,7 +589,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
     }
 
     pd <- port_artifact$diag %||% list()
-    if (identical(pd$method, "tilt_fallback") || identical(pd$method, "tilt_signal")) {
+    if (grepl("FALLBACK", pd$method %||% "", fixed = TRUE)) {
         .fb(
             "portfolio", paste0("portfolio_", pd$method),
             sprintf("Portfolio used %s method", pd$method)
@@ -598,7 +605,6 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         risk_artifact$F_t <- NULL
     }
     if (isFALSE(spec$meta$retain_matrices)) {
-        # Keep at least one covariance for validation / portfolio audit
         if (!is.null(risk_artifact$Sigma_risk_H)) {
             risk_artifact$Sigma_total <- NULL
             risk_artifact$Sigma_f <- NULL
@@ -613,22 +619,24 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
 
     architecture_flags <- list(
         glasso_residual_precision_configured = isTRUE(spec$risk$resid$use_glasso),
-        glasso_residual_precision_used = isTRUE(risk_artifact$diag$glasso_used),
+        glasso_residual_precision_used = isTRUE(rd$glasso_used),
+        standardized_path_used = isTRUE(rd$standardized_path_used),
+        factor_alignment_used = isTRUE(rd$factor_alignment_used),
+        recursive_factor_cov_used = isTRUE(rd$recursive_factor_cov_used),
+        recursive_resid_target_used = isTRUE(rd$recursive_resid_target_used),
         horizon_covariance_available = !is.null(risk_artifact$Sigma_risk_H),
-
-        # History / forecast architecture status
-        feature_snapshot_history_available = !is.null(feature_history_out) &&
-            is.list(feature_history_out$snapshots) &&
-            length(feature_history_out$snapshots) > 0,
+        forecast_stage_executed = !is.null(forecast_artifact),
+        forecast_method = if (!is.null(forecast_artifact)) {
+            forecast_artifact$diag$method %||% "unknown"
+        } else {
+            "skipped"
+        },
         feature_snapshot_history_count = if (!is.null(feature_history_out) &&
             is.list(feature_history_out$snapshots)) {
             length(feature_history_out$snapshots)
         } else {
             0L
         },
-        forecast_feature_history_available = !is.null(X_hist_window), # strict: training panel input available
-        forecast_stage_executed = !is.null(forecast_artifact),
-        forecast_asset_level_training_implemented = FALSE,
         legacy_hrp_alias_present = !is.null(risk_artifact$w_hrp)
     )
 
@@ -643,14 +651,8 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
             active_names  = nrow(port_artifact$target_weights)
         ),
         feature_info = list(
-            n_features = feature_artifact$diag$n_features %||% 0,
-            groups = feature_artifact$feature_groups %||% list(),
-            snapshot_history_count = if (!is.null(feature_history_out) &&
-                is.list(feature_history_out$snapshots)) {
-                length(feature_history_out$snapshots)
-            } else {
-                0L
-            }
+            n_features = feature_artifact$n_features %||% ncol(feature_artifact$X %||% matrix(0, 0, 0)),
+            groups = feature_artifact$groups %||% list()
         ),
         forecast_info = if (!is.null(forecast_artifact)) forecast_artifact$diag else list(stage = "skipped"),
         graph_info = if (!is.null(graph_artifact)) graph_artifact$diag else list(),
@@ -664,6 +666,12 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         )
     )
 
+    # ── Collect all recursive state updates ──
+    risk_state <- risk_artifact$risk_state_out %||% list()
+    graph_state <- if (!is.null(graph_artifact)) graph_artifact$graph_state_out %||% list() else list()
+    signal_state <- signal_artifact$signal_state_out %||% list()
+    forecast_state <- if (!is.null(forecast_artifact)) forecast_artifact$forecast_state_out %||% list() else list()
+
     res <- list(
         as_of_date = as_of_date,
         tradable_symbols = risk_univ,
@@ -673,6 +681,7 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         signals = signal_artifact,
         market_state = state_gating_artifact$market_state,
         gating = state_gating_artifact$gating,
+        arch_gating = state_gating_artifact$arch_gating,
         graph = if (!is.null(graph_artifact)) {
             list(
                 clustering = graph_artifact$clustering,
@@ -682,14 +691,19 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
             list()
         },
         features = list(
-            n_features = feature_artifact$diag$n_features %||% 0,
-            groups     = feature_artifact$feature_groups %||% list()
+            n_features = feature_artifact$n_features %||% 0,
+            groups     = feature_artifact$groups %||% list()
         ),
         forecast = if (!is.null(forecast_artifact)) {
             list(
-                combined = forecast_artifact$combined_forecast,
-                confidence = forecast_artifact$confidence$avg_confidence,
-                uncertainty = forecast_artifact$uncertainty
+                mu_hat = forecast_artifact$mu_hat,
+                mu_eff = forecast_artifact$mu_eff,
+                sigma_hat = forecast_artifact$sigma_hat,
+                s_eff = forecast_artifact$s_eff,
+                confidence = forecast_artifact$confidence,
+                pi_t = forecast_artifact$pi_t,
+                rho_rel = forecast_artifact$rho_rel,
+                method = forecast_artifact$diag$method
             )
         } else {
             list()
@@ -697,16 +711,52 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         portfolio_diag = pd,
         meta = meta,
         model_state_out = list(
-            prev_P_bar = if (!is.null(graph_artifact)) graph_artifact$P_bar else NULL,
+            # Graph states
+            prev_P_bar = if (!is.null(graph_artifact)) {
+                graph_artifact$P_bar
+            } else {
+                (if (!is.null(model_state)) model_state$prev_P_bar else NULL)
+            },
             prev_labels = if (!is.null(graph_artifact) &&
                 !is.null(graph_artifact$clustering) &&
                 !is.null(graph_artifact$clustering$labels)) {
                 graph_artifact$clustering$labels
             } else {
-                NULL
+                if (!is.null(model_state)) model_state$prev_labels else NULL
             },
+            # Portfolio state
             prev_target = port_artifact$target_weights,
-            feature_history = feature_history_out
+            # Feature history
+            feature_history = feature_history_out,
+            # Risk recursive states
+            ewma_vol_state = risk_state$ewma_vol_state %||%
+                (if (!is.null(model_state)) model_state$ewma_vol_state else NULL),
+            factor_cov_state = risk_state$factor_cov_state %||%
+                (if (!is.null(model_state)) model_state$factor_cov_state else NULL),
+            resid_cov_state = risk_state$resid_cov_state %||%
+                (if (!is.null(model_state)) model_state$resid_cov_state else NULL),
+            B_prev = risk_state$B_prev %||%
+                (if (!is.null(model_state)) model_state$B_prev else NULL),
+            # Graph recursive states
+            edge_stability = graph_state$edge_stability %||%
+                (if (!is.null(model_state)) model_state$edge_stability else NULL),
+            node_stability = graph_state$node_stability %||%
+                (if (!is.null(model_state)) model_state$node_stability else NULL),
+            prev_M = graph_state$prev_M %||%
+                (if (!is.null(model_state)) model_state$prev_M else NULL),
+            chi_t = graph_state$chi_t %||% 0,
+            # Signal recursive states
+            kalman_states = signal_state$kalman_states %||%
+                (if (!is.null(model_state)) model_state$kalman_states else NULL),
+            scalar_weights = signal_state$scalar_weights %||%
+                (if (!is.null(model_state)) model_state$scalar_weights else NULL),
+            # Forecast recursive states
+            component_model_fits = forecast_state$component_model_fits %||%
+                (if (!is.null(model_state)) model_state$component_model_fits else NULL),
+            component_error_states = forecast_state$component_error_states %||%
+                (if (!is.null(model_state)) model_state$component_error_states else NULL),
+            forecast_step = forecast_state$forecast_step %||%
+                (if (!is.null(model_state)) model_state$forecast_step else 0L)
         ),
         warnings = unique(warns)
     )

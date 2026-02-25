@@ -1,468 +1,583 @@
 #' @title Model Engine — Forecast Engine
-#' @description 5-component forecasts, rolling ridge, gating, confidence, uncertainty.
-#' Implements architecture.md §12: component models → gated combination → reliability.
+#' @description Architecture §12: 5-component asset-date panel forecast with global softmax
+#' mixture, bounded confidence multipliers, stagger-bucket error states, asset reliability.
+#' Preserves legacy fallback path explicitly flagged.
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §12.1 Component forecast models
+# §12.0 Training panel construction (causal)
 # ══════════════════════════════════════════════════════════════════════════════
 
-#' Rolling ridge regression: y ~ X with L2 penalty
+#' Build causal training panel: {(X_{i,s}, y^(H)_{i,s}) : s <= t-H}
 #' @export
-me_rolling_ridge <- function(y, X, lambda = 0.01) {
-    n <- nrow(X)
-    p <- ncol(X)
+me_build_training_panel <- function(feature_history, R_history, horizon = 21L,
+                                    current_date_idx = NULL) {
+    # feature_history: list of snapshots, each with $X (data.frame/matrix n×p) and $date
+    # R_history: matrix of returns (T × n_assets, with rownames = dates)
+    # Returns: list(X = matrix, y = vector, asset = char, date = char)
 
-    if (is.null(colnames(X))) {
-        colnames(X) <- paste0("x", seq_len(p))
+    if (is.null(feature_history) || length(feature_history) < horizon + 1) {
+        return(list(X = NULL, y = NULL, n_obs = 0, n_features = 0))
     }
 
-    if (n < max(5, p + 1)) {
-        return(list(
-            beta = setNames(rep(0, p), colnames(X)),
-            intercept = 0,
-            feature_names = colnames(X),
-            fitted = FALSE,
-            reason = "insufficient_obs"
-        ))
+    all_X <- list()
+    all_y <- c()
+    all_asset <- c()
+    all_date <- c()
+
+    n_snaps <- length(feature_history)
+    # Only use snapshots where labels have matured: up to t - H
+    usable_end <- n_snaps - horizon
+
+    if (usable_end < 1) {
+        return(list(X = NULL, y = NULL, n_obs = 0, n_features = 0))
     }
 
-    mu_X <- colMeans(X, na.rm = TRUE)
-    sd_X <- apply(X, 2, sd, na.rm = TRUE)
-    sd_X[sd_X < 1e-8 | !is.finite(sd_X)] <- 1
+    for (s in seq_len(usable_end)) {
+        snap <- feature_history[[s]]
+        if (is.null(snap$X)) next
 
-    X_s <- scale(X, center = mu_X, scale = sd_X)
-    X_s[!is.finite(X_s)] <- 0
+        X_s <- as.matrix(snap$X)
+        snap_syms <- rownames(X_s)
+        if (is.null(snap_syms) || length(snap_syms) == 0) next
 
-    mu_y <- mean(y, na.rm = TRUE)
-    y_c <- y - mu_y
-    y_c[!is.finite(y_c)] <- 0
+        # Forward returns as labels (H-day cumulative)
+        # Need returns from s+1 to s+H
+        date_s <- snap$date_idx %||% s
+        label_start <- date_s + 1
+        label_end <- date_s + horizon
 
-    XtX <- crossprod(X_s)
-    Xty <- crossprod(X_s, y_c)
+        if (label_end > nrow(R_history)) next
 
-    beta_s <- tryCatch(
-        solve(XtX + lambda * diag(p), Xty),
-        error = function(e) NULL
+        for (sym in snap_syms) {
+            if (!(sym %in% colnames(R_history))) next
+            r_forward <- R_history[label_start:label_end, sym]
+            if (any(!is.finite(r_forward))) next
+            y_label <- sum(r_forward) # H-day cumulative return
+
+            all_X[[length(all_X) + 1]] <- X_s[sym, , drop = TRUE]
+            all_y <- c(all_y, y_label)
+            all_asset <- c(all_asset, sym)
+            all_date <- c(all_date, snap$date %||% as.character(s))
+        }
+    }
+
+    if (length(all_y) < 10) {
+        return(list(X = NULL, y = NULL, n_obs = 0, n_features = 0))
+    }
+
+    X_panel <- do.call(rbind, all_X)
+    X_panel[!is.finite(X_panel)] <- 0
+
+    list(
+        X = X_panel,
+        y = all_y,
+        asset = all_asset,
+        date = all_date,
+        n_obs = length(all_y),
+        n_features = ncol(X_panel)
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.1 Component feature selectors
+# ══════════════════════════════════════════════════════════════════════════════
+
+.component_feature_selector <- function(feature_names, component_id) {
+    # Select features relevant to each architecture component
+    switch(as.character(component_id),
+        "1" = {
+            # C1: temporal continuation (raw/resid TSMOM, Kalman, factor, scalar, liquidity interactions)
+            grep("^f_(mom|kal|fac|tsmom|resid_tsmom|scalar|kal_slope|kal_uncert|kal_innov|mom_x_liq|kal_x_liq)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "2" = {
+            # C2: structural continuation (graph peer, shrinkage, mixed, signed)
+            grep("^f_(graph_peer|graph_shr|graph_mixed|graph_signed|cluster_z)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "3" = {
+            # C3: neighborhood mean-reversion (relative, tension, cluster)
+            grep("^f_(graph_relative|graph_tension|cluster_z|centrality)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "4" = {
+            # C4: PCA-graph dislocation (pca_graph features, factor exposure, structural)
+            grep("^f_(pca_graph|factor_exposure|idio_frac|vol_rank)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "5" = {
+            # C5: liquidity-conditioned correction (liquidity, illiq, liq interactions)
+            grep("^f_(liquidity|traded|illiq|liq_zscore|avg_trade|n_trades|mom_x_liq|kal_x_liq)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        feature_names # fallback: all features
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.2 Per-component ridge regression
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_train_component_model <- function(X, y, feature_cols, lambda = 0.01) {
+    # Ridge regression for a single component
+    if (is.null(X) || length(y) < 10 || length(feature_cols) == 0) {
+        return(list(beta = NULL, intercept = 0, n_obs = 0, n_features = 0, fitted = FALSE))
+    }
+
+    # Select columns
+    avail_cols <- intersect(feature_cols, colnames(X))
+    if (length(avail_cols) < 1) {
+        return(list(beta = NULL, intercept = 0, n_obs = 0, n_features = 0, fitted = FALSE))
+    }
+
+    Xc <- X[, avail_cols, drop = FALSE]
+    Xc[!is.finite(Xc)] <- 0
+
+    # Standardize X columns
+    x_means <- colMeans(Xc)
+    x_sds <- apply(Xc, 2, sd)
+    x_sds[x_sds <= 0 | !is.finite(x_sds)] <- 1
+    Xc <- scale(Xc, center = x_means, scale = x_sds)
+    Xc[!is.finite(Xc)] <- 0
+
+    y_mean <- mean(y, na.rm = TRUE)
+    yc <- y - y_mean
+
+    p <- ncol(Xc)
+    XtX <- t(Xc) %*% Xc + lambda * diag(p)
+    Xty <- t(Xc) %*% yc
+
+    beta_std <- tryCatch(
+        as.vector(solve(XtX, Xty)),
+        error = function(e) rep(0, p)
     )
 
-    if (is.null(beta_s)) {
-        return(list(
-            beta = setNames(rep(0, p), colnames(X)),
-            intercept = 0,
-            feature_names = colnames(X),
-            fitted = FALSE,
-            reason = "solve_failed"
-        ))
-    }
-
-    beta_s <- as.vector(beta_s)
-    names(beta_s) <- colnames(X)
-
-    beta <- beta_s / sd_X
-    names(beta) <- colnames(X)
-
-    intercept <- mu_y - sum(beta * mu_X)
+    # Unstandardize
+    beta <- beta_std / x_sds
+    intercept <- y_mean - sum(beta * x_means)
+    names(beta) <- avail_cols
 
     list(
         beta = beta,
         intercept = intercept,
-        feature_names = colnames(X),
-        fitted = TRUE,
-        reason = "ok"
+        x_means = x_means,
+        x_sds = x_sds,
+        y_mean = y_mean,
+        feature_cols = avail_cols,
+        n_obs = nrow(Xc),
+        n_features = p,
+        fitted = TRUE
     )
 }
 
-#' §12.1 Component c forecast: f_hat_i^c = X_i * beta_c + intercept_c
 #' @export
-me_component_forecast <- function(X_current, model_fit) {
-    syms <- rownames(X_current)
-    if (is.null(syms)) syms <- seq_len(nrow(X_current))
-
-    if (!isTRUE(model_fit$fitted)) {
-        out <- setNames(rep(0, nrow(X_current)), syms)
-        return(out)
+me_predict_component <- function(X_new, model) {
+    # Predict from trained component model
+    if (is.null(model) || !isTRUE(model$fitted) || is.null(model$beta)) {
+        return(rep(0, nrow(X_new)))
     }
 
-    feat_names <- model_fit$feature_names %||% names(model_fit$beta)
-    if (is.null(feat_names) || length(feat_names) == 0) {
-        out <- setNames(rep(0, nrow(X_current)), syms)
-        return(out)
+    avail <- intersect(model$feature_cols, colnames(X_new))
+    if (length(avail) == 0) {
+        return(rep(0, nrow(X_new)))
     }
 
-    X_use <- matrix(0,
-        nrow = nrow(X_current), ncol = length(feat_names),
-        dimnames = list(syms, feat_names)
-    )
+    Xc <- X_new[, avail, drop = FALSE]
+    Xc[!is.finite(Xc)] <- 0
 
-    common <- intersect(feat_names, colnames(X_current))
-    if (length(common) > 0) {
-        X_use[, common] <- X_current[, common, drop = FALSE]
-    }
-
-    beta <- model_fit$beta[feat_names]
-    beta[!is.finite(beta)] <- 0
-
-    pred <- as.vector(X_use %*% beta) + model_fit$intercept
+    pred <- as.vector(Xc %*% model$beta[avail]) + model$intercept
     pred[!is.finite(pred)] <- 0
-    names(pred) <- syms
     pred
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §12.2 Five component models
-# ══════════════════════════════════════════════════════════════════════════════
-
-#' Train all 5 component models
-#' @export
-me_train_component_models <- function(y_hist, X_hist, spec_forecast = list()) {
-    # y_hist: list of label vectors (by component type)
-    # X_hist: feature matrix used for training
-    # Returns list of fitted models for each component
-
-    lambda <- spec_forecast$ridge_lambda %||% 0.01
-
-    models <- list()
-
-    # C1: Momentum composite (use all features)
-    models$momentum <- me_rolling_ridge(y_hist, X_hist, lambda)
-
-    # C2: Signal-only model (use only temporal features if available)
-    temp_cols <- grep("^f_mom|^f_kal|^f_fac$", colnames(X_hist), value = TRUE)
-    if (length(temp_cols) >= 1) {
-        models$signal_only <- me_rolling_ridge(y_hist, X_hist[, temp_cols, drop = FALSE], lambda)
-    } else {
-        models$signal_only <- list(
-            beta = numeric(0), intercept = 0,
-            fitted = FALSE, reason = "no_signal_features"
-        )
-    }
-
-    # C3: Structure-aware model (structural + graph features)
-    struct_cols <- grep("^f_factor|^f_vol|^f_idio|^f_graph|^f_cluster|^f_centrality",
-        colnames(X_hist),
-        value = TRUE
-    )
-    if (length(struct_cols) >= 1) {
-        models$structure <- me_rolling_ridge(y_hist, X_hist[, struct_cols, drop = FALSE], lambda)
-    } else {
-        models$structure <- list(
-            beta = numeric(0), intercept = 0,
-            fitted = FALSE, reason = "no_structural_features"
-        )
-    }
-
-    # C4: Contrarian model (relative dislocation + mean-reversion features)
-    contra_cols <- grep("^f_graph_relative|^f_cluster_z", colnames(X_hist), value = TRUE)
-    if (length(contra_cols) >= 1) {
-        models$contrarian <- me_rolling_ridge(-y_hist, X_hist[, contra_cols, drop = FALSE], lambda)
-    } else {
-        models$contrarian <- list(
-            beta = numeric(0), intercept = 0,
-            fitted = FALSE, reason = "no_contra_features"
-        )
-    }
-
-    # C5: Adaptive model (includes state features for regime adaptation)
-    state_cols <- grep("^f_state_", colnames(X_hist), value = TRUE)
-    adaptive_cols <- union(temp_cols, state_cols)
-    if (length(adaptive_cols) >= 1) {
-        models$adaptive <- me_rolling_ridge(y_hist, X_hist[, adaptive_cols, drop = FALSE], lambda)
-    } else {
-        models$adaptive <- models$momentum # fallback
-    }
-
-    models
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# §12.3 Building training labels (with matured label discipline)
-# ══════════════════════════════════════════════════════════════════════════════
-
-#' Build lagged forward returns as labels (strict no-lookahead)
-#' @export
-me_build_training_labels <- function(R_window, horizon = 21L) {
-    # Labels are h-step ahead cumulative returns
-    # At time t, label = sum(r_{t+1}...r_{t+h}) — but we only use MATURED labels
-    # So the last h observations have NO valid label
-    Tn <- nrow(R_window)
-    if (Tn < horizon + 10) {
-        return(list(y = NULL, X_dates = NULL, valid = FALSE))
-    }
-
-    n_train <- Tn - horizon
-    y_mat <- matrix(NA_real_, n_train, ncol(R_window))
-    for (t in seq_len(n_train)) {
-        y_mat[t, ] <- colSums(R_window[(t + 1):(t + horizon), , drop = FALSE], na.rm = TRUE)
-    }
-    colnames(y_mat) <- colnames(R_window)
-
-    # Cross-sectional median as aggregate label for ridge
-    y <- rowMedians_safe(y_mat)
-
-    list(y = y, y_mat = y_mat, n_train = n_train, valid = TRUE)
-}
-
-#' Safe row-medians
-rowMedians_safe <- function(mat) {
-    apply(mat, 1, median, na.rm = TRUE)
-}
-
-# ══════════════════════════════════════════════════════════════════════════════
-# §12.4 Forecast combination with gating weights
+# §12.4 Global softmax mixture weights π_t
 # ══════════════════════════════════════════════════════════════════════════════
 
 #' @export
-me_combine_forecasts <- function(component_forecasts, gating_weights, spec_forecast = list()) {
-    # component_forecasts: list of named vectors (per component)
-    # gating_weights: named vector summing to 1
-    syms <- unique(unlist(lapply(component_forecasts, names)))
-    if (length(syms) == 0) {
-        return(setNames(numeric(0), character(0)))
-    }
-
-    combined <- setNames(rep(0, length(syms)), syms)
-
-    for (comp_name in names(component_forecasts)) {
-        fc <- component_forecasts[[comp_name]]
-        wt <- gating_weights[comp_name] %||% 0
-        if (is.null(fc) || length(fc) == 0 || wt == 0) next
-        common <- intersect(syms, names(fc))
-        combined[common] <- combined[common] + wt * fc[common]
-    }
-    combined[!is.finite(combined)] <- 0
-    combined
+me_forecast_softmax_weights <- function(m_t, A_pi, b_pi, temperature = 1.0) {
+    # π_t = softmax((A_pi %*% m_t + b_pi) / temperature)
+    n_comp <- nrow(A_pi)
+    z <- as.vector(A_pi %*% m_t + b_pi) / temperature
+    z <- z - max(z) # numerical stability
+    e <- exp(z)
+    pi_t <- e / sum(e)
+    pi_t[!is.finite(pi_t)] <- 1 / n_comp
+    names(pi_t) <- paste0("C", seq_len(n_comp))
+    pi_t
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# §12.5 Confidence and uncertainty
+# §12.5 Bounded confidence multipliers κ_{i,c,t}
 # ══════════════════════════════════════════════════════════════════════════════
 
-#' Per-asset, per-component confidence (κ_{i,c,t})
 #' @export
-me_compute_confidence <- function(component_forecasts, spec_forecast = list()) {
-    comp_names <- names(component_forecasts)
-    if (length(comp_names) == 0) {
-        return(list(kappa = list(), avg_confidence = 0))
-    }
-
-    syms <- unique(unlist(lapply(component_forecasts, names)))
-    n <- length(syms)
-
-    # κ = 1 - dispersion_within / dispersion_total
-    # Heuristic: confidence based on forecast amplitude and cross-component agreement
-    kappa <- list()
-    for (comp in comp_names) {
-        fc <- component_forecasts[[comp]]
-        if (is.null(fc) || length(fc) == 0) {
-            kappa[[comp]] <- setNames(rep(0, n), syms)
-            next
-        }
-        fc_aligned <- setNames(rep(0, n), syms)
-        fc_aligned[intersect(syms, names(fc))] <- fc[intersect(syms, names(fc))]
-
-        # Amplitude-based confidence: |fc| / (|fc| + epsilon)
-        eps <- spec_forecast$confidence_eps %||% 0.01
-        k <- abs(fc_aligned) / (abs(fc_aligned) + eps)
-        k[!is.finite(k)] <- 0
-        kappa[[comp]] <- k
-    }
-
-    # Agreement: if all components have same sign → higher confidence
-    fc_signs <- do.call(cbind, lapply(component_forecasts, function(fc) {
-        s <- setNames(rep(0, n), syms)
-        s[intersect(syms, names(fc))] <- sign(fc[intersect(syms, names(fc))])
-        s
-    }))
-
-    agreement <- rowMeans(fc_signs, na.rm = TRUE) # [-1, 1]
-    agreement_confidence <- abs(agreement) # 0 = disagree, 1 = agree
-
-    list(
-        kappa = kappa,
-        agreement = setNames(agreement_confidence, syms),
-        avg_confidence = mean(agreement_confidence, na.rm = TRUE)
-    )
-}
-
-#' §12.6 Uncertainty envelope
-#' @export
-me_compute_uncertainty <- function(combined_forecast, sigma_t, confidence,
-                                   spec_forecast = list()) {
-    syms <- names(combined_forecast)
-    n <- length(syms)
-    sigma_aligned <- setNames(rep(0.2, n), syms)
-    common <- intersect(syms, names(sigma_t))
-    sigma_aligned[common] <- sigma_t[common]
-
-    # σ_forecast = σ_asset × (1 - κ_agreement) × scale_factor
-    scale_factor <- spec_forecast$uncertainty_scale %||% 1.0
-    agree <- confidence$agreement[syms]
-    agree[is.na(agree)] <- 0
-
-    u <- sigma_aligned * (1 - agree) * scale_factor / sqrt(252)
-    u[!is.finite(u)] <- 0.01
-
-    data.frame(
-        symbol = syms,
-        forecast = combined_forecast,
-        sigma_fc = u,
-        z_score = combined_forecast / pmax(u, 1e-8),
-        stringsAsFactors = FALSE
-    )
+me_bounded_kappa <- function(X_i, kappa_min = 0.5, kappa_max = 1.5) {
+    # κ_{i,c,t} = kappa_min + (kappa_max - kappa_min) * σ(||x_i||_2 - threshold)
+    # Simple: scale by feature magnitude
+    x_norm <- sqrt(sum(X_i^2, na.rm = TRUE))
+    # Sigmoid centered at median feature norm
+    raw <- 1 / (1 + exp(-(x_norm - 1)))
+    kappa <- kappa_min + (kappa_max - kappa_min) * raw
+    if (!is.finite(kappa)) kappa <- 1.0
+    kappa
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
-# Full forecast engine orchestrator
+# §12.6 Stagger-bucket component error states
 # ══════════════════════════════════════════════════════════════════════════════
 
 #' @export
-me_run_forecast_engine <- function(X_current, R_window, X_hist_window,
-                                   gating_artifact, risk_artifact,
-                                   spec_forecast = list()) {
-    syms <- rownames(X_current)
-    n <- length(syms)
+me_update_error_states <- function(error_states_prev, predictions, actuals, horizon,
+                                   lambda_err = 0.97) {
+    # H stagger buckets per component
+    # Only update bucket (t mod H) when labels mature
+    n_comp <- length(predictions)
 
-    if (n == 0 || ncol(X_current) == 0) {
-        return(list(
-            combined_forecast = setNames(rep(0, n), syms),
-            component_forecasts = list(),
-            confidence = list(kappa = list(), avg_confidence = 0),
-            uncertainty = data.frame(
-                symbol = character(0), forecast = numeric(0),
-                sigma_fc = numeric(0), z_score = numeric(0)
-            ),
-            models = list(),
-            diag = list(reason = "empty_inputs")
-        ))
+    if (is.null(error_states_prev)) {
+        # Initialize: one variance per component
+        error_states_prev <- lapply(seq_len(n_comp), function(c) {
+            list(
+                sigma2 = rep(0.01, horizon), # H buckets
+                n_updates = rep(0L, horizon)
+            )
+        })
+        names(error_states_prev) <- names(predictions)
     }
 
-    # 1. Build training labels
-    horizon <- spec_forecast$label_horizon %||% 21L
-    label_result <- me_build_training_labels(R_window, horizon)
+    bucket <- ((error_states_prev[[1]]$n_updates[1] %||% 0) %% horizon) + 1
 
-    if (!isTRUE(label_result$valid)) {
-        # Can't train → use raw signal-based forecast
-        fc <- X_current[, 1, drop = TRUE]
-        fc <- as.vector(fc)
-        names(fc) <- syms
-        fc[!is.finite(fc)] <- 0
-        return(list(
-            combined_forecast = fc,
-            component_forecasts = list(fallback = fc),
-            confidence = list(kappa = list(), avg_confidence = 0),
-            uncertainty = data.frame(
-                symbol = syms, forecast = fc,
-                sigma_fc = rep(0.01, n), z_score = rep(0, n)
-            ),
-            models = list(),
-            diag = list(reason = "insufficient_labels")
-        ))
-    }
-
-    # 2. Align feature history with labels
-    n_train <- label_result$n_train
-    if (is.null(X_hist_window) || nrow(X_hist_window) < n_train) {
-        # Honest fallback: no historical feature panel available yet
-        # Use current feature signals directly rather than fake regression training
-        fc_fallback <- if ("f_mom" %in% colnames(X_current)) {
-            X_current[, "f_mom"]
-        } else if ("f_kal" %in% colnames(X_current)) {
-            X_current[, "f_kal"]
-        } else if (ncol(X_current) > 0) {
-            X_current[, 1]
-        } else {
-            setNames(rep(0, nrow(X_current)), rownames(X_current))
-        }
-
-        fc_fallback <- as.vector(fc_fallback)
-        names(fc_fallback) <- rownames(X_current)
-        fc_fallback[!is.finite(fc_fallback)] <- 0
-
-        return(list(
-            combined_forecast = fc_fallback,
-            component_forecasts = list(fallback = fc_fallback),
-            gating_weights = c(fallback = 1),
-            confidence = list(kappa = list(), agreement = abs(sign(fc_fallback)), avg_confidence = mean(abs(sign(fc_fallback)))),
-            uncertainty = data.frame(
-                symbol = names(fc_fallback),
-                forecast = fc_fallback,
-                sigma_fc = rep(0.01, length(fc_fallback)),
-                z_score = rep(0, length(fc_fallback)),
-                stringsAsFactors = FALSE
-            ),
-            models = list(),
-            diag = list(reason = "no_feature_history_fallback", label_horizon = horizon)
-        ))
-    }
-
-    X_train <- X_hist_window[1:n_train, , drop = FALSE]
-
-    # Use cross-sectional median returns as labels
-    y_train <- label_result$y
-    y_train[!is.finite(y_train)] <- 0
-
-    # 3. Train component models
-    models <- me_train_component_models(y_train, X_train, spec_forecast)
-
-    # 4. Generate component forecasts
-    component_forecasts <- list()
-    for (comp in names(models)) {
-        if (isTRUE(models[[comp]]$fitted)) {
-            # Use matching feature columns
-            model <- models[[comp]]
-            feat_names <- names(model$beta)
-            if (length(feat_names) > 0 && all(feat_names %in% colnames(X_current))) {
-                component_forecasts[[comp]] <- me_component_forecast(
-                    X_current[, feat_names, drop = FALSE], model
-                )
-            } else {
-                # Use all available columns if names don't match
-                component_forecasts[[comp]] <- me_component_forecast(X_current, model)
+    out <- error_states_prev
+    for (c in seq_len(n_comp)) {
+        nm <- names(predictions)[c]
+        if (is.null(nm)) nm <- paste0("C", c)
+        if (!is.null(actuals) && !is.null(actuals[[nm]])) {
+            err <- (predictions[[nm]] - actuals[[nm]])^2
+            err <- mean(err, na.rm = TRUE)
+            if (is.finite(err)) {
+                if (is.null(out[[nm]])) {
+                    out[[nm]] <- list(sigma2 = rep(0.01, horizon), n_updates = rep(0L, horizon))
+                }
+                out[[nm]]$sigma2[bucket] <- lambda_err * out[[nm]]$sigma2[bucket] +
+                    (1 - lambda_err) * err
+                out[[nm]]$n_updates[bucket] <- out[[nm]]$n_updates[bucket] + 1L
             }
-        } else {
-            component_forecasts[[comp]] <- setNames(rep(0, n), syms)
         }
     }
+    out
+}
 
-    # 5. Build gating weights for forecast combination
-    # Use gating artifact for expert mixture + uniform remainder
-    g <- gating_artifact$gating
-    n_comps <- length(component_forecasts)
-    gating_w <- setNames(rep(1 / n_comps, n_comps), names(component_forecasts))
-
-    # Give momentum/signal more weight via gating signal
-    if (!is.null(g$w_kalman) && "signal_only" %in% names(gating_w)) {
-        gating_w["signal_only"] <- g$w_kalman
+#' @export
+me_component_uncertainty <- function(error_states, horizon) {
+    # σ̂^(H) per component = sqrt(mean across H buckets)
+    if (is.null(error_states)) {
+        return(NULL)
     }
-    if (!is.null(g$w_tsmom) && "momentum" %in% names(gating_w)) {
-        gating_w["momentum"] <- g$w_tsmom
+    sapply(error_states, function(es) {
+        if (is.null(es) || is.null(es$sigma2)) {
+            return(0.01)
+        }
+        sqrt(mean(es$sigma2, na.rm = TRUE))
+    })
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.7 Reliability score ρ_rel and effective forecast
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_reliability_score <- function(X_i, liquidity_features = NULL,
+                                 node_stability = NULL) {
+    # ρ_rel = σ(θ_rel' z_rel)
+    # z_rel = [liquidity_z, node_stability, data_coverage]
+    # Simple deterministic version
+    z_sum <- 0
+    n_features <- 0
+
+    if (!is.null(liquidity_features)) {
+        liq <- liquidity_features$f_liquidity %||% 0
+        z_sum <- z_sum + liq
+        n_features <- n_features + 1
     }
-    gating_w <- gating_w / sum(gating_w)
+    if (!is.null(node_stability)) {
+        z_sum <- z_sum + node_stability
+        n_features <- n_features + 1
+    }
 
-    # 6. Combine
-    combined <- me_combine_forecasts(component_forecasts, gating_w, spec_forecast)
+    if (n_features == 0) {
+        return(0.8)
+    } # default
+    z_mean <- z_sum / n_features
+    rho <- 1 / (1 + exp(-z_mean)) # (0,1)
+    rho <- max(0.1, min(1.0, rho))
+    rho
+}
 
-    # 7. Confidence + uncertainty
-    confidence <- me_compute_confidence(component_forecasts, spec_forecast)
-    uncertainty <- me_compute_uncertainty(
-        combined, risk_artifact$sigma_t,
-        confidence, spec_forecast
+# ══════════════════════════════════════════════════════════════════════════════
+# §12 Full forecast engine orchestrator
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_run_forecast_engine <- function(feature_artifact, risk_artifact, graph_artifact,
+                                   signal_artifact, market_state_vec,
+                                   spec_forecast, spec_gating,
+                                   feature_history = NULL, R_history = NULL,
+                                   model_state = NULL) {
+    syms <- rownames(feature_artifact$X)
+    n_assets <- length(syms)
+    X_now <- as.matrix(feature_artifact$X)
+    feature_names <- colnames(X_now)
+
+    n_comp <- spec_forecast$n_components %||% 5L
+    horizon <- spec_forecast$label_horizon %||% 21L
+    ridge_lambda <- spec_forecast$ridge_lambda %||% 0.01
+    kappa_min <- spec_forecast$kappa_min %||% 0.5
+    kappa_max <- spec_forecast$kappa_max %||% 1.5
+    lambda_err <- spec_forecast$lambda_err %||% 0.97
+    refit_every <- spec_forecast$refit_every %||% 1L
+
+    # Extract previous model state
+    comp_models_prev <- if (!is.null(model_state)) model_state$component_model_fits else NULL
+    error_states_prev <- if (!is.null(model_state)) model_state$component_error_states else NULL
+    forecast_step <- if (!is.null(model_state)) (model_state$forecast_step %||% 0L) + 1L else 1L
+
+    # Flag: architecture vs fallback
+    use_arch_path <- !is.null(feature_history) && length(feature_history) >= horizon + 10 &&
+        !is.null(R_history) && nrow(R_history) >= horizon + 10
+
+    if (!use_arch_path) {
+        # ── FALLBACK: Legacy confidence-scaled forecast ──
+        # FALLBACK:forecast_legacy_path
+        s_mom <- signal_artifact$s_mom[syms]
+        s_kal <- signal_artifact$s_kal[syms]
+
+        mu_hat <- (s_mom + s_kal) / 2
+        mu_hat[!is.finite(mu_hat)] <- 0
+
+        conf_scale <- spec_forecast$confidence_eps %||% 0.01
+        unc <- rep(spec_forecast$uncertainty_scale %||% 1.0, n_assets)
+        names(unc) <- syms
+
+        mu_eff <- mu_hat * 0.8 # conservative reliability scaling
+        s_eff <- unc / sqrt(0.8)
+
+        return(list(
+            mu_hat = mu_hat,
+            mu_eff = mu_eff,
+            sigma_hat = unc,
+            s_eff = s_eff,
+            confidence = rep(0.6, n_assets),
+            pi_t = setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp))),
+            component_mu = NULL,
+            rho_rel = rep(0.8, n_assets),
+            diag = list(
+                method = "FALLBACK:forecast_legacy_path",
+                reason = if (is.null(feature_history) || length(feature_history) < horizon + 10) {
+                    "insufficient_feature_history"
+                } else {
+                    "insufficient_R_history"
+                },
+                n_history = length(feature_history),
+                forecast_step = forecast_step
+            ),
+            forecast_state_out = list(
+                forecast_step = forecast_step
+            )
+        ))
+    }
+
+    # ── ARCHITECTURE PATH: 5-component asset-date panel ──
+
+    # 1. Build training panel (causal)
+    panel <- me_build_training_panel(feature_history, R_history, horizon)
+
+    if (panel$n_obs < 20) {
+        # Not enough data yet → fallback
+        mu_hat <- rep(0, n_assets)
+        names(mu_hat) <- syms
+        return(list(
+            mu_hat = mu_hat,
+            mu_eff = mu_hat,
+            sigma_hat = rep(1, n_assets),
+            s_eff = rep(1, n_assets),
+            confidence = rep(0.5, n_assets),
+            pi_t = setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp))),
+            component_mu = NULL,
+            rho_rel = rep(0.5, n_assets),
+            diag = list(
+                method = "FALLBACK:insufficient_panel", n_obs = panel$n_obs,
+                forecast_step = forecast_step
+            ),
+            forecast_state_out = list(forecast_step = forecast_step)
+        ))
+    }
+
+    # 2. Train (or reuse) component models
+    should_refit <- is.null(comp_models_prev) || (forecast_step %% refit_every == 0)
+
+    comp_models <- if (should_refit) {
+        lapply(seq_len(n_comp), function(c) {
+            feat_cols <- .component_feature_selector(colnames(panel$X), c)
+            me_train_component_model(panel$X, panel$y, feat_cols, ridge_lambda)
+        })
+    } else {
+        comp_models_prev
+    }
+    names(comp_models) <- paste0("C", seq_len(n_comp))
+
+    # 3. Generate component forecasts μ^(c)_{i,t}
+    component_mu <- matrix(0, n_assets, n_comp,
+        dimnames = list(syms, paste0("C", seq_len(n_comp)))
     )
+    for (c in seq_len(n_comp)) {
+        component_mu[, c] <- me_predict_component(X_now, comp_models[[c]])
+    }
+
+    # 4. Global softmax mixture weights π_t (§12.4)
+    A_pi <- spec_gating$A_pi
+    b_pi <- spec_gating$b_pi
+    if (is.null(A_pi) || is.null(market_state_vec)) {
+        pi_t <- setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp)))
+    } else {
+        m_t <- market_state_vec
+        # Pad or trim m_t to match A_pi columns
+        if (length(m_t) < ncol(A_pi)) {
+            m_t <- c(m_t, rep(0, ncol(A_pi) - length(m_t)))
+        } else if (length(m_t) > ncol(A_pi)) {
+            m_t <- m_t[seq_len(ncol(A_pi))]
+        }
+        pi_t <- me_forecast_softmax_weights(m_t, A_pi, b_pi,
+            temperature = spec_gating$temperature %||% 1.0
+        )
+    }
+
+    # 5. Bounded κ_{i,c,t} and normalized q_{i,c,t} (§12.5)
+    kappa <- matrix(1, n_assets, n_comp, dimnames = list(syms, paste0("C", seq_len(n_comp))))
+    for (i in seq_len(n_assets)) {
+        kappa[i, ] <- me_bounded_kappa(X_now[i, ], kappa_min, kappa_max)
+    }
+
+    # q_{i,c} = π_c × κ_{i,c} / Σ_c(π_c × κ_{i,c})
+    q <- sweep(kappa, 2, pi_t, "*")
+    q_sums <- rowSums(q)
+    q_sums[q_sums <= 0] <- 1
+    q <- q / q_sums
+
+    # 6. Final μ̂^(H)
+    mu_hat <- rowSums(q * component_mu)
+    names(mu_hat) <- syms
+
+    # 7. Component uncertainty (§12.6)
+    comp_sigma <- me_component_uncertainty(error_states_prev, horizon)
+    if (is.null(comp_sigma) || length(comp_sigma) != n_comp) {
+        comp_sigma <- rep(0.01, n_comp)
+    }
+
+    # Asset-level forecast uncertainty: weighted by π
+    sigma_hat <- rep(0, n_assets)
+    for (i in seq_len(n_assets)) {
+        sigma_hat[i] <- sqrt(sum(q[i, ]^2 * comp_sigma^2))
+    }
+    sigma_hat[sigma_hat <= 0 | !is.finite(sigma_hat)] <- 0.01
+    names(sigma_hat) <- syms
+
+    # 8. Reliability ρ_rel (§12.7)
+    liq_feats <- feature_artifact$X[, grep("^f_liquidity$", names(feature_artifact$X)), drop = FALSE]
+    node_stab <- if (!is.null(graph_artifact$graph_state_out)) {
+        graph_artifact$graph_state_out$node_stability
+    } else {
+        NULL
+    }
+
+    rho_rel <- rep(0.8, n_assets)
+    names(rho_rel) <- syms
+    for (i in seq_len(n_assets)) {
+        ns <- if (!is.null(node_stab) && syms[i] %in% names(node_stab)) {
+            node_stab[syms[i]]
+        } else {
+            NULL
+        }
+        lf <- if (ncol(liq_feats) > 0) list(f_liquidity = liq_feats[i, 1]) else NULL
+        rho_rel[i] <- me_reliability_score(X_now[i, ], lf, ns)
+    }
+
+    # μ_eff = ρ × μ̂,  s_eff = σ̂ / √ρ
+    mu_eff <- rho_rel * mu_hat
+    s_eff <- sigma_hat / sqrt(pmax(rho_rel, 0.1))
+    names(mu_eff) <- syms
+    names(s_eff) <- syms
+
+    # 9. Confidence score (for legacy compat)
+    confidence <- rho_rel * (1 - sigma_hat / (abs(mu_hat) + sigma_hat + 1e-8))
+    confidence[!is.finite(confidence)] <- 0.5
+    confidence <- pmin(pmax(confidence, 0), 1)
+    names(confidence) <- syms
 
     list(
-        combined_forecast = combined,
-        component_forecasts = component_forecasts,
-        gating_weights = gating_w,
+        mu_hat = mu_hat,
+        mu_eff = mu_eff,
+        sigma_hat = sigma_hat,
+        s_eff = s_eff,
         confidence = confidence,
-        uncertainty = uncertainty,
-        models = models,
+        pi_t = pi_t,
+        component_mu = component_mu,
+        kappa = kappa,
+        q = q,
+        rho_rel = rho_rel,
         diag = list(
-            n_components = length(component_forecasts),
-            n_fitted = sum(vapply(models, function(m) isTRUE(m$fitted), logical(1))),
-            label_horizon = horizon,
-            n_train = n_train,
-            avg_confidence = confidence$avg_confidence,
-            gating_weights = gating_w
+            method = "architecture_5comp_panel",
+            n_training_obs = panel$n_obs,
+            n_features = panel$n_features,
+            component_fitted = sapply(comp_models, function(m) isTRUE(m$fitted)),
+            component_n_features = sapply(comp_models, function(m) m$n_features %||% 0),
+            pi_t = pi_t,
+            mean_kappa = colMeans(kappa),
+            mean_rho_rel = mean(rho_rel),
+            refit_this_step = should_refit,
+            forecast_step = forecast_step,
+            comp_sigma = comp_sigma
+        ),
+        # Recursive state outputs
+        forecast_state_out = list(
+            component_model_fits = comp_models,
+            component_error_states = error_states_prev, # will be updated when labels mature
+            forecast_step = forecast_step
         )
     )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Legacy forecast helpers (backward compat, explicitly flagged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_forecast_to_alpha <- function(mu, confidence, sigma, spec_forecast) {
+    # LEGACY COMPAT: convert forecast to alpha vector
+    # In architecture path, portfolio should use mu_eff directly
+    alpha_scale <- spec_forecast$alpha_scale %||% 1.0
+    alpha <- mu * confidence * alpha_scale
+    alpha[!is.finite(alpha)] <- 0
+    alpha
+}
+
+#' @export
+me_forecast_confidence <- function(X, y_hat, sigma_hat, spec_forecast) {
+    # LEGACY COMPAT: simple confidence from prediction uncertainty
+    eps <- spec_forecast$confidence_eps %||% 0.01
+    u_scale <- spec_forecast$uncertainty_scale %||% 1.0
+    conf <- 1 / (1 + u_scale * sigma_hat)
+    conf[!is.finite(conf)] <- eps
+    conf <- pmin(pmax(conf, eps), 1)
+    conf
 }

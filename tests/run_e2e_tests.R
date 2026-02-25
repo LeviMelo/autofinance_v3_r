@@ -131,7 +131,7 @@ risk_test <- me_run_risk_engine(R_test, spec$risk)
 spec_gl <- spec$risk
 spec_gl$resid$use_glasso <- TRUE
 spec_gl$resid$lambda <- 0.1
-risk_gl <- me_run_risk_engine(R_test, spec_gl)
+risk_gl <- me_run_risk_engine(R_test, spec_gl, model_state = NULL)
 
 graph <- me_run_graph_pipeline(risk_gl, spec$graph)
 cat(sprintf("  Edges: %d | Density: %.3f\n", graph$diag$n_edges, graph$diag$density))
@@ -159,34 +159,30 @@ cat("Test 3: Feature Engine\n")
 cat("══════════════════════════════════════════════════════\n")
 
 P_test <- adapter$price_matrix(as_of, 252, "close")
-sig <- me_run_signal_engine(P_test, R_test, risk_test$sigma_t,
-    spec$signals,
-    E_window = risk_test$E_t,
-    B_t = risk_test$B_t, F_window = risk_test$F_t
-)
-scalars <- me_scalarize_signals(sig)
+sig <- me_run_signal_engine(P_test, R_test, risk_test, spec$signals)
 cat(sprintf(
-    "  Signal scalars: s_mom(%d) s_kal(%d) s_fac(%s)\n",
-    length(scalars$s_mom), length(scalars$s_kal),
-    if (!is.null(scalars$s_fac)) length(scalars$s_fac) else "NULL"
+    "  Signals: s_mom(%d) s_kal(%d) s_fac(%d) s_scalar(%d)\n",
+    length(sig$s_mom), length(sig$s_kal),
+    length(sig$s_fac), length(sig$s_scalar)
 ))
 
-sg <- me_run_state_and_gating(
-    .slice_mat(R_test, 63), .slice_mat(R_test, 126), .slice_mat(R_test, 84),
-    risk_test, spec$market_state, spec$gating, 21L
-)
+# Market state + gating
+R_disp <- .slice_mat(R_test, 63)
+market_state_vec <- me_build_market_state_vector(R_disp, spec$market_state)
+gating <- me_softmax_gating(market_state_vec, spec$gating)
 
-feat <- me_run_feature_engine(
-    sig, risk_test, graph, sg,
-    adapter, as_of, names(risk_test$w_hrp)
+# Feature assembly
+feat <- me_assemble_features(
+    sig, risk_test, graph,
+    market_state_vec, P_test
 )
 cat(sprintf("  Feature matrix: %dx%d\n", nrow(feat$X), ncol(feat$X)))
 cat(sprintf(
     "  Groups: %s\n",
-    paste(names(feat$feature_groups), collapse = ", ")
+    paste(names(feat$groups), collapse = ", ")
 ))
-for (g in names(feat$feature_groups)) {
-    cat(sprintf("    %s: %s\n", g, paste(feat$feature_groups[[g]], collapse = ", ")))
+for (g in names(feat$groups)) {
+    cat(sprintf("    %s: %s\n", g, paste(feat$groups[[g]], collapse = ", ")))
 }
 stopifnot(nrow(feat$X) > 0)
 stopifnot(ncol(feat$X) > 0)

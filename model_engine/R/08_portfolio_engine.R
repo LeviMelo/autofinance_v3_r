@@ -311,10 +311,27 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
                                       state_gating_artifact, spec_portfolio,
                                       forecast_artifact = NULL,
                                       graph_artifact = NULL,
-                                      prev_target = NULL) {
+                                      prev_target = NULL,
+                                      optimizer_controls = NULL,
+                                      liquidity_features = NULL) {
     gating <- state_gating_artifact$gating
     gross_exposure <- gating$gross_exposure
     w_cash <- gating$w_cash
+
+    # Optimizer controls override spec defaults if provided (§12.8)
+    if (!is.null(optimizer_controls)) {
+        gamma_t <- optimizer_controls$gamma_t %||% (spec_portfolio$gamma %||% 1.0)
+        tau_t <- optimizer_controls$tau_t %||% (spec_portfolio$turnover_penalty %||% 0.0)
+        rho_gross <- optimizer_controls$rho_gross
+        if (!is.null(rho_gross) && is.finite(rho_gross)) {
+            gross_exposure <- rho_gross
+            w_cash <- 1 - rho_gross
+        }
+    } else {
+        gamma_t <- spec_portfolio$gamma %||% 1.0
+        tau_t <- spec_portfolio$turnover_penalty %||% 0.0
+    }
+
     max_weight <- spec_portfolio$caps$max_weight %||% 0.15
 
     Sigma <- risk_artifact$Sigma_risk_H %||% risk_artifact$Sigma_total %||% risk_artifact$Sigma_risk_1
@@ -342,7 +359,7 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         ))
     }
 
-    # Transitional baseline (legacy internals allowed; contracts no longer depend on HRP)
+    # Transitional baseline
     w_baseline <- risk_artifact$w_baseline %||% risk_artifact$w_hrp
     if (is.null(w_baseline) || length(w_baseline) == 0) {
         w_baseline <- setNames(rep(1 / n_risk, n_risk), risk_univ)
@@ -358,17 +375,54 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         w_baseline <- wb
     }
 
+    # §11.9 Liquidity-aware caps (if liquidity features available)
+    cap_vec <- setNames(rep(max_weight, n_risk), risk_univ)
+    if (!is.null(liquidity_features) && !is.null(liquidity_features$f_liquidity)) {
+        liq <- liquidity_features$f_liquidity[risk_univ]
+        liq[!is.finite(liq)] <- 0
+        # h_w(ℓ) = max_weight × (0.5 + 0.5 × σ(ℓ - median))
+        liq_med <- median(liq, na.rm = TRUE)
+        liq_scale <- 1 / (1 + exp(-(liq - liq_med)))
+        cap_vec <- max_weight * (0.5 + 0.5 * liq_scale)
+        cap_vec <- pmin(pmax(cap_vec, 0.02), max_weight)
+        names(cap_vec) <- risk_univ
+    }
+
     # ── Choose optimization path ──
     method <- "tilt"
 
-    if (!is.null(forecast_artifact) && length(forecast_artifact$combined_forecast) > 0) {
-        # Full QP path: use forecast as alpha
+    # ARCHITECTURE PATH: use mu_eff directly as alpha
+    use_arch_alpha <- !is.null(forecast_artifact) &&
+        !is.null(forecast_artifact$mu_eff) &&
+        length(forecast_artifact$mu_eff) > 0
+
+    if (use_arch_alpha) {
+        # §13: Portfolio consumes μ_eff directly (no me_forecast_to_alpha re-scaling)
+        alpha <- forecast_artifact$mu_eff
+        alpha_aligned <- setNames(rep(0, n_risk), risk_univ)
+        common_alpha <- intersect(names(alpha), risk_univ)
+        alpha_aligned[common_alpha] <- alpha[common_alpha]
+
+        # Use dynamic optimizer controls
+        spec_qp <- spec_portfolio
+        spec_qp$gamma <- gamma_t
+        spec_qp$turnover_penalty <- tau_t
+        spec_qp$caps$max_weight <- max_weight # Use base max; per-asset caps in post-shaping
+
+        opt <- me_qp_optimize(
+            Sigma, alpha_aligned, w_baseline, gross_exposure,
+            spec_qp, prev_target
+        )
+        w_target <- opt$w
+        method <- paste0("arch_", opt$method)
+    } else if (!is.null(forecast_artifact) && length(forecast_artifact$combined_forecast %||% NULL) > 0) {
+        # LEGACY PATH: use forecast_to_alpha
+        # FALLBACK:portfolio_legacy_alpha_path
         alpha <- me_forecast_to_alpha(
             forecast_artifact$combined_forecast,
             forecast_artifact$confidence,
             spec_portfolio
         )
-        # Align to risk universe
         alpha_aligned <- setNames(rep(0, n_risk), risk_univ)
         alpha_aligned[intersect(names(alpha), risk_univ)] <-
             alpha[intersect(names(alpha), risk_univ)]
@@ -380,7 +434,8 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         w_target <- opt$w
         method <- opt$method
     } else {
-        # Signal-based tilt path (fallback to simple)
+        # Signal-based tilt path (simplest fallback)
+        # FALLBACK:portfolio_tilt_only
         combined <- .combine_expert_scores(signal_artifact, gating, spec_portfolio)
         alpha_aligned <- setNames(rep(0, n_risk), risk_univ)
         alpha_aligned[intersect(names(combined), risk_univ)] <-
@@ -390,11 +445,12 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
             alpha_aligned, w_baseline, gross_exposure,
             max_weight, spec_portfolio
         )
-        method <- "tilt_signal"
+        method <- "FALLBACK:tilt_signal"
     }
 
-    # Post-shaping
-    w_target <- me_post_shape(w_target, risk_univ, max_weight,
+    # Post-shaping (with per-asset caps if available)
+    effective_cap <- max(cap_vec)
+    w_target <- me_post_shape(w_target, risk_univ, effective_cap,
         min_weight = 1e-6, gross_exposure
     )
 
@@ -405,7 +461,7 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         w_target <- me_apply_turnover_ceiling(w_target, w_prev, max_to)
     }
 
-    # Contract: portfolio weights must be a named vector aligned to risk universe
+    # Contract: portfolio weights must be a named vector
     if (is.null(names(w_target))) {
         stop("me_build_portfolio_target: w_target lost names (NULL).")
     }
@@ -419,7 +475,6 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         stop("me_build_portfolio_target: w_target contains empty symbol names.")
     }
 
-    # Build target dataframe
     tgt_df <- data.frame(
         symbol = names(w_target),
         weight_target = unname(w_target),
@@ -439,6 +494,9 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
             gross_exposure = actual_risky,
             method = method,
             max_weight_used = max_weight,
+            gamma_used = gamma_t,
+            tau_used = tau_t,
+            liquidity_caps_used = !is.null(liquidity_features),
             baseline_method = risk_artifact$baseline_method %||% "unknown"
         )
     )
@@ -449,8 +507,8 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
 .combine_expert_scores <- function(signal_artifact, gating, spec_portfolio) {
     w_kal <- gating$w_kalman
     w_tsm <- gating$w_tsmom
-    kalman <- signal_artifact$kalman
-    tsmom <- signal_artifact$tsmom
+    kalman <- signal_artifact$kalman %||% signal_artifact$s_kal
+    tsmom <- signal_artifact$tsmom %||% signal_artifact$s_mom
     syms <- unique(c(names(kalman), names(tsmom)))
     if (length(syms) == 0) {
         return(setNames(numeric(0), character(0)))
