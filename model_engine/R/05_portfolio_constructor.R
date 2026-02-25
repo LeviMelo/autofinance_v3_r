@@ -1,190 +1,219 @@
-#' @title Portfolio Constructor
+#' @title Model Engine — Portfolio Constructor
 #' @description Convert risk baseline + signals + gating into target weights.
+
+# ── Combine expert scores using gating weights ────────────────────────────────
 
 #' @export
 me_combine_expert_scores <- function(signal_artifact, gating_artifact, spec_portfolio) {
-    wk <- gating_artifact$w_kalman
-    wm <- gating_artifact$w_tsmom
+    w_kal <- gating_artifact$w_kalman
+    w_tsm <- gating_artifact$w_tsmom
 
-    w_tot <- wk + wm
-    if (w_tot == 0) {
-        v <- signal_artifact$kalman * 0
-        names(v) <- names(signal_artifact$kalman)
-        return(v)
+    kalman_scores <- signal_artifact$kalman
+    tsmom_scores <- signal_artifact$tsmom
+
+    # Union universe
+    syms <- unique(c(names(kalman_scores), names(tsmom_scores)))
+    if (length(syms) == 0) {
+        return(setNames(numeric(0), character(0)))
     }
 
-    wk <- wk / w_tot
-    wm <- wm / w_tot
+    # Align
+    k <- rep(0, length(syms))
+    names(k) <- syms
+    t <- rep(0, length(syms))
+    names(t) <- syms
+    k[names(kalman_scores)] <- kalman_scores
+    t[names(tsmom_scores)] <- tsmom_scores
 
-    S_t <- (wk * signal_artifact$kalman) + (wm * signal_artifact$tsmom)
-    S_t
+    # Weighted combination (excluding cash from active weight)
+    active_sum <- w_kal + w_tsm
+    if (active_sum <= 0) {
+        return(setNames(rep(0, length(syms)), syms))
+    }
+
+    combined <- (w_kal * k + w_tsm * t) / active_sum
+    combined[!is.finite(combined)] <- 0
+    combined
 }
 
+# ── Score to tilt ─────────────────────────────────────────────────────────────
+
 #' @export
-me_score_to_tilt <- function(S_t, spec_tilt) {
-    # Formal cross-sectional standardisation and bounded tilt mapping
-    max_tilt <- spec_tilt$max_tilt %||% 2.0
+me_score_to_tilt <- function(scores, max_tilt = 2.0) {
+    if (length(scores) == 0) {
+        return(numeric(0))
+    }
 
-    mu <- mean(S_t, na.rm = TRUE)
-    sigma <- sd(S_t, na.rm = TRUE)
+    # Cross-sectional z-score
+    s <- scores[is.finite(scores)]
+    if (length(s) < 2) {
+        tilt <- rep(1, length(scores))
+        names(tilt) <- names(scores)
+        return(tilt)
+    }
 
-    if (is.na(sigma) || sigma < 1e-8) {
-        z_t <- S_t * 0
+    mu <- mean(s)
+    sigma <- sd(s)
+    if (!is.finite(sigma) || sigma < 1e-8) sigma <- 1e-8
+
+    z <- (scores - mu) / sigma
+    z[!is.finite(z)] <- 0
+
+    # Bounded exponential tilt: exp(lambda * z) clamped to [1/max_tilt, max_tilt]
+    lambda <- log(max_tilt)
+    tilt <- exp(lambda * z)
+    tilt <- pmin(pmax(tilt, 1 / max_tilt), max_tilt)
+
+    names(tilt) <- names(scores)
+    tilt
+}
+
+# ── Apply tilts to HRP baseline ───────────────────────────────────────────────
+
+#' @export
+me_apply_tilts <- function(w_hrp, tilts, gross_exposure) {
+    syms <- names(w_hrp)
+    if (length(syms) == 0) {
+        return(setNames(numeric(0), character(0)))
+    }
+
+    # Align tilts to risk universe
+    t <- rep(1, length(syms))
+    names(t) <- syms
+    shared <- intersect(names(tilts), syms)
+    t[shared] <- tilts[shared]
+
+    # Apply tilt and renormalize to gross exposure
+    w_tilted <- w_hrp * t
+    w_tilted[w_tilted < 0] <- 0
+    w_sum <- sum(w_tilted)
+    if (w_sum > 0) {
+        w_tilted <- w_tilted * (gross_exposure / w_sum)
     } else {
-        z_t <- (S_t - mu) / sigma
+        w_tilted <- w_hrp * (gross_exposure / sum(w_hrp))
     }
 
-    # Bounded sigmoid mapping
-    lambda_tilt <- log(max_tilt)
-    mult <- exp(lambda_tilt * tanh(z_t))
-
-    list(mult = mult, z_t = z_t, mu = mu, sigma = sigma)
+    w_tilted
 }
 
+# ── Apply weight caps ─────────────────────────────────────────────────────────
+
 #' @export
-me_apply_tilt_to_baseline <- function(w_hrp, tilt_mult, spec_portfolio) {
-    # Align vectors
-    mult_align <- rep(1.0, length(w_hrp))
-    names(mult_align) <- names(w_hrp)
-    found <- intersect(names(tilt_mult), names(w_hrp))
-    mult_align[found] <- tilt_mult[found]
+me_apply_caps <- function(w, max_weight = 0.15, max_iter = 20) {
+    if (length(w) == 0) {
+        return(w)
+    }
+    target_sum <- sum(w)
+    if (target_sum <= 0) {
+        return(w)
+    }
 
-    w <- w_hrp * mult_align
+    for (iter in seq_len(max_iter)) {
+        over <- w > max_weight
+        if (!any(over)) break
 
-    fallback_to_hrp <- FALSE
-    fallback_reason <- "none"
+        overflow <- sum(w[over] - max_weight)
+        w[over] <- max_weight
 
-    if (sum(w, na.rm = TRUE) > 0) {
-        out <- w / sum(w, na.rm = TRUE)
+        # Redistribute overflow proportionally to non-capped
+        under <- !over & w > 0
+        if (!any(under)) break
+
+        w[under] <- w[under] + overflow * (w[under] / sum(w[under]))
+    }
+
+    # Final renormalize
+    w <- w * (target_sum / sum(w))
+    w
+}
+
+# ── Full portfolio construction orchestrator ──────────────────────────────────
+
+#' @export
+me_build_portfolio_target <- function(risk_artifact, signal_artifact,
+                                      state_gating_artifact, spec_portfolio,
+                                      prev_target = NULL) {
+    w_hrp <- risk_artifact$w_hrp
+    gating <- state_gating_artifact$gating
+    gross_exposure <- gating$gross_exposure
+    w_cash <- gating$w_cash
+    max_tilt <- spec_portfolio$tilt$max_tilt %||% 2.0
+    max_weight <- spec_portfolio$caps$max_weight %||% 0.15
+
+    # Risk universe
+    risk_univ <- names(w_hrp)
+    n_risk <- length(risk_univ)
+
+    tilt_fallback <- FALSE
+    tilt_reason <- "none"
+
+    if (n_risk == 0) {
+        tgt_df <- data.frame(
+            symbol = character(0), weight_target = numeric(0),
+            stringsAsFactors = FALSE
+        )
+        return(list(
+            target_weights = tgt_df,
+            cash_weight = 1.0,
+            diag = list(
+                n_risk = 0, tilt_fallback_to_hrp = TRUE,
+                tilt_fallback_reason = "empty_universe"
+            )
+        ))
+    }
+
+    # 1. Combine expert scores
+    combined <- me_combine_expert_scores(signal_artifact, gating, spec_portfolio)
+
+    # 2. Score to tilt
+    tilts <- me_score_to_tilt(combined, max_tilt)
+
+    # 3. Apply tilts
+    if (length(tilts) == 0 || all(tilts == 1)) {
+        w_target <- w_hrp * (gross_exposure / sum(w_hrp))
+        tilt_fallback <- TRUE
+        tilt_reason <- "no_valid_scores"
     } else {
-        out <- w_hrp
-        fallback_to_hrp <- TRUE
-        fallback_reason <- "degenerate_tilt_sum_nonpositive"
+        w_target <- me_apply_tilts(w_hrp, tilts, gross_exposure)
     }
 
-    attr(out, "fallback_to_hrp") <- fallback_to_hrp
-    attr(out, "fallback_reason") <- fallback_reason
-    out
-}
-
-#' @export
-me_apply_weight_caps <- function(w, spec_caps) {
-    cap <- spec_caps$max_weight %||% 0.15
-
+    # 4. Apply caps
     cap_infeasible <- FALSE
-    cap_reason <- "none"
-    n_iters <- 0L
-
-    if (cap >= 1.0) {
-        out <- w
-        attr(out, "cap_infeasible") <- FALSE
-        attr(out, "cap_reason") <- "cap_ge_1_noop"
-        attr(out, "cap_iters") <- 0L
-        return(out)
-    }
-
-    if (length(w) * cap < 1.0) {
-        # Cannot cap if mathematically impossible to sum to 1
-        out <- w
+    w_capped <- me_apply_caps(w_target, max_weight)
+    if (any(w_capped >= max_weight - 1e-6)) {
         cap_infeasible <- TRUE
-        cap_reason <- "cap_infeasible_given_universe_size"
-        attr(out, "cap_infeasible") <- cap_infeasible
-        attr(out, "cap_reason") <- cap_reason
-        attr(out, "cap_iters") <- 0L
-        return(out)
     }
 
-    # Iterative proportional redistribution
-    for (iter in 1:100) {
-        n_iters <- iter
-        if (all(w <= cap + 1e-6)) break
+    # Ensure non-negative
+    w_capped[w_capped < 0] <- 0
+    w_capped <- w_capped * (gross_exposure / max(sum(w_capped), 1e-12))
 
-        cap_idx <- w > cap
-        excess <- sum(w[cap_idx] - cap)
-        w[cap_idx] <- cap
-
-        uncapped_idx <- w < cap
-        if (sum(uncapped_idx) == 0) break
-
-        # Redistribute proportionally to uncapped weights
-        w_un <- w[uncapped_idx]
-        if (sum(w_un) > 0) {
-            w[uncapped_idx] <- w_un + excess * (w_un / sum(w_un))
-        } else {
-            w[uncapped_idx] <- w_un + excess / length(w_un)
-        }
-    }
-
-    out <- w / sum(w)
-    attr(out, "cap_infeasible") <- cap_infeasible
-    attr(out, "cap_reason") <- cap_reason
-    attr(out, "cap_iters") <- n_iters
-    out
-}
-
-#' @export
-me_build_portfolio_target <- function(risk_artifact, signal_artifact, state_gating_artifact, spec_portfolio, prev_target = NULL) {
-    g_t <- as.numeric(state_gating_artifact$gating$gross_exposure)
-    w_hrp <- risk_artifact$w_hrp # canonical risk universe defines tradable subset
-
-    # Extract scored elements strictly aligned with risk universe
-    aligned_signals <- list(
-        kalman = signal_artifact$kalman[names(w_hrp)],
-        tsmom = signal_artifact$tsmom[names(w_hrp)]
-    )
-    # Missing -> Neutral (0)
-    aligned_signals$kalman[is.na(aligned_signals$kalman)] <- 0
-    aligned_signals$tsmom[is.na(aligned_signals$tsmom)] <- 0
-
-    # Combine bounded signals into ensemble S_t
-    S_t <- me_combine_expert_scores(aligned_signals, state_gating_artifact$gating, spec_portfolio)
-
-    # Tilt computation: standardize S_t cross-sectionally and apply exponential tanh
-    tilt_res <- me_score_to_tilt(S_t, spec_portfolio$tilt)
-    tilt_mult <- tilt_res$mult
-
-    w_tilted <- me_apply_tilt_to_baseline(w_hrp, tilt_mult, spec_portfolio)
-    tilt_fallback_to_hrp <- isTRUE(attr(w_tilted, "fallback_to_hrp"))
-    tilt_fallback_reason <- attr(w_tilted, "fallback_reason") %||% "none"
-
-    w_capped <- me_apply_weight_caps(w_tilted, spec_portfolio$caps)
-    cap_infeasible <- isTRUE(attr(w_capped, "cap_infeasible"))
-    cap_reason <- attr(w_capped, "cap_reason") %||% "none"
-    cap_iters <- attr(w_capped, "cap_iters") %||% 0L
-
-    w_final_risky <- g_t * w_capped
-    w_cash <- as.numeric(1 - g_t)
-
-    w_final_risky[w_final_risky < 1e-4] <- 0
-
-    tgt_table <- data.frame(
-        symbol = names(w_final_risky),
-        weight_target = unname(w_final_risky),
+    # Build target dataframe
+    tgt_df <- data.frame(
+        symbol = names(w_capped),
+        weight_target = unname(w_capped),
         stringsAsFactors = FALSE
     )
+    # Remove zero-weight positions
+    tgt_df <- tgt_df[tgt_df$weight_target > 1e-8, , drop = FALSE]
+    rownames(tgt_df) <- NULL
 
-    tgt_table <- tgt_table[tgt_table$weight_target > 0, ]
+    # Recalculate cash
+    actual_risky <- sum(tgt_df$weight_target)
+    actual_cash <- 1 - actual_risky
 
     list(
-        target_weights = tgt_table,
-        cash_weight = w_cash,
+        target_weights = tgt_df,
+        cash_weight = actual_cash,
         diag = list(
-            score_mean = tilt_res$mu,
-            score_sd = tilt_res$sigma,
-            neutralized_scores = sum(S_t == 0),
-            pre_norm_range = if (length(S_t) > 0) range(S_t, na.rm = TRUE) else c(0, 0),
-            post_norm_range = if (length(tilt_res$z_t) > 0) range(tilt_res$z_t, na.rm = TRUE) else c(0, 0),
-            cap_hits = sum(w_capped >= (spec_portfolio$caps$max_weight %||% 1) - 1e-4),
-            pre_cap_sum = sum(w_tilted),
-            post_cap_sum = sum(w_capped),
-            gross_exposure = g_t,
-            tilt_fallback_to_hrp = tilt_fallback_to_hrp,
-            tilt_fallback_reason = tilt_fallback_reason,
-            cap_infeasible = cap_infeasible,
-            cap_reason = cap_reason,
-            cap_iters = cap_iters,
-            prev_target_supplied = !is.null(prev_target),
-            prev_target_used = FALSE
+            n_risk               = n_risk,
+            n_active             = nrow(tgt_df),
+            gross_exposure       = actual_risky,
+            tilt_fallback_to_hrp = tilt_fallback,
+            tilt_fallback_reason = tilt_reason,
+            cap_infeasible       = cap_infeasible,
+            max_weight_used      = max_weight,
+            max_tilt_used        = max_tilt
         )
     )
 }

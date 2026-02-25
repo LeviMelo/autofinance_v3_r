@@ -1,147 +1,176 @@
-#' @title State and Gating
-#' @description Compute market-state features and map them to expert trust and cash mass.
+#' @title Model Engine — State and Gating
+#' @description Market-state features and softmax gating for expert mixture.
+
+# ── Cross-sectional dispersion ────────────────────────────────────────────────
 
 #' @export
 me_state_dispersion <- function(r_t) {
     if (length(r_t) < 2) {
         return(0)
     }
-    sd(r_t, na.rm = TRUE)
+    r <- r_t[is.finite(r_t)]
+    if (length(r) < 2) {
+        return(0)
+    }
+    sd(r, na.rm = TRUE)
 }
 
-#' @export
-me_state_mode_dominance <- function(R_state_window) {
-    if (nrow(R_state_window) < 10) {
-        return(0.5)
-    }
-    keep <- colSums(is.na(R_state_window)) == 0
-    R_clean <- R_state_window[, keep, drop = FALSE]
-
-    if (ncol(R_clean) < 2) {
-        return(0.5)
-    }
-
-    pca <- tryCatch(prcomp(R_clean, center = TRUE, scale. = TRUE), error = function(e) NULL)
-    if (is.null(pca)) {
-        return(0.5)
-    }
-
-    vars <- pca$sdev^2
-    vars[1] / sum(vars)
-}
+# ── Market-mode dominance (eta) ───────────────────────────────────────────────
 
 #' @export
-me_state_vov <- function(R_hist, vol_lookback = 63L) {
-    # True VoV: median market vol series standard deviation
-    # R_hist must span (vov_lookback + vol_lookback - 1) days ideally
-
-    n_days <- nrow(R_hist)
-    if (n_days <= vol_lookback) {
+me_state_eta <- function(R_window) {
+    if (is.null(R_window) || nrow(R_window) < 5 || ncol(R_window) < 2) {
         return(0)
     }
 
-    # Rolling vol estimates per asset
-    v_tau <- numeric(n_days - vol_lookback + 1)
+    R_clean <- R_window
+    R_clean[!is.finite(R_clean)] <- 0
 
-    for (i in seq_along(v_tau)) {
-        # window for t
-        start_idx <- i
-        end_idx <- i + vol_lookback - 1
+    cor_mat <- tryCatch(cor(R_clean, use = "pairwise.complete.obs"),
+        error = function(e) NULL
+    )
+    if (is.null(cor_mat)) {
+        return(0)
+    }
+    cor_mat[!is.finite(cor_mat)] <- 0
+    diag(cor_mat) <- 1
 
-        R_sub <- R_hist[start_idx:end_idx, , drop = FALSE]
-        # Keep strictly valid columns inside this rolling slice
-        keep <- colSums(is.na(R_sub)) == 0
-        if (sum(keep) < 2) {
-            v_tau[i] <- 0
-            next
+    evals <- tryCatch(eigen(cor_mat, symmetric = TRUE, only.values = TRUE)$values,
+        error = function(e) NULL
+    )
+    if (is.null(evals) || length(evals) == 0) {
+        return(0)
+    }
+
+    p <- length(evals)
+    lambda_1 <- max(evals)
+    eta <- lambda_1 / p
+    if (!is.finite(eta)) 0 else eta
+}
+
+# ── Vol-of-vol proxy ─────────────────────────────────────────────────────────
+
+#' @export
+me_state_vov <- function(R_window, vol_lookback = 21L) {
+    if (is.null(R_window) || nrow(R_window) < (vol_lookback + 5) || ncol(R_window) < 2) {
+        return(0)
+    }
+
+    Tn <- nrow(R_window)
+    n_days <- Tn - vol_lookback + 1
+    if (n_days < 3) {
+        return(0)
+    }
+
+    # Rolling per-asset volatilities, then daily median
+    med_vols <- rep(NA_real_, n_days)
+    for (tau in seq_len(n_days)) {
+        idx <- tau:(tau + vol_lookback - 1)
+        block <- R_window[idx, , drop = FALSE]
+        asset_vols <- apply(block, 2, sd, na.rm = TRUE)
+        asset_vols <- asset_vols[is.finite(asset_vols) & asset_vols > 0]
+        if (length(asset_vols) > 0) {
+            med_vols[tau] <- median(asset_vols)
         }
-
-        R_clean <- R_sub[, keep, drop = FALSE]
-        # Volatility per asset in cross section
-        vols <- apply(R_clean, 2, sd, na.rm = TRUE) * sqrt(252)
-        # Market vol proxy on this day
-        v_tau[i] <- median(vols, na.rm = TRUE)
     }
 
-    # Return standard deviation of the median market vols over the state window
-    sd(v_tau, na.rm = TRUE)
+    med_vols <- med_vols[is.finite(med_vols) & med_vols > 0]
+    if (length(med_vols) < 3) {
+        return(0)
+    }
+
+    # VoV = sd of log-changes in median vol
+    log_vol <- log(med_vols)
+    d_log_vol <- diff(log_vol)
+    d_log_vol <- d_log_vol[is.finite(d_log_vol)]
+    if (length(d_log_vol) < 2) {
+        return(0)
+    }
+
+    vov <- sd(d_log_vol)
+    if (!is.finite(vov)) 0 else vov
 }
 
-#' @export
-me_build_market_state <- function(R_disp, R_eta, R_vov, spec_market_state, vol_lookback) {
-    r_t <- tail(R_disp, 1)[1, ]
-    res <- c(
-        disp = me_state_dispersion(r_t),
-        eta = me_state_mode_dominance(R_eta),
-        VoV = me_state_vov(R_vov, vol_lookback)
-    )
-    # Ensure exact dimensions
-    if (is.na(res["VoV"])) res["VoV"] <- 0
-    res
-}
+# ── Build market state vector ─────────────────────────────────────────────────
 
 #' @export
-me_gating_softmax_linear <- function(m_t, spec_gating) {
-    w0 <- spec_gating$w0 %||% c(kalman = 0, tsmom = 0, cash = -1)
-
-    if (is.null(spec_gating$W)) {
-        logits <- w0
+me_build_market_state <- function(R_disp, R_eta, R_vov,
+                                  spec_market_state, vol_lookback = 21L) {
+    # Cross-sectional dispersion from most recent day's returns
+    if (nrow(R_disp) > 0) {
+        r_today <- R_disp[nrow(R_disp), ]
+        disp <- me_state_dispersion(r_today)
     } else {
-        # Safe alignment using exact parameter mapping established in validation
-        logits <- w0 + as.vector(spec_gating$W %*% m_t[colnames(spec_gating$W)])
-        names(logits) <- names(w0)
+        disp <- 0
     }
 
-    exp_logits <- exp(logits - max(logits))
-    probs <- exp_logits / sum(exp_logits)
+    # Eta from correlation eigenvalues
+    eta <- me_state_eta(R_eta)
 
-    # Use [[ ]] or unname() so scalars are true scalars, not named remnants
-    w_kalman <- as.numeric(probs[["kalman"]])
-    w_tsmom <- as.numeric(probs[["tsmom"]])
-    w_cash <- as.numeric(probs[["cash"]])
-    gross_exposure <- as.numeric(1.0 - w_cash)
+    # Vol-of-vol
+    vov <- me_state_vov(R_vov, vol_lookback)
 
-    list(
-        w_kalman = w_kalman,
-        w_tsmom = w_tsmom,
-        w_cash = w_cash,
-        gross_exposure = gross_exposure,
-        logits = logits
-    )
+    m_t <- c(disp = disp, eta = eta, VoV = vov)
+    m_t
 }
 
+# ── Softmax gating ────────────────────────────────────────────────────────────
+
 #' @export
-me_run_state_and_gating <- function(R_disp, R_eta, R_vov, risk_artifact, spec_market_state, spec_gating, vol_lookback = 63L) {
-    # Heuristic diagnostics for default-path risk in state features
-    eta_keep_cols <- if (!is.null(R_eta) && nrow(R_eta) > 0 && ncol(R_eta) > 0) {
-        sum(colSums(is.na(R_eta)) == 0)
-    } else {
-        0L
-    }
-
-    vov_n_days <- if (!is.null(R_vov)) nrow(R_vov) else 0L
-    disp_n_assets <- if (!is.null(R_disp)) ncol(R_disp) else 0L
-
-    eta_likely_defaulted <- (is.null(R_eta) || nrow(R_eta) < 10 || eta_keep_cols < 2)
-    vov_likely_defaulted <- (is.null(R_vov) || vov_n_days <= vol_lookback)
-    disp_likely_degenerate <- (is.null(R_disp) || nrow(R_disp) < 1 || disp_n_assets < 2)
-
-    m_t <- me_build_market_state(R_disp, R_eta, R_vov, spec_market_state, vol_lookback)
-    gating <- me_gating_softmax_linear(m_t, spec_gating)
-
+me_softmax_gating <- function(m_t, spec_gating) {
     W <- spec_gating$W
-    gating_is_static <- is.null(W) || (is.matrix(W) && all(W == 0))
+    w0 <- spec_gating$w0
+    tau <- spec_gating$temperature %||% 1.0
+
+    if (is.null(W)) W <- matrix(0, 3, 3)
+    if (is.null(w0)) w0 <- c(0, 0, -1)
+
+    # Logits: W %*% m_t + w0
+    logits <- as.vector(W %*% m_t) + w0
+
+    # Softmax with temperature
+    logits_scaled <- logits / tau
+    logits_scaled <- logits_scaled - max(logits_scaled) # numerical stability
+    exp_logits <- exp(logits_scaled)
+    pi_t <- exp_logits / sum(exp_logits)
+
+    names(pi_t) <- c("kalman", "tsmom", "cash")
+    pi_t
+}
+
+# ── Full state and gating orchestrator ────────────────────────────────────────
+
+#' @export
+me_run_state_and_gating <- function(R_disp, R_eta, R_vov,
+                                    risk_artifact,
+                                    spec_market_state, spec_gating,
+                                    vol_lookback = 21L) {
+    m_t <- me_build_market_state(
+        R_disp, R_eta, R_vov,
+        spec_market_state, vol_lookback
+    )
+
+    pi_t <- me_softmax_gating(m_t, spec_gating)
+
+    w_kalman <- pi_t["kalman"]
+    w_tsmom <- pi_t["tsmom"]
+    w_cash <- pi_t["cash"]
+    gross_exposure <- 1 - w_cash
 
     list(
         market_state = m_t,
-        gating = gating,
+        gating = list(
+            w_kalman        = unname(w_kalman),
+            w_tsmom         = unname(w_tsmom),
+            w_cash          = unname(w_cash),
+            gross_exposure  = unname(gross_exposure),
+            softmax_weights = pi_t,
+            logits          = NULL # can store if debug needed
+        ),
         diag = list(
-            disp_likely_degenerate = disp_likely_degenerate,
-            eta_likely_defaulted = eta_likely_defaulted,
-            vov_likely_defaulted = vov_likely_defaulted,
-            gating_is_static = gating_is_static,
-            # Explicit placeholder status
-            risk_artifact_used = FALSE
+            dispersion = m_t["disp"],
+            eta        = m_t["eta"],
+            vov        = m_t["VoV"]
         )
     )
 }

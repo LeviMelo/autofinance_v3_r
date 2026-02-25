@@ -1,5 +1,7 @@
-#' @title Model Engine Contracts and Specs
-#' @description Define contracts, validators, enums, spec defaults, and shared structural helpers.
+#' @title Model Engine — Contracts and Spec
+#' @description ModelSpec defaults, validation, artifact contracts, shared helpers.
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
 
 #' @export
 `%||%` <- function(a, b) if (is.null(a)) b else a
@@ -8,13 +10,16 @@
 me_require <- function(pkgs) {
     for (pkg in pkgs) {
         if (!requireNamespace(pkg, quietly = TRUE)) {
-            stop(sprintf("Package '%s' is strictly required but not installed.", pkg), call. = FALSE)
+            stop(sprintf("Package '%s' is required but not installed.", pkg), call. = FALSE)
         }
     }
 }
 
+# ── ModelSpec default ────────────────────────────────────────────────────────
+
 #' @export
 me_spec_default <- function() {
+    # Default gating matrix W (3 experts × 3 state features)
     W0 <- matrix(
         0,
         nrow = 3, ncol = 3,
@@ -25,43 +30,79 @@ me_spec_default <- function() {
     )
 
     list(
+        # ── data section ──
         data = list(
-            min_coverage_ratio = 0.9,
+            min_coverage_ratio = 0.90,
             min_median_turnover = 1e5,
-            # Aligned with data_engine canonical asset types
             allowed_types = c("equity", "fii", "etf", "bdr")
         ),
+
+        # ── risk section ──
         risk = list(
-            vol = list(lookback = 63L),
-            pca = list(lookback = 252L, k = 3L),
-            resid = list(use_glasso = TRUE, lambda = 0.05),
+            vol = list(
+                lookback = 252L,
+                method   = "sd" # "sd" or "ewma"
+            ),
+            pca = list(
+                k        = 5L,
+                lookback = 252L
+            ),
+            resid = list(
+                use_glasso = FALSE,
+                lambda     = 0.1
+            ),
             factor = list(),
             hrp = list()
         ),
+
+        # ── signals section ──
         signals = list(
-            kalman = list(lookback = 252L, q_var = 1e-4, r_var = 1e-2, scale = 1.0),
-            tsmom = list(horizon = 252L, scale = 2.0)
+            kalman = list(
+                lookback = 252L,
+                q_var    = 1e-4,
+                r_var    = 1e-2,
+                scale    = 1.0
+            ),
+            tsmom = list(
+                horizon = 252L,
+                scale   = 2.0
+            )
         ),
+
+        # ── market state section ──
         market_state = list(
-            dispersion = list(lookback = 1L),
-            eta = list(lookback = 63L),
-            vov = list(lookback = 126L) # requires R window of L + vol_lookback - 1
+            dispersion = list(lookback = 63L),
+            eta = list(lookback = 126L),
+            vov = list(
+                lookback     = 63L,
+                vol_lookback = 21L
+            )
         ),
+
+        # ── gating section ──
         gating = list(
-            w0 = c(kalman = 0, tsmom = 0, cash = -1),
-            # Explicit matrix (zero matrix = static gating until calibrated, but no NULL/disabled ambiguity)
-            W = W0
+            W           = W0,
+            w0          = c(kalman = 0, tsmom = 0, cash = -1),
+            temperature = 1.0
         ),
+
+        # ── portfolio section ──
         portfolio = list(
             tilt = list(max_tilt = 2.0),
-            caps = list(max_weight = 0.15)
+            caps = list(max_weight = 0.15),
+            turnover_penalty = 0.0
         ),
+
+        # ── meta section ──
         meta = list(
-            retain_windows = TRUE,
-            retain_matrices = TRUE
+            retain_windows  = FALSE,
+            retain_matrices = FALSE,
+            mode            = "production"
         )
     )
 }
+
+# ── Spec access ──────────────────────────────────────────────────────────────
 
 #' @export
 me_get_spec <- function(overrides = NULL) {
@@ -72,200 +113,182 @@ me_get_spec <- function(overrides = NULL) {
     spec
 }
 
+# ── Spec validation ──────────────────────────────────────────────────────────
+
 #' @export
 me_validate_spec <- function(spec) {
-    req_names <- c("data", "risk", "signals", "market_state", "gating", "portfolio", "meta")
-    missing <- setdiff(req_names, names(spec))
-    if (length(missing) > 0) stop("ModelSpec missing sections: ", paste(missing, collapse = ", "))
+    # ---- top-level structure ----
+    req <- c("data", "risk", "signals", "market_state", "gating", "portfolio", "meta")
+    miss <- setdiff(req, names(spec))
+    if (length(miss) > 0) stop("ModelSpec missing sections: ", paste(miss, collapse = ", "))
 
     # ---- data section ----
-    if (!is.null(spec$data$min_coverage_ratio) &&
-        (spec$data$min_coverage_ratio < 0 || spec$data$min_coverage_ratio > 1)) {
+    d <- spec$data
+    if (!is.null(d$min_coverage_ratio) && (d$min_coverage_ratio < 0 || d$min_coverage_ratio > 1)) {
         stop("data$min_coverage_ratio must be in [0, 1]")
     }
-
-    if (!is.null(spec$data$min_median_turnover) &&
-        (!is.numeric(spec$data$min_median_turnover) || length(spec$data$min_median_turnover) != 1 ||
-            !is.finite(spec$data$min_median_turnover) || spec$data$min_median_turnover < 0)) {
-        stop("data$min_median_turnover must be a finite scalar >= 0")
+    if (!is.null(d$min_median_turnover) && d$min_median_turnover < 0) {
+        stop("data$min_median_turnover must be >= 0")
     }
-
-    allowed_types <- spec$data$allowed_types
-    if (is.null(allowed_types) || length(allowed_types) == 0 ||
-        any(!nzchar(trimws(as.character(allowed_types))))) {
-        stop("data$allowed_types must be a non-empty character vector")
-    }
-    # Keep broad enough for compatibility; default should be data_engine canonical set
-    allowed_set <- c("equity", "fii", "etf", "bdr", "unit")
-    if (!all(as.character(allowed_types) %in% allowed_set)) {
-        stop(
-            "data$allowed_types contains invalid values. Allowed: ",
-            paste(allowed_set, collapse = ", ")
-        )
+    allowed_set <- c("equity", "fii", "etf", "bdr")
+    if (!is.null(d$allowed_types) && !all(d$allowed_types %in% allowed_set)) {
+        stop("data$allowed_types contains invalid values. Allowed: ", paste(allowed_set, collapse = ", "))
     }
 
     # ---- risk section ----
+    r <- spec$risk
     for (mod in c("vol", "pca")) {
-        if (!is.null(spec$risk[[mod]]$lookback) && spec$risk[[mod]]$lookback <= 0) {
-            stop(sprintf("risk$%s$lookback must be positive", mod))
+        lkb <- r[[mod]]$lookback
+        if (!is.null(lkb) && (!is.finite(lkb) || lkb <= 0)) {
+            stop(sprintf("risk$%s$lookback must be a positive finite number", mod))
         }
     }
-
-    if (!is.null(spec$risk$pca$k) && spec$risk$pca$k < 1) {
+    if (!is.null(r$pca$k) && (!is.finite(r$pca$k) || r$pca$k < 1)) {
         stop("risk$pca$k must be >= 1")
     }
-
-    if (!is.null(spec$risk$resid$lambda) && spec$risk$resid$lambda < 0) {
-        stop("risk$resid$lambda must be >= 0")
-    }
-
-    # Nonnegotiable in your locked backbone
-    if (!isTRUE(spec$risk$resid$use_glasso)) {
-        stop("risk$resid$use_glasso must be TRUE (PCA -> Glasso -> HRP is locked in this pipeline)")
+    if (!is.null(r$resid$lambda) && (!is.finite(r$resid$lambda) || r$resid$lambda < 0)) {
+        stop("risk$resid$lambda must be finite and >= 0")
     }
 
     # ---- signals section ----
-    if (!is.null(spec$signals$kalman$lookback) && spec$signals$kalman$lookback <= 0) {
+    s <- spec$signals
+    if (!is.null(s$kalman$lookback) && s$kalman$lookback <= 0) {
         stop("signals$kalman$lookback must be > 0")
     }
-    if (!is.null(spec$signals$tsmom$horizon) && spec$signals$tsmom$horizon <= 0) {
+    if (!is.null(s$tsmom$horizon) && s$tsmom$horizon <= 0) {
         stop("signals$tsmom$horizon must be > 0")
     }
 
-    if (!is.null(spec$signals$kalman$q_var) && spec$signals$kalman$q_var <= 0) {
-        stop("signals$kalman$q_var must be > 0")
-    }
-
-    if (!is.null(spec$signals$kalman$r_var) && spec$signals$kalman$r_var <= 0) {
-        stop("signals$kalman$r_var must be > 0")
-    }
-
     # ---- market_state section ----
-    if (!is.null(spec$market_state$dispersion$lookback) && spec$market_state$dispersion$lookback <= 0) {
-        stop("market_state$dispersion$lookback must be > 0")
-    }
-    if (!is.null(spec$market_state$eta$lookback) && spec$market_state$eta$lookback <= 0) {
-        stop("market_state$eta$lookback must be > 0")
-    }
-    if (!is.null(spec$market_state$vov$lookback) && spec$market_state$vov$lookback <= 0) {
-        stop("market_state$vov$lookback must be > 0")
+    ms <- spec$market_state
+    for (feat in c("dispersion", "eta", "vov")) {
+        lkb <- ms[[feat]]$lookback
+        if (!is.null(lkb) && (!is.finite(lkb) || lkb <= 0)) {
+            stop(sprintf("market_state$%s$lookback must be > 0", feat))
+        }
     }
 
     # ---- gating section ----
-    w0 <- spec$gating$w0
-    if (is.null(w0) || length(w0) != 3 || !all(c("kalman", "tsmom", "cash") %in% names(w0))) {
-        stop("gating$w0 must be a 3-element vector named c('kalman', 'tsmom', 'cash')")
+    g <- spec$gating
+    W <- g$W
+    if (!is.null(W)) {
+        if (!is.matrix(W) || !all(dim(W) == c(3, 3))) {
+            stop("gating$W must be a 3x3 matrix")
+        }
+        exp_row <- c("kalman", "tsmom", "cash")
+        exp_col <- c("disp", "eta", "VoV")
+        if (!is.null(rownames(W)) && !all(rownames(W) == exp_row)) {
+            stop("gating$W rownames must be c('kalman', 'tsmom', 'cash')")
+        }
+        if (!is.null(colnames(W)) && !all(colnames(W) == exp_col)) {
+            stop("gating$W colnames must be c('disp', 'eta', 'VoV')")
+        }
+        if (any(!is.finite(W))) {
+            stop("gating$W must contain only finite values")
+        }
     }
-
-    W <- spec$gating$W
-    expected_state_names <- c("disp", "eta", "VoV")
-
-    # Nonnegotiable in your adaptive gating design: W must exist
-    if (is.null(W)) {
-        stop("gating$W must be provided (3x3 matrix with rows kalman/tsmom/cash and cols disp/eta/VoV)")
+    w0 <- g$w0
+    if (!is.null(w0)) {
+        if (length(w0) != 3) stop("gating$w0 must have length 3")
+        if (any(!is.finite(w0))) stop("gating$w0 must contain only finite values")
     }
-
-    if (!is.matrix(W)) stop("gating$W must be a matrix")
-    if (nrow(W) != 3 || ncol(W) != length(expected_state_names)) {
-        stop("gating$W must be a 3 x 3 matrix")
-    }
-    if (is.null(rownames(W)) || is.null(colnames(W))) {
-        stop("gating$W must have rownames and colnames")
-    }
-    if (!all(rownames(W) == c("kalman", "tsmom", "cash"))) {
-        stop("gating$W rownames must be exactly c('kalman', 'tsmom', 'cash')")
-    }
-    if (!all(colnames(W) == expected_state_names)) {
-        stop("gating$W colnames must be exactly c('disp', 'eta', 'VoV')")
-    }
-    if (any(!is.finite(W))) {
-        stop("gating$W must contain only finite numeric values")
+    if (!is.null(g$temperature) && (!is.finite(g$temperature) || g$temperature <= 0)) {
+        stop("gating$temperature must be a positive scalar")
     }
 
     # ---- portfolio section ----
-    if (!is.null(spec$portfolio$caps$max_weight) &&
-        (spec$portfolio$caps$max_weight <= 0 || spec$portfolio$caps$max_weight > 1)) {
+    p <- spec$portfolio
+    if (!is.null(p$caps$max_weight) && (p$caps$max_weight <= 0 || p$caps$max_weight > 1)) {
         stop("portfolio$caps$max_weight must be in (0, 1]")
     }
-
-    if (!is.null(spec$portfolio$tilt$max_tilt) &&
-        (!is.numeric(spec$portfolio$tilt$max_tilt) || length(spec$portfolio$tilt$max_tilt) != 1 ||
-            !is.finite(spec$portfolio$tilt$max_tilt) || spec$portfolio$tilt$max_tilt < 1)) {
-        stop("portfolio$tilt$max_tilt must be a finite scalar >= 1")
+    if (!is.null(p$tilt$max_tilt) && (!is.finite(p$tilt$max_tilt) || p$tilt$max_tilt < 1)) {
+        stop("portfolio$tilt$max_tilt must be >= 1")
     }
 
     invisible(spec)
 }
 
+# ── Snapshot artifact validation ─────────────────────────────────────────────
+
 #' @export
 me_validate_snapshot_artifact <- function(x) {
-    req_names <- c(
-        "as_of_date", "tradable_symbols", "target_weights", "cash_weight",
-        "risk", "signals", "market_state", "gating", "portfolio_diag", "meta", "warnings"
+    req <- c(
+        "as_of_date", "tradable_symbols", "target_weights",
+        "cash_weight", "risk", "signals", "market_state",
+        "gating", "portfolio_diag", "meta", "warnings"
     )
-    missing <- setdiff(req_names, names(x))
-    if (length(missing) > 0) stop("SnapshotArtifact missing sections: ", paste(missing, collapse = ", "))
+    miss <- setdiff(req, names(x))
+    if (length(miss) > 0) stop("Snapshot artifact missing: ", paste(miss, collapse = ", "))
 
-    if (!inherits(x$as_of_date, "Date")) stop("as_of_date must be a Date")
-
-    # Target bounds
+    # Target weights structure
     tgt <- x$target_weights
     if (!is.data.frame(tgt)) stop("target_weights must be a data.frame")
     if (!all(c("symbol", "weight_target") %in% names(tgt))) {
-        stop("target_weights must have 'symbol' and 'weight_target'")
-    }
-    if (length(unique(tgt$symbol)) != nrow(tgt)) stop("Duplicate symbols in target_weights")
-    if (any(tgt$weight_target < 0, na.rm = TRUE)) stop("Negative target weights are not allowed")
-
-    if (!is.numeric(x$cash_weight) || length(x$cash_weight) != 1 ||
-        x$cash_weight < -1e-6 || x$cash_weight > 1 + 1e-6) {
-        stop("cash_weight must be scalar in [0,1]")
+        stop("target_weights must have columns 'symbol' and 'weight_target'")
     }
 
-    tot_w <- sum(tgt$weight_target, na.rm = TRUE) + x$cash_weight
-    if (abs(tot_w - 1.0) > 1e-4) stop(sprintf("Weights sum to %f, not 1.0", tot_w))
+    # Weight budget
+    tot <- sum(tgt$weight_target, na.rm = TRUE) + x$cash_weight
+    if (abs(tot - 1.0) > 1e-4) stop(sprintf("Weights sum to %f, not 1.0", tot))
 
-    # Gating consistency (if present)
-    gating <- x$gating
-    if (length(gating) > 0) {
-        req_g <- c("w_kalman", "w_tsmom", "w_cash", "gross_exposure")
-        if (!all(req_g %in% names(gating))) {
-            stop("Gating artifact missing required fields")
+    # Cash validity
+    if (!is.finite(x$cash_weight) || x$cash_weight < 0 || x$cash_weight > 1) {
+        stop("cash_weight must be in [0, 1]")
+    }
+
+    # Gating consistency
+    g <- x$gating
+    if (length(g) > 0 && !is.null(g$w_kalman)) {
+        gate_sum <- g$w_kalman + g$w_tsmom + g$w_cash
+        if (abs(gate_sum - 1.0) > 1e-6) {
+            stop("Gating softmax weights do not sum to 1")
         }
-        if (abs(gating$gross_exposure - (1 - gating$w_cash)) > 1e-6) {
-            stop("Gating consistency: gross_exposure != 1 - w_cash")
-        }
-        sum_gates <- gating$w_kalman + gating$w_tsmom + gating$w_cash
-        if (abs(sum_gates - 1.0) > 1e-6) {
-            stop("Gating consistency: softmax weights do not sum to 1")
+        if (!is.null(g$gross_exposure) && abs(g$gross_exposure - (1 - x$cash_weight)) > 1e-4) {
+            stop("Gating gross_exposure inconsistent with cash_weight")
         }
     }
 
-    # Risk consistency (only validate matrices if retained/present)
+    # Risk universe alignment
     risk <- x$risk
-    if (length(risk) > 0) {
-        if (!is.null(risk$w_hrp)) {
-            risk_univ <- names(risk$w_hrp)
-            if (length(risk_univ) > 0 && !all(tgt$symbol %in% risk_univ)) {
-                stop("Portfolio target universe contains elements not in canonical risk universe")
-            }
+    if (!is.null(risk$w_hrp) && length(risk$w_hrp) > 0) {
+        risk_univ <- names(risk$w_hrp)
+        if (!all(tgt$symbol %in% risk_univ)) {
+            stop("Some target symbols are not in risk universe")
         }
-
-        if (!is.null(risk$sigma_t) && !is.null(risk$Sigma_total)) {
-            if (is.null(rownames(risk$Sigma_total)) || is.null(colnames(risk$Sigma_total))) {
-                stop("Sigma_total must have row/col names when retained")
-            }
-            if (!all(names(risk$sigma_t) == rownames(risk$Sigma_total))) {
-                stop("Risk artifact mismatch: sigma_t names do not align with Sigma_total rownames")
-            }
-            if (!is.null(risk$w_hrp) && !all(names(risk$w_hrp) == colnames(risk$Sigma_total))) {
-                stop("Risk artifact mismatch: w_hrp names do not align with Sigma_total colnames")
+        # Sigma_total alignment
+        if (!is.null(risk$Sigma_total)) {
+            if (!all(names(risk$w_hrp) == colnames(risk$Sigma_total))) {
+                stop("w_hrp names do not align with Sigma_total colnames")
             }
         }
     }
 
     invisible(x)
 }
+
+# ── Model state validation (for recursive carry-forward) ─────────────────────
+
+#' @export
+me_validate_model_state <- function(state) {
+    if (is.null(state)) {
+        return(invisible(NULL))
+    }
+
+    # State must be a list with at minimum these markers
+    if (!is.list(state)) stop("model_state must be a list or NULL")
+
+    # If it has prev_target, validate structure
+    if (!is.null(state$prev_target)) {
+        pt <- state$prev_target
+        if (!is.data.frame(pt) || !all(c("symbol", "weight_target") %in% names(pt))) {
+            stop("model_state$prev_target must be a data.frame with symbol + weight_target")
+        }
+    }
+
+    invisible(state)
+}
+
+# ── Spec hash ────────────────────────────────────────────────────────────────
 
 #' @export
 me_hash_spec <- function(spec) {

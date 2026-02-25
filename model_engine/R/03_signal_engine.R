@@ -1,18 +1,14 @@
-#' @title Signal Engine
-#' @description Implement trend experts and score normalization in one place.
+#' @title Model Engine — Signal Engine
+#' @description Trend expert signals: Kalman filter, TSMOM (raw + residual).
 
-.tanh_scale <- function(x, scale = 1.0) {
-  tanh(x / scale)
-}
+# ── Internal helpers ──────────────────────────────────────────────────────────
+
+.tanh_scale <- function(x, scale = 1.0) tanh(x / scale)
+
+# ── Kalman filter signal ──────────────────────────────────────────────────────
 
 #' @export
 me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
-  # 2-state local linear trend Kalman filter on log-prices
-  # State x_t = [level_t, slope_t]'
-  # level_t = level_{t-1} + slope_{t-1} + w1_t
-  # slope_t = slope_{t-1} + w2_t
-  # y_t = level_t + v_t
-
   n_assets <- ncol(prices_window)
   Tn <- nrow(prices_window)
 
@@ -27,22 +23,14 @@ me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
   r_var <- spec_kalman$r_var %||% 1e-2
   out_scale <- spec_kalman$scale %||% 1.0
 
-  # Correct local linear trend transition / observation matrices
-  F_mat <- matrix(c(
-    1, 1,
-    0, 1
-  ), nrow = 2, byrow = TRUE)
+  # 2-state local linear trend: [level, slope]
+  F_mat <- matrix(c(1, 0, 1, 1), nrow = 2, byrow = FALSE)
   H_mat <- matrix(c(1, 0), nrow = 1)
-
   Q <- diag(c(q_var, q_var))
-  R_obs <- r_var
-
   I2 <- diag(2)
 
   for (j in seq_len(n_assets)) {
     y_raw <- prices_window[, j]
-
-    # Require finite positive prices before log
     valid <- is.finite(y_raw) & !is.na(y_raw) & (y_raw > 0)
     if (sum(valid) < 10) next
 
@@ -60,23 +48,20 @@ me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
       # Update
       y_hat <- (H_mat %*% x_pred)[1, 1]
       err <- y[i] - y_hat
-      S <- (H_mat %*% P_pred %*% t(H_mat))[1, 1] + R_obs
-
+      S <- (H_mat %*% P_pred %*% t(H_mat))[1, 1] + r_var
       if (!is.finite(S) || S <= 0) next
 
       K <- P_pred %*% t(H_mat) / S
       x_hat <- x_pred + K * err
 
-      # Joseph-form covariance update (more numerically stable)
+      # Joseph-form covariance update
       KH <- K %*% H_mat
-      P <- (I2 - KH) %*% P_pred %*% t(I2 - KH) + K %*% matrix(R_obs, 1, 1) %*% t(K)
+      P <- (I2 - KH) %*% P_pred %*% t(I2 - KH) + K %*% matrix(r_var, 1, 1) %*% t(K)
     }
 
-    # Final latent slope is a daily log-return-like increment
     slope_daily <- x_hat[2, 1]
     if (!is.finite(slope_daily)) next
 
-    # Convert to annualized slope to match annualized sigma_t
     slope_ann <- slope_daily * 252
 
     sym_j <- colnames(prices_window)[j]
@@ -92,21 +77,23 @@ me_signal_kalman <- function(prices_window, sigma_t, spec_kalman) {
   .tanh_scale(scores, out_scale)
 }
 
+# ── TSMOM signal (raw returns) ────────────────────────────────────────────────
+
 #' @export
 me_signal_tsmom <- function(R_window, sigma_t, spec_tsmom) {
-  # Defensive checks
   if (is.null(dim(R_window)) || ncol(R_window) == 0) {
     return(setNames(numeric(0), character(0)))
   }
   if (is.null(colnames(R_window))) {
-    stop("me_signal_tsmom: R_window must have colnames for symbol alignment.")
+    stop("me_signal_tsmom: R_window must have colnames")
   }
   if (is.null(names(sigma_t))) {
-    stop("me_signal_tsmom: sigma_t must be a named numeric vector.")
+    stop("me_signal_tsmom: sigma_t must be named")
   }
 
   h <- spec_tsmom$horizon %||% 252L
   h <- min(h, nrow(R_window))
+  out_scale <- spec_tsmom$scale %||% 2.0
 
   if (h < 5) {
     v <- rep(0, ncol(R_window))
@@ -114,48 +101,46 @@ me_signal_tsmom <- function(R_window, sigma_t, spec_tsmom) {
     return(v)
   }
 
-  # ---- CRITICAL FIX: align sigma_t to returns columns by symbol ----
+  # Align sigma to returns columns
   syms <- colnames(R_window)
   sigma_aligned <- sigma_t[syms]
 
-  # Replace missing / invalid vols with robust fallback (median positive vol)
   good_sigma <- sigma_t[is.finite(sigma_t) & !is.na(sigma_t) & sigma_t > 0]
-  sigma_fallback <- stats::median(good_sigma, na.rm = TRUE)
-  if (!is.finite(sigma_fallback) || sigma_fallback <= 0) sigma_fallback <- 0.2
+  sigma_fb <- stats::median(good_sigma, na.rm = TRUE)
+  if (!is.finite(sigma_fb) || sigma_fb <= 0) sigma_fb <- 0.2
 
-  bad_sigma <- !is.finite(sigma_aligned) | is.na(sigma_aligned) | sigma_aligned <= 0
-  if (any(bad_sigma)) {
-    sigma_aligned[bad_sigma] <- sigma_fallback
-    warning(sprintf(
-      "TSMOM sigma alignment: replaced %d invalid/missing sigma values with fallback %.6f.",
-      sum(bad_sigma), sigma_fallback
-    ), call. = FALSE)
-  }
+  bad <- !is.finite(sigma_aligned) | is.na(sigma_aligned) | sigma_aligned <= 0
+  if (any(bad)) sigma_aligned[bad] <- sigma_fb
 
-  # Use colSums to preserve exact 1:1 vector length with columns
   ret_cum <- colSums(tail(R_window, h), na.rm = TRUE)
-
   denom <- sigma_aligned * sqrt(h / 252)
-  bad_denom <- !is.finite(denom) | is.na(denom) | denom <= 0
-  if (any(bad_denom)) {
-    denom[bad_denom] <- sigma_fallback * sqrt(h / 252)
-    warning(sprintf(
-      "TSMOM denominator: replaced %d invalid denominators.",
-      sum(bad_denom)
-    ), call. = FALSE)
-  }
 
-  # Now lengths and names are guaranteed aligned (no vector recycling)
-  scores_raw <- ret_cum / denom
-  scores_raw[!is.finite(scores_raw) | is.na(scores_raw)] <- 0
+  bad_d <- !is.finite(denom) | denom <= 0
+  if (any(bad_d)) denom[bad_d] <- sigma_fb * sqrt(h / 252)
 
-  .tanh_scale(scores_raw, spec_tsmom$scale %||% 2.0)
+  scores <- ret_cum / denom
+  scores[!is.finite(scores)] <- 0
+
+  .tanh_scale(scores, out_scale)
 }
+
+# ── Residual TSMOM signal ─────────────────────────────────────────────────────
+
+#' @export
+me_signal_residual_tsmom <- function(E_window, sigma_t, spec_tsmom) {
+  # Same logic as raw TSMOM but applied to PCA residuals
+  me_signal_tsmom(E_window, sigma_t, spec_tsmom)
+}
+
+# ── Signal alignment ──────────────────────────────────────────────────────────
 
 #' @export
 me_align_signal_vectors <- function(...) {
   lst <- list(...)
   syms <- unique(unlist(lapply(lst, names)))
+  if (length(syms) == 0) {
+    return(list())
+  }
 
   aligned <- lapply(lst, function(v) {
     res <- rep(0, length(syms))
@@ -167,60 +152,73 @@ me_align_signal_vectors <- function(...) {
   aligned
 }
 
+# ── Full signal engine orchestrator ───────────────────────────────────────────
+
 #' @export
-me_run_signal_engine <- function(prices_window, R_window, sigma_t, spec_signals) {
-  # Defensive checks
+me_run_signal_engine <- function(prices_window, R_window, sigma_t,
+                                 spec_signals, E_window = NULL) {
   if (is.null(dim(prices_window)) || is.null(dim(R_window))) {
-    stop("me_run_signal_engine: prices_window and R_window must be matrices.")
+    stop("prices_window and R_window must be matrices")
   }
   if (is.null(colnames(prices_window)) || is.null(colnames(R_window))) {
-    stop("me_run_signal_engine: input matrices must have colnames.")
+    stop("Input matrices must have colnames")
   }
   if (is.null(names(sigma_t))) {
-    stop("me_run_signal_engine: sigma_t must be a named numeric vector.")
+    stop("sigma_t must be named")
   }
 
-  # ---- CRITICAL FIX: canonical signal universe alignment ----
-  common_syms <- Reduce(intersect, list(colnames(prices_window), colnames(R_window), names(sigma_t)))
-  common_syms <- unique(common_syms)
+  # Canonical signal universe = intersection
+  common <- Reduce(intersect, list(
+    colnames(prices_window),
+    colnames(R_window),
+    names(sigma_t)
+  ))
+  if (length(common) == 0) stop("Signal engine: zero common symbols")
 
-  if (length(common_syms) == 0) {
-    stop("Signal engine has zero common symbols across prices_window, R_window, and sigma_t.")
-  }
-
-  n_price_only <- length(setdiff(colnames(prices_window), common_syms))
-  n_ret_only <- length(setdiff(colnames(R_window), common_syms))
-  n_sigma_only <- length(setdiff(names(sigma_t), common_syms))
-
-  if (n_price_only > 0 || n_ret_only > 0 || n_sigma_only > 0) {
-    warning(sprintf(
-      paste0(
-        "Signal universe alignment dropped symbols: ",
-        "prices_only=%d, returns_only=%d, sigma_only=%d; using common=%d."
-      ),
-      n_price_only, n_ret_only, n_sigma_only, length(common_syms)
-    ), call. = FALSE)
-  }
-
-  P_use <- prices_window[, common_syms, drop = FALSE]
-  R_use <- R_window[, common_syms, drop = FALSE]
-  sigma_use <- sigma_t[common_syms]
+  P_use <- prices_window[, common, drop = FALSE]
+  R_use <- R_window[, common, drop = FALSE]
+  sigma_use <- sigma_t[common]
 
   kalman_scores <- me_signal_kalman(P_use, sigma_use, spec_signals$kalman)
   tsmom_scores <- me_signal_tsmom(R_use, sigma_use, spec_signals$tsmom)
 
-  aligned <- me_align_signal_vectors(kalman = kalman_scores, tsmom = tsmom_scores)
+  # Residual TSMOM if residuals provided
+  res_tsmom_scores <- NULL
+  if (!is.null(E_window) && ncol(E_window) > 0) {
+    e_common <- intersect(common, colnames(E_window))
+    if (length(e_common) > 0) {
+      res_tsmom_scores <- me_signal_residual_tsmom(
+        E_window[, e_common, drop = FALSE],
+        sigma_use[e_common],
+        spec_signals$tsmom
+      )
+    }
+  }
 
-  list(
+  # Align all signals to union universe
+  sig_list <- list(kalman = kalman_scores, tsmom = tsmom_scores)
+  if (!is.null(res_tsmom_scores)) sig_list$res_tsmom <- res_tsmom_scores
+  aligned <- do.call(me_align_signal_vectors, sig_list)
+
+  result <- list(
     kalman = aligned$kalman,
     tsmom = aligned$tsmom,
     diag = list(
-      kalman_coverage = sum(aligned$kalman != 0),
-      tsmom_coverage = sum(aligned$tsmom != 0),
-      n_common_assets = length(common_syms),
-      n_price_assets = ncol(prices_window),
-      n_return_assets = ncol(R_window),
-      n_sigma_assets = length(sigma_t)
+      kalman_coverage   = sum(aligned$kalman != 0),
+      tsmom_coverage    = sum(aligned$tsmom != 0),
+      n_common          = length(common),
+      n_price_assets    = ncol(prices_window),
+      n_return_assets   = ncol(R_window),
+      n_sigma_assets    = length(sigma_t),
+      kalman_all_zero   = all(aligned$kalman == 0),
+      tsmom_all_zero    = all(aligned$tsmom == 0)
     )
   )
+
+  if (!is.null(res_tsmom_scores)) {
+    result$res_tsmom <- aligned$res_tsmom
+    result$diag$res_tsmom_coverage <- sum(aligned$res_tsmom != 0)
+  }
+
+  result
 }

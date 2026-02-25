@@ -1,97 +1,135 @@
-#' @title Model Data Adapter
-#' @description Wrap data bundle/panel securely into no-lookahead structures.
+#' @title Model Engine — Data Adapter
+#' @description No-lookahead data access layer wrapping panel_adj_model.
 
 #' @export
 me_make_data_adapter <- function(data_bundle_or_panel, aux = list()) {
     me_require("data.table")
 
-    # Extract true panel
+    # ── Extract panel ──
     if (is.list(data_bundle_or_panel) && "panel_adj_model" %in% names(data_bundle_or_panel)) {
         dt <- data.table::as.data.table(data_bundle_or_panel$panel_adj_model)
     } else if (is.data.frame(data_bundle_or_panel)) {
         dt <- data.table::as.data.table(data_bundle_or_panel)
     } else {
-        stop("data_bundle_or_panel must be a data.frame or a bundle list containing 'panel_adj_model'")
+        stop("Input must be a data.frame or a bundle list containing 'panel_adj_model'")
     }
 
-    req_cols <- c("symbol", "refdate", "open", "close", "turnover", "qty", "asset_type")
+    # ── Validate required columns ──
+    # Canonical: traded_value, traded_units, n_trades
+    # Legacy aliases: turnover (= traded_value), qty (= traded_units)
+    req_cols <- c("symbol", "refdate", "open", "close")
     missing <- setdiff(req_cols, names(dt))
-    if (length(missing) > 0) stop("Panel missing fields: ", paste(missing, collapse = ", "))
+    if (length(missing) > 0) {
+        stop("Panel missing required columns: ", paste(missing, collapse = ", "))
+    }
 
-    # Canonical refdate type
+    # Ensure activity columns exist (prefer canonical, fallback to legacy)
+    if (!"traded_value" %in% names(dt) && "turnover" %in% names(dt)) {
+        dt[, traded_value := turnover]
+    }
+    if (!"traded_units" %in% names(dt) && "qty" %in% names(dt)) {
+        dt[, traded_units := qty]
+    }
+    # Create legacy aliases if they don't exist
+    if (!"turnover" %in% names(dt) && "traded_value" %in% names(dt)) {
+        dt[, turnover := traded_value]
+    }
+    if (!"qty" %in% names(dt) && "traded_units" %in% names(dt)) {
+        dt[, qty := traded_units]
+    }
+
+    # ── Canonical date type ──
     if (!inherits(dt$refdate, "Date")) {
-        # Try safe coercion once
         dt[, refdate := as.Date(refdate)]
         if (any(is.na(dt$refdate))) {
-            stop("refdate must be coercible to Date without NA introduction")
+            stop("refdate must be coercible to Date")
         }
     }
 
-    # Canonicalize
+    # ── Set key and dedupe check ──
     data.table::setkeyv(dt, c("symbol", "refdate"))
     if (anyDuplicated(dt, by = c("symbol", "refdate")) > 0) {
         stop("Panel contains duplicate (symbol, refdate) pairs")
     }
 
+    # ── Default asset_type if missing ──
+    if (!"asset_type" %in% names(dt)) dt[, asset_type := "equity"]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Build adapter (closure-based interface)
+    # ══════════════════════════════════════════════════════════════════════════
     adapter <- list()
 
-    adapter$calendar <- function() {
-        sort(unique(dt$refdate))
-    }
+    # ── Calendar ──
+    adapter$calendar <- function() sort(unique(dt$refdate))
 
-    adapter$panel_upto <- function(as_of_date) {
-        dt[refdate <= as_of_date]
-    }
+    # ── Panel up to date (strict no-lookahead) ──
+    adapter$panel_upto <- function(as_of_date) dt[refdate <= as_of_date]
 
-    adapter$price_matrix <- function(as_of_date, lookback, field = "close", symbols = NULL, strict = TRUE) {
-        sub_dt <- adapter$panel_upto(as_of_date)
-        if (nrow(sub_dt) == 0) {
+    # ── Price matrix ──
+    adapter$price_matrix <- function(as_of_date, lookback, field = "close",
+                                     symbols = NULL, strict = TRUE) {
+        sub <- adapter$panel_upto(as_of_date)
+        if (nrow(sub) == 0) {
             return(matrix(NA_real_, 0, 0))
         }
-        cal_upto <- sort(unique(sub_dt$refdate))
-        dates_to_keep <- tail(cal_upto, lookback)
-        sub_dt <- sub_dt[refdate %in% dates_to_keep]
 
-        if (!is.null(symbols)) sub_dt <- sub_dt[symbol %in% symbols]
+        cal <- sort(unique(sub$refdate))
+        dates <- tail(cal, lookback)
+        sub <- sub[refdate %in% dates]
+        if (!is.null(symbols)) sub <- sub[symbol %in% symbols]
 
-        mat <- data.table::dcast(sub_dt, refdate ~ symbol, value.var = field)
+        mat <- data.table::dcast(sub, refdate ~ symbol, value.var = field)
         if (nrow(mat) == 0) {
             return(matrix(NA_real_, 0, 0))
         }
 
-        mat_out <- as.matrix(mat[, -1, with = FALSE])
-        rownames(mat_out) <- as.character(mat$refdate)
+        out <- as.matrix(mat[, -1, with = FALSE])
+        rownames(out) <- as.character(mat$refdate)
 
         if (strict) {
-            keep <- colSums(!is.na(mat_out)) == nrow(mat_out)
-            mat_out <- mat_out[, keep, drop = FALSE]
+            keep <- colSums(!is.na(out)) == nrow(out)
+            out <- out[, keep, drop = FALSE]
         }
-
-        # Return with requested symbol order if provided and possible
         if (!is.null(symbols)) {
-            found <- intersect(symbols, colnames(mat_out))
-            mat_out <- mat_out[, found, drop = FALSE]
+            found <- intersect(symbols, colnames(out))
+            out <- out[, found, drop = FALSE]
         }
-        mat_out
+        out
     }
 
-    adapter$returns_matrix <- function(as_of_date, lookback, field = "close", method = "log", symbols = NULL, strict = TRUE) {
+    # ── Returns matrix ──
+    adapter$returns_matrix <- function(as_of_date, lookback, field = "close",
+                                       method = "log", symbols = NULL,
+                                       strict = TRUE) {
         pm <- adapter$price_matrix(as_of_date, lookback + 1, field, symbols, strict)
         if (nrow(pm) < 2) {
-            return(matrix(NA_real_, nrow = 0, ncol = ncol(pm), dimnames = list(NULL, colnames(pm))))
+            return(matrix(NA_real_, 0, ncol(pm),
+                dimnames = list(NULL, colnames(pm))
+            ))
         }
-        if (method == "log") {
-            diff(log(pm))
-        } else {
-            diff(pm) / pm[-nrow(pm), ]
-        }
+        if (method == "log") diff(log(pm)) else diff(pm) / pm[-nrow(pm), ]
     }
 
+    # ── Single-day cross-sectional return ──
+    adapter$return_1d <- function(as_of_date, symbols = NULL) {
+        pm <- adapter$price_matrix(as_of_date, 2, "close", symbols, strict = FALSE)
+        if (nrow(pm) < 2) {
+            v <- rep(NA_real_, max(1, ncol(pm)))
+            if (ncol(pm) > 0) names(v) <- colnames(pm)
+            return(v)
+        }
+        r <- log(pm[2, ] / pm[1, ])
+        r[!is.finite(r)] <- NA_real_
+        r
+    }
+
+    # ── Execution prices ──
     adapter$execution_price <- function(exec_date, field = "open", symbols = NULL) {
-        sub_dt <- dt[refdate == exec_date]
-        if (!is.null(symbols)) sub_dt <- sub_dt[symbol %in% symbols]
-        res <- sub_dt[[field]]
-        names(res) <- sub_dt$symbol
+        sub <- dt[refdate == exec_date]
+        if (!is.null(symbols)) sub <- sub[symbol %in% symbols]
+        res <- sub[[field]]
+        names(res) <- sub$symbol
         if (!is.null(symbols)) {
             out <- rep(NA_real_, length(symbols))
             names(out) <- symbols
@@ -102,37 +140,43 @@ me_make_data_adapter <- function(data_bundle_or_panel, aux = list()) {
         res
     }
 
+    # ── Investability snapshot ──
     adapter$investability_snapshot <- function(as_of_date, spec_data) {
-        sub_dt <- adapter$panel_upto(as_of_date)
-        cal_upto <- sort(unique(sub_dt$refdate))
+        sub <- adapter$panel_upto(as_of_date)
+        cal <- sort(unique(sub$refdate))
 
-        # Needs at least 63 days of history to check coverage reasonably, otherwise take available
-        lkb <- min(63L, length(cal_upto))
+        lkb <- min(63L, length(cal))
         if (lkb < 5) {
             return(character(0))
         }
 
-        dates_to_keep <- tail(cal_upto, lkb)
-        sub_dt <- sub_dt[refdate %in% dates_to_keep]
+        dates <- tail(cal, lkb)
+        sub <- sub[refdate %in% dates]
 
         min_cov <- spec_data$min_coverage_ratio %||% 0.90
         min_turnover <- spec_data$min_median_turnover %||% 1e5
-        allowed_types <- spec_data$allowed_types %||% c("equity")
+        allowed <- spec_data$allowed_types %||% c("equity")
 
-        # Filter by type first
-        if (length(allowed_types) > 0 && "asset_type" %in% names(sub_dt)) {
-            sub_dt <- sub_dt[asset_type %in% allowed_types]
+        # Filter by asset type
+        if (length(allowed) > 0 && "asset_type" %in% names(sub)) {
+            sub <- sub[asset_type %in% allowed]
         }
 
-        # Aggregate over the lookback
-        agg <- sub_dt[, .(
-            n_obs = .N,
-            med_turnover = median(turnover, na.rm = TRUE),
-            last_price = tail(close, 1)
+        # Use canonical traded_value (with turnover fallback)
+        tv_col <- if ("traded_value" %in% names(sub)) "traded_value" else "turnover"
+        if (!tv_col %in% names(sub)) {
+            return(character(0))
+        }
+
+        agg <- sub[, .(
+            n_obs        = .N,
+            med_turnover = median(get(tv_col), na.rm = TRUE),
+            last_price   = tail(close, 1)
         ), by = symbol]
 
-        # Filter
-        agg <- agg[n_obs >= (lkb * min_cov) & med_turnover >= min_turnover & last_price > 0]
+        agg <- agg[n_obs >= (lkb * min_cov) &
+            med_turnover >= min_turnover &
+            last_price > 0]
         agg$symbol
     }
 
