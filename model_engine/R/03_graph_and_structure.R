@@ -22,14 +22,38 @@ me_partial_corr_from_precision <- function(Theta_eps) {
 
 #' @export
 me_smooth_partial_corr <- function(P_new, P_prev, alpha = 0.3) {
-    # P_bar_t = (1 - alpha) * P_bar_{t-1} + alpha * P_t
     if (is.null(P_prev)) {
         return(P_new)
     }
-    if (!all(dim(P_new) == dim(P_prev))) {
+
+    # Require named square matrices
+    if (!is.matrix(P_new) || !is.matrix(P_prev) ||
+        nrow(P_new) != ncol(P_new) || nrow(P_prev) != ncol(P_prev) ||
+        is.null(rownames(P_new)) || is.null(colnames(P_new)) ||
+        is.null(rownames(P_prev)) || is.null(colnames(P_prev))) {
         return(P_new)
-    } # universe changed
-    P_bar <- (1 - alpha) * P_prev + alpha * P_new
+    }
+
+    syms_new <- colnames(P_new)
+    syms_prev <- colnames(P_prev)
+
+    # Exact alignment if same universe/order
+    if (identical(syms_new, syms_prev) && identical(rownames(P_new), syms_new) && identical(rownames(P_prev), syms_prev)) {
+        P_bar <- (1 - alpha) * P_prev + alpha * P_new
+        P_bar <- (P_bar + t(P_bar)) / 2
+        diag(P_bar) <- 0
+        return(P_bar)
+    }
+
+    # Universe/order changed → smooth only on intersection, keep new values elsewhere
+    common <- intersect(syms_new, syms_prev)
+    if (length(common) < 2) {
+        return(P_new)
+    }
+
+    P_bar <- P_new
+    P_bar[common, common] <- (1 - alpha) * P_prev[common, common, drop = FALSE] +
+        alpha * P_new[common, common, drop = FALSE]
     P_bar <- (P_bar + t(P_bar)) / 2
     diag(P_bar) <- 0
     P_bar
@@ -37,65 +61,99 @@ me_smooth_partial_corr <- function(P_new, P_prev, alpha = 0.3) {
 
 #' @export
 me_build_graph_mask <- function(P_bar, spec_graph = list()) {
-    # Architecture §6: activation + persistence + top-k + symmetry
+    # Architecture §6: activation + top-k + symmetry
     activation_thr <- spec_graph$activation_thr %||% 0.05
-    top_k <- spec_graph$top_k %||% 10L
+    top_k <- as.integer(spec_graph$top_k %||% 10L)
+    top_k <- max(1L, top_k)
+
     n <- ncol(P_bar)
     syms <- colnames(P_bar)
 
-    # Absolute partial correlations
-    W_abs <- abs(P_bar)
+    W_abs_full <- abs(P_bar)
+    diag(W_abs_full) <- 0
 
-    # Activation mask: |P_bar_ij| > threshold
-    M <- W_abs > activation_thr
+    M_dir <- matrix(FALSE, n, n, dimnames = list(syms, syms))
 
-    # Top-k enforcement: each node keeps at most top_k neighbors
     for (i in seq_len(n)) {
-        scores <- W_abs[i, ]
+        scores <- W_abs_full[i, ]
         scores[i] <- 0
-        if (sum(scores > 0) > top_k) {
-            cutoff <- sort(scores, decreasing = TRUE)[top_k]
-            M[i, scores < cutoff] <- FALSE
+
+        eligible <- which(is.finite(scores) & (scores > activation_thr))
+        if (length(eligible) == 0) next
+
+        if (length(eligible) > top_k) {
+            ord <- eligible[order(scores[eligible], decreasing = TRUE)]
+            keep <- ord[seq_len(top_k)]
+        } else {
+            keep <- eligible
         }
+        M_dir[i, keep] <- TRUE
     }
 
-    # Symmetrize (union: if either direction active, keep)
-    M <- M | t(M)
+    # Symmetry by union
+    M <- M_dir | t(M_dir)
     diag(M) <- FALSE
 
-    # Build weighted adjacency
-    W <- W_abs * M
-    W <- (W + t(W)) / 2
-    diag(W) <- 0
-    dimnames(W) <- list(syms, syms)
+    # Preserve both signed and abs weighted adjacency
+    W_signed <- P_bar * M
+    W_signed <- (W_signed + t(W_signed)) / 2
+    diag(W_signed) <- 0
 
-    list(M = M, W = W, n_edges = sum(M) / 2, density = sum(M) / (n * (n - 1)))
+    W_abs <- abs(W_signed)
+    W_abs <- (W_abs + t(W_abs)) / 2
+    diag(W_abs) <- 0
+
+    dimnames(M) <- list(syms, syms)
+    dimnames(W_signed) <- list(syms, syms)
+    dimnames(W_abs) <- list(syms, syms)
+
+    list(
+        M = M,
+        W = W_abs, # backward-compatible alias
+        W_abs = W_abs,
+        W_signed = W_signed,
+        n_edges = sum(M) / 2,
+        density = if (n > 1) sum(M) / (n * (n - 1)) else 0
+    )
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
 # §9: Graph operators
 # ══════════════════════════════════════════════════════════════════════════════
 
+#' @keywords internal
+.me_named_graph_mv <- function(M, s) {
+    out <- as.vector(M %*% s)
+    nm <- rownames(M)
+    if (is.null(nm) && !is.null(names(s))) nm <- names(s)
+    names(out) <- nm
+    out
+}
+
 #' @export
-me_graph_operators <- function(W) {
-    # Build all canonical graph operators from weighted adjacency
+me_graph_operators <- function(W, W_signed = NULL) {
+    # W should be nonnegative weighted adjacency (for Laplacian/clustering)
     n <- ncol(W)
     syms <- colnames(W)
 
-    # Row-normalized adjacency A_t
+    # Unsigned row-normalized adjacency
     deg <- rowSums(W)
-    deg[deg <= 0] <- 1e-12
+    deg[deg <= 0 | !is.finite(deg)] <- 1e-12
     A <- W / deg
 
-    # Signed adjacency (normalize by sum of absolutes per row)
-    P_signed <- W # W is already |P_bar| * M, need original P_bar for signs
-    # We'll use A as the unsigned normalized operator
+    # Optional signed adjacency normalized by row abs-sum
+    A_signed <- NULL
+    if (!is.null(W_signed)) {
+        denom_s <- rowSums(abs(W_signed))
+        denom_s[denom_s <= 0 | !is.finite(denom_s)] <- 1e-12
+        A_signed <- W_signed / denom_s
+        dimnames(A_signed) <- list(syms, syms)
+    }
 
-    # Degree matrix and Laplacian
+    # Degree + Laplacian from unsigned graph (PSD-friendly)
     D <- diag(deg)
     L <- D - W
 
-    # Normalized Laplacian: L_norm = D^{-1/2} L D^{-1/2}
     d_inv_sqrt <- 1 / sqrt(deg)
     d_inv_sqrt[!is.finite(d_inv_sqrt)] <- 0
     D_inv_sqrt <- diag(d_inv_sqrt)
@@ -105,26 +163,33 @@ me_graph_operators <- function(W) {
     dimnames(A) <- list(syms, syms)
     dimnames(L) <- list(syms, syms)
     dimnames(L_norm) <- list(syms, syms)
+    dimnames(D) <- list(syms, syms)
+    names(deg) <- syms
 
-    list(A = A, L = L, L_norm = L_norm, D = D, deg = deg)
+    list(A = A, A_signed = A_signed, L = L, L_norm = L_norm, D = D, deg = deg)
 }
 
 #' §9.1 Peer-context transform: G_peer[s] = A * s
 #' @export
 me_graph_peer <- function(A, s) {
-    as.vector(A %*% s)
+    .me_named_graph_mv(A, s)
 }
 
 #' §9.2 Relative/dislocation transform: G_rel[s] = s - A * s
 #' @export
 me_graph_relative <- function(A, s) {
-    s - as.vector(A %*% s)
+    peer <- .me_named_graph_mv(A, s)
+    s_aligned <- s[names(peer)]
+    s_aligned[!is.finite(s_aligned)] <- 0
+    out <- s_aligned - peer
+    names(out) <- names(peer)
+    out
 }
 
 #' §9.4 Tension/local incompatibility: G_ten[s] = L * s
 #' @export
 me_graph_tension <- function(L, s) {
-    as.vector(L %*% s)
+    .me_named_graph_mv(L, s)
 }
 
 #' §9.5 Graph-regularized shrinkage: G_shr[s] = (I + lambda * L_norm)^{-1} * s
@@ -132,9 +197,13 @@ me_graph_tension <- function(L, s) {
 me_graph_shrinkage <- function(L_norm, s, lambda_g = 0.1) {
     n <- length(s)
     M <- diag(n) + lambda_g * L_norm
-    tryCatch(as.vector(solve(M, s)),
-        error = function(e) s
-    ) # fallback to identity
+    out <- tryCatch(as.vector(solve(M, s)),
+        error = function(e) as.vector(s)
+    )
+    nm <- rownames(L_norm)
+    if (is.null(nm)) nm <- names(s)
+    names(out) <- nm
+    out
 }
 
 #' §9.6 One-step mixed propagation: G_mix[s] = ((1-nu)*I + nu*A) * s
@@ -142,7 +211,11 @@ me_graph_shrinkage <- function(L_norm, s, lambda_g = 0.1) {
 me_graph_mixed <- function(A, s, nu = 0.5) {
     n <- length(s)
     M <- (1 - nu) * diag(n) + nu * A
-    as.vector(M %*% s)
+    out <- as.vector(M %*% s)
+    nm <- rownames(A)
+    if (is.null(nm)) nm <- names(s)
+    names(out) <- nm
+    out
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -340,7 +413,7 @@ me_run_graph_pipeline <- function(risk_artifact, spec_graph = list(),
     mask_result <- me_build_graph_mask(P_bar, spec_graph)
 
     # 4. Graph operators
-    ops <- me_graph_operators(mask_result$W)
+    ops <- me_graph_operators(mask_result$W_abs %||% mask_result$W, mask_result$W_signed)
 
     # 5. Spectral clustering
     K_min <- spec_graph$K_min %||% 2L

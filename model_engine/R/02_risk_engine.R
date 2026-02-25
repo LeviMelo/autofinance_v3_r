@@ -191,6 +191,23 @@ me_cov_sanity <- function(Sigma, repair = TRUE) {
 #' @export
 me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
     n <- ncol(Sigma)
+
+    if (!is.matrix(Sigma)) {
+        Sigma <- as.matrix(Sigma)
+    }
+    if (length(dim(Sigma)) != 2L || nrow(Sigma) != ncol(Sigma)) {
+        stop(sprintf(
+            "me_allocate_hrp: Sigma must be square, got %s x %s",
+            NROW(Sigma), NCOL(Sigma)
+        ))
+    }
+    if (is.null(colnames(Sigma)) || is.null(rownames(Sigma))) {
+        stop("me_allocate_hrp: Sigma must have rownames and colnames.")
+    }
+    if (!identical(rownames(Sigma), colnames(Sigma))) {
+        stop("me_allocate_hrp: Sigma rownames/colnames must match and be in same order.")
+    }
+
     if (is.null(n) || n == 0) {
         w <- numeric(0)
         attr(w, "allocator_method") <- "empty"
@@ -207,7 +224,15 @@ me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
     }
 
     # Distance matrix from correlation
-    cor_mat <- cov2cor(Sigma)
+    cor_mat <- tryCatch(cov2cor(Sigma), error = function(e) NULL)
+    if (is.null(cor_mat)) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- "cov2cor_failed"
+        return(w)
+    }
     cor_mat[!is.finite(cor_mat)] <- 0
     diag(cor_mat) <- 1
     dist_mat <- sqrt(pmax(0, (1 - cor_mat) / 2))

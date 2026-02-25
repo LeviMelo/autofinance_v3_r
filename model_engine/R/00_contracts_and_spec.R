@@ -55,6 +55,15 @@ me_spec_default <- function() {
             hrp = list()
         ),
 
+        # ── graph section ──
+        graph = list(
+            smoothing_alpha = 0.3,
+            activation_thr  = 0.05,
+            top_k           = 10L,
+            K_min           = 2L,
+            K_max           = 8L
+        ),
+
         # ── signals section ──
         signals = list(
             kalman = list(
@@ -86,11 +95,22 @@ me_spec_default <- function() {
             temperature = 1.0
         ),
 
+        # ── forecast section ──
+        forecast = list(
+            label_horizon      = 21L,
+            ridge_lambda       = 0.01,
+            confidence_eps     = 0.01,
+            uncertainty_scale  = 1.0
+        ),
+
         # ── portfolio section ──
         portfolio = list(
+            gamma = 1.0,
+            alpha_scale = 1.0,
             tilt = list(max_tilt = 2.0),
             caps = list(max_weight = 0.15),
-            turnover_penalty = 0.0
+            turnover_penalty = 0.0,
+            max_turnover = 0.5
         ),
 
         # ── meta section ──
@@ -118,7 +138,7 @@ me_get_spec <- function(overrides = NULL) {
 #' @export
 me_validate_spec <- function(spec) {
     # ---- top-level structure ----
-    req <- c("data", "risk", "signals", "market_state", "gating", "portfolio", "meta")
+    req <- c("data", "risk", "graph", "signals", "market_state", "gating", "forecast", "portfolio", "meta")
     miss <- setdiff(req, names(spec))
     if (length(miss) > 0) stop("ModelSpec missing sections: ", paste(miss, collapse = ", "))
 
@@ -148,6 +168,27 @@ me_validate_spec <- function(spec) {
     }
     if (!is.null(r$resid$lambda) && (!is.finite(r$resid$lambda) || r$resid$lambda < 0)) {
         stop("risk$resid$lambda must be finite and >= 0")
+    }
+
+    # ---- graph section ----
+    gr <- spec$graph
+    if (!is.null(gr$smoothing_alpha) && (gr$smoothing_alpha < 0 || gr$smoothing_alpha > 1)) {
+        stop("graph$smoothing_alpha must be in [0, 1]")
+    }
+    if (!is.null(gr$activation_thr) && (!is.finite(gr$activation_thr) || gr$activation_thr < 0)) {
+        stop("graph$activation_thr must be finite and >= 0")
+    }
+    if (!is.null(gr$top_k) && (!is.finite(gr$top_k) || gr$top_k < 1)) {
+        stop("graph$top_k must be >= 1")
+    }
+    if (!is.null(gr$K_min) && (!is.finite(gr$K_min) || gr$K_min < 1)) {
+        stop("graph$K_min must be >= 1")
+    }
+    if (!is.null(gr$K_max) && (!is.finite(gr$K_max) || gr$K_max < 1)) {
+        stop("graph$K_max must be >= 1")
+    }
+    if (!is.null(gr$K_min) && !is.null(gr$K_max) && gr$K_min > gr$K_max) {
+        stop("graph$K_min cannot exceed graph$K_max")
     }
 
     # ---- signals section ----
@@ -196,6 +237,21 @@ me_validate_spec <- function(spec) {
         stop("gating$temperature must be a positive scalar")
     }
 
+    # ---- forecast section ----
+    fc <- spec$forecast
+    if (!is.null(fc$label_horizon) && (!is.finite(fc$label_horizon) || fc$label_horizon < 1)) {
+        stop("forecast$label_horizon must be >= 1")
+    }
+    if (!is.null(fc$ridge_lambda) && (!is.finite(fc$ridge_lambda) || fc$ridge_lambda < 0)) {
+        stop("forecast$ridge_lambda must be >= 0")
+    }
+    if (!is.null(fc$confidence_eps) && (!is.finite(fc$confidence_eps) || fc$confidence_eps <= 0)) {
+        stop("forecast$confidence_eps must be > 0")
+    }
+    if (!is.null(fc$uncertainty_scale) && (!is.finite(fc$uncertainty_scale) || fc$uncertainty_scale < 0)) {
+        stop("forecast$uncertainty_scale must be >= 0")
+    }
+
     # ---- portfolio section ----
     p <- spec$portfolio
     if (!is.null(p$caps$max_weight) && (p$caps$max_weight <= 0 || p$caps$max_weight > 1)) {
@@ -203,6 +259,18 @@ me_validate_spec <- function(spec) {
     }
     if (!is.null(p$tilt$max_tilt) && (!is.finite(p$tilt$max_tilt) || p$tilt$max_tilt < 1)) {
         stop("portfolio$tilt$max_tilt must be >= 1")
+    }
+    if (!is.null(p$gamma) && !is.finite(p$gamma)) {
+        stop("portfolio$gamma must be finite")
+    }
+    if (!is.null(p$alpha_scale) && !is.finite(p$alpha_scale)) {
+        stop("portfolio$alpha_scale must be finite")
+    }
+    if (!is.null(p$turnover_penalty) && (!is.finite(p$turnover_penalty) || p$turnover_penalty < 0)) {
+        stop("portfolio$turnover_penalty must be >= 0")
+    }
+    if (!is.null(p$max_turnover) && (!is.finite(p$max_turnover) || p$max_turnover < 0 || p$max_turnover > 1)) {
+        stop("portfolio$max_turnover must be in [0, 1]")
     }
 
     invisible(spec)
@@ -215,7 +283,8 @@ me_validate_snapshot_artifact <- function(x) {
     req <- c(
         "as_of_date", "tradable_symbols", "target_weights",
         "cash_weight", "risk", "signals", "market_state",
-        "gating", "portfolio_diag", "meta", "warnings"
+        "gating", "portfolio_diag", "meta", "warnings",
+        "model_state_out"
     )
     miss <- setdiff(req, names(x))
     if (length(miss) > 0) stop("Snapshot artifact missing: ", paste(miss, collapse = ", "))

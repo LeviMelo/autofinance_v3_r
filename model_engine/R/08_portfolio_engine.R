@@ -26,80 +26,196 @@ me_forecast_to_alpha <- function(combined_forecast, confidence, spec_portfolio) 
 # §14 QP Optimizer: min w^T Σ w - γ α^T w  s.t. constraints
 # ══════════════════════════════════════════════════════════════════════════════
 
+#' @keywords internal
+.me_project_capped_simplex <- function(w, target_sum, cap, max_iter = 100L, tol = 1e-10) {
+    nm <- names(w) # preserve names BEFORE numeric coercion
+    w <- unname(as.numeric(w)) # strip names intentionally, restore later
+
+    if (length(w) == 0) {
+        out <- numeric(0)
+        names(out) <- nm
+        return(out)
+    }
+
+    w[!is.finite(w)] <- 0
+    w <- pmax(w, 0)
+
+    target_sum <- max(0, target_sum)
+    target_sum <- min(target_sum, length(w) * cap)
+
+    if (target_sum == 0) {
+        out <- rep(0, length(w))
+        names(out) <- nm
+        return(out)
+    }
+
+    if (sum(w) <= 0) {
+        out <- rep(0, length(w))
+        remaining <- target_sum
+        for (i in seq_along(out)) {
+            add <- min(cap, remaining)
+            out[i] <- add
+            remaining <- remaining - add
+            if (remaining <= tol) break
+        }
+        names(out) <- nm
+        return(out)
+    }
+
+    # Start by scaling to target sum
+    w <- w * (target_sum / sum(w))
+
+    for (iter in seq_len(max_iter)) {
+        over <- which(w > cap + tol)
+        if (length(over) == 0) break
+
+        excess <- sum(w[over] - cap)
+        w[over] <- cap
+
+        under <- which(w < cap - tol)
+        if (length(under) == 0 || excess <= tol) break
+
+        base <- w[under]
+        base[!is.finite(base)] <- 0
+
+        if (sum(base) > tol) {
+            w[under] <- w[under] + excess * (base / sum(base))
+        } else {
+            headroom <- cap - w[under]
+            if (sum(headroom) <= tol) break
+            w[under] <- w[under] + excess * (headroom / sum(headroom))
+        }
+
+        w <- pmax(w, 0)
+    }
+
+    # Final correction
+    s <- sum(w)
+    if (s > 0 && abs(s - target_sum) > 1e-8) {
+        headroom <- pmax(cap - w, 0)
+        if (s < target_sum && sum(headroom) > tol) {
+            add <- (target_sum - s) * headroom / sum(headroom)
+            w <- w + add
+        } else if (s > target_sum) {
+            reducible <- pmax(w, 0)
+            if (sum(reducible) > tol) {
+                sub <- (s - target_sum) * reducible / sum(reducible)
+                w <- pmax(w - sub, 0)
+            }
+        }
+    }
+
+    names(w) <- nm
+    w
+}
+
 #' @export
 me_qp_optimize <- function(Sigma, alpha, w_baseline, gross_exposure,
                            spec_portfolio, prev_target = NULL) {
     n <- length(alpha)
     syms <- names(alpha)
+
     gamma <- spec_portfolio$gamma %||% 1.0
     max_weight <- spec_portfolio$caps$max_weight %||% 0.15
     turnover_penalty <- spec_portfolio$turnover_penalty %||% 0.0
 
-    # Check for quadprog
+    if (n == 0) {
+        return(list(w = setNames(numeric(0), character(0)), method = "empty", converged = TRUE))
+    }
+
+    # Feasibility: sum(w)=gross_exposure with w_i <= max_weight
+    gross_req <- gross_exposure
+    gross_cap_max <- n * max_weight
+    gross_use <- min(gross_req, gross_cap_max)
+    if (!is.finite(gross_use) || gross_use < 0) gross_use <- 0
+
     has_qp <- requireNamespace("quadprog", quietly = TRUE)
 
     if (has_qp && n >= 2) {
-        # ── QP formulation ──
-        # min 0.5 * w^T (Sigma + turnover_pen * I) w - (gamma * alpha)^T w
-        # s.t.: sum(w) = gross_exposure, 0 <= w_i <= max_weight
-
-        # Turnover regularization
         Dmat <- Sigma
-        if (turnover_penalty > 0) {
-            diag(Dmat) <- diag(Dmat) + turnover_penalty
-        }
-
-        # Ensure PD (add small ridge)
-        min_eig <- min(eigen(Dmat, symmetric = TRUE, only.values = TRUE)$values)
-        if (min_eig < 1e-8) {
-            diag(Dmat) <- diag(Dmat) + abs(min_eig) + 1e-6
-        }
+        Dmat <- (Dmat + t(Dmat)) / 2
 
         dvec <- gamma * alpha
 
-        # Constraints: Amat^T w >= bvec
-        # 1. sum(w) = gross_exposure    → +sum and -sum
-        # 2. w_i >= 0                    → identity rows
-        # 3. w_i <= max_weight           → -identity rows
+        # Quadratic turnover proxy around previous target:
+        # +(lambda/2)||w - w_prev||^2 => D += lambda I ; d += lambda w_prev
+        if (turnover_penalty > 0 && !is.null(prev_target)) {
+            if (is.data.frame(prev_target)) {
+                w_prev <- setNames(prev_target$weight_target, prev_target$symbol)
+            } else {
+                w_prev <- prev_target
+            }
+            w_prev_aligned <- setNames(rep(0, n), syms)
+            common_prev <- intersect(syms, names(w_prev))
+            w_prev_aligned[common_prev] <- w_prev[common_prev]
+
+            diag(Dmat) <- diag(Dmat) + turnover_penalty
+            dvec <- dvec + turnover_penalty * w_prev_aligned
+        } else if (turnover_penalty > 0) {
+            # Mild ridge only if no prev target is available
+            diag(Dmat) <- diag(Dmat) + turnover_penalty
+        }
+
+        # Ensure positive definite enough for solve.QP
+        eigvals <- tryCatch(eigen(Dmat, symmetric = TRUE, only.values = TRUE)$values,
+            error = function(e) NULL
+        )
+        if (!is.null(eigvals)) {
+            min_eig <- min(eigvals, na.rm = TRUE)
+            if (is.finite(min_eig) && min_eig < 1e-8) {
+                diag(Dmat) <- diag(Dmat) + abs(min_eig) + 1e-6
+            }
+        } else {
+            diag(Dmat) <- diag(Dmat) + 1e-6
+        }
+
+        # solve.QP uses Amat^T w >= bvec
+        # Equality: sum(w) = gross_use  (meq = 1)
         Amat <- cbind(
-            rep(1, n), # sum = gross_exposure (eq via two ineq)
-            rep(-1, n), # -sum >= -gross_exposure
+            rep(1, n), # equality
             diag(n), # w_i >= 0
-            -diag(n) # -w_i >= -max_weight
+            -diag(n) # w_i <= max_weight
         )
         bvec <- c(
-            gross_exposure - 1e-6, # sum >= gross - eps
-            -(gross_exposure + 1e-6), # -sum >= -(gross + eps)
-            rep(0, n), # w_i >= 0
-            rep(-max_weight, n) # -w_i >= -max_weight
+            gross_use,
+            rep(0, n),
+            rep(-max_weight, n)
         )
 
         sol <- tryCatch(
-            quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 0),
+            quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 1),
             error = function(e) NULL
         )
 
         if (!is.null(sol)) {
             w_opt <- sol$solution
+            w_opt[!is.finite(w_opt)] <- 0
             w_opt[w_opt < 0] <- 0
-            # Rescale to exact gross exposure
-            s <- sum(w_opt)
-            if (s > 0) w_opt <- w_opt * (gross_exposure / s)
             names(w_opt) <- syms
+
+            # Final robust capped projection (see helper below)
+            w_opt <- .me_project_capped_simplex(w_opt, target_sum = gross_use, cap = max_weight)
+
             return(list(
-                w = w_opt, method = "qp",
+                w = w_opt,
+                method = "qp",
                 obj_value = sol$value,
-                converged = TRUE
+                converged = TRUE,
+                gross_requested = gross_req,
+                gross_used = gross_use
             ))
         }
     }
 
-    # ── Fallback: tilt-based allocation ──
+    # Fallback
     w_opt <- .tilt_allocation(
-        alpha, w_baseline, gross_exposure, max_weight,
-        spec_portfolio
+        alpha, w_baseline, gross_use, max_weight, spec_portfolio
     )
-    list(w = w_opt, method = "tilt_fallback", obj_value = NA, converged = FALSE)
+
+    list(
+        w = w_opt, method = "tilt_fallback", obj_value = NA, converged = FALSE,
+        gross_requested = gross_req, gross_used = gross_use
+    )
 }
 
 #' Tilt-based fallback (score-to-tilt on baseline)
@@ -123,21 +239,9 @@ me_qp_optimize <- function(Sigma, alpha, w_baseline, gross_exposure,
     tilt <- pmin(pmax(tilt, 1 / max_tilt), max_tilt)
 
     w <- w_baseline * tilt
-    w[w < 0] <- 0
-    s <- sum(w)
-    if (s > 0) w <- w * (gross_exposure / s)
 
-    # Apply caps
-    for (iter in 1:20) {
-        over <- w > max_weight
-        if (!any(over)) break
-        overflow <- sum(w[over] - max_weight)
-        w[over] <- max_weight
-        under <- !over & w > 0
-        if (!any(under)) break
-        w[under] <- w[under] + overflow * (w[under] / sum(w[under]))
-    }
-    w <- w * (gross_exposure / max(sum(w), 1e-12))
+    w[w < 0] <- 0
+    w <- .me_project_capped_simplex(w, target_sum = gross_exposure, cap = max_weight)
     names(w) <- syms
     w
 }
@@ -147,23 +251,23 @@ me_qp_optimize <- function(Sigma, alpha, w_baseline, gross_exposure,
 # ══════════════════════════════════════════════════════════════════════════════
 
 #' @export
-me_post_shape <- function(w, tradable_mask, max_weight = 0.15,
+me_post_shape <- function(w, tradable_symbols, max_weight = 0.15,
                           min_weight = 1e-6, gross_exposure = 1.0) {
-    # 1. Zero out non-tradable
-    non_tradable <- setdiff(names(w), tradable_mask)
-    w[non_tradable] <- 0
-
-    # 2. Zero out dust positions
-    w[w < min_weight] <- 0
-
-    # 3. Re-enforce caps
-    w <- pmin(w, max_weight)
-
-    # 4. Renormalize to gross exposure
-    s <- sum(w)
-    if (s > 0) {
-        w <- w * (gross_exposure / s)
+    if (length(w) == 0) {
+        return(w)
     }
+
+    # 1. Zero out non-tradable
+    non_tradable <- setdiff(names(w), tradable_symbols)
+    if (length(non_tradable) > 0) w[non_tradable] <- 0
+
+    # 2. Zero out dust
+    w[!is.finite(w)] <- 0
+    w[w < min_weight] <- 0
+    w[w < 0] <- 0
+
+    # 3. Project to capped simplex exactly
+    w <- .me_project_capped_simplex(w, target_sum = gross_exposure, cap = max_weight)
 
     w
 }
@@ -274,6 +378,20 @@ me_build_portfolio_target <- function(risk_artifact, signal_artifact,
         w_prev <- setNames(prev_target$weight_target, prev_target$symbol)
         max_to <- spec_portfolio$max_turnover %||% 0.5
         w_target <- me_apply_turnover_ceiling(w_target, w_prev, max_to)
+    }
+
+    # Contract: portfolio weights must be a named vector aligned to risk universe
+    if (is.null(names(w_target))) {
+        stop("me_build_portfolio_target: w_target lost names (NULL).")
+    }
+    if (length(names(w_target)) != length(w_target)) {
+        stop(sprintf(
+            "me_build_portfolio_target: names(w_target) length (%d) != length(w_target) (%d).",
+            length(names(w_target)), length(w_target)
+        ))
+    }
+    if (any(!nzchar(names(w_target)))) {
+        stop("me_build_portfolio_target: w_target contains empty symbol names.")
     }
 
     # Build target dataframe

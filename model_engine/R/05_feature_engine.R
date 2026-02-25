@@ -68,6 +68,7 @@ me_features_structural <- function(risk_artifact, syms) {
     # Idiosyncratic vol fraction: diag(Sigma_eps) / sigma^2
     if (!is.null(risk_artifact$Sigma_eps) && !is.null(vols)) {
         id_var <- diag(risk_artifact$Sigma_eps) * 252
+        names(id_var) <- rownames(risk_artifact$Sigma_eps)
         total_var <- vols^2
         common <- intersect(syms, names(id_var))
         f_idio_frac <- setNames(rep(0, n), syms)
@@ -101,7 +102,7 @@ me_features_graph <- function(graph_artifact, signal_artifact, syms) {
         return(features)
     }
 
-    A <- ops$A
+    A <- ops$A_signed %||% ops$A
     L <- ops$L
     graph_syms <- colnames(A)
     common <- intersect(syms, graph_syms)
@@ -149,8 +150,16 @@ me_features_graph <- function(graph_artifact, signal_artifact, syms) {
     deg <- ops$deg
     f_centrality <- setNames(rep(0, n), syms)
     deg_common <- deg[common]
-    if (sd(deg_common) > 1e-8) {
-        deg_common <- (deg_common - mean(deg_common)) / sd(deg_common)
+    deg_common[!is.finite(deg_common)] <- 0
+    if (length(deg_common) > 1) {
+        sdc <- sd(deg_common)
+        if (is.finite(sdc) && sdc > 1e-8) {
+            deg_common <- (deg_common - mean(deg_common)) / sdc
+        } else {
+            deg_common[] <- 0
+        }
+    } else {
+        deg_common[] <- 0
     }
     f_centrality[common] <- deg_common
     features$f_centrality <- .tanh_scale(f_centrality, 2.0)
@@ -201,10 +210,20 @@ me_features_liquidity <- function(adapter, as_of_date, syms) {
         illiq_vals <- tapply(seq_len(nrow(sub_sorted)), sub_sorted$symbol, function(idx) {
             cl <- sub_sorted[[close_col]][idx]
             tv <- sub_sorted[[tv_col]][idx]
-            r <- abs(diff(log(cl)))
-            vol <- tv[-1]
-            vol[vol <= 0 | !is.finite(vol)] <- 1e8
-            mean(r / vol, na.rm = TRUE)
+
+            if (length(cl) < 2) {
+                return(NA_real_)
+            }
+
+            r <- c(NA_real_, abs(diff(log(cl)))) # align with same-day traded value for t
+            valid <- is.finite(r) & is.finite(tv) & (tv > 0)
+
+            # Need enough valid observations to be meaningful
+            if (sum(valid, na.rm = TRUE) < 5) {
+                return(NA_real_)
+            }
+
+            mean(r[valid] / tv[valid], na.rm = TRUE)
         })
 
         f_illiq <- setNames(rep(0, n), syms)

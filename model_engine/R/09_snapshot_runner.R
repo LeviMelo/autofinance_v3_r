@@ -15,6 +15,13 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
                             aux = list()) {
     spec <- me_get_spec(spec)
     me_validate_spec(spec)
+    me_validate_model_state(model_state)
+
+    # Convenience: if caller passed model_state but forgot prev_target separately,
+    # recover it from state.
+    if (is.null(prev_target) && !is.null(model_state) && !is.null(model_state$prev_target)) {
+        prev_target <- model_state$prev_target
+    }
 
     warns <- character(0)
     .w <- function(msg) warns <<- c(warns, msg)
@@ -50,6 +57,15 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
             gating = list(), graph = list(), features = list(),
             forecast = list(), portfolio_diag = list(),
             meta = list(spec_hash = me_hash_spec(spec)),
+            model_state_out = list(
+                prev_P_bar = NULL,
+                prev_labels = NULL,
+                prev_target = data.frame(
+                    symbol = character(0),
+                    weight_target = numeric(0),
+                    stringsAsFactors = FALSE
+                )
+            ),
             warnings = warns
         )
         me_validate_snapshot_artifact(res)
@@ -221,6 +237,12 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         }
     )
 
+    if (!is.null(forecast_artifact) &&
+        !is.null(forecast_artifact$diag$reason) &&
+        identical(forecast_artifact$diag$reason, "no_feature_history_fallback")) {
+        .w("Forecast engine used no_feature_history_fallback (X_hist_window not implemented yet)")
+    }
+
     # ══════════════════════════════════════════════════════════════════════════
     # STAGE 7: Portfolio Construction (§§13-14)
     # ══════════════════════════════════════════════════════════════════════════
@@ -306,6 +328,17 @@ me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
         },
         portfolio_diag = pd,
         meta = meta,
+        model_state_out = list(
+            prev_P_bar = if (!is.null(graph_artifact)) graph_artifact$P_bar else NULL,
+            prev_labels = if (!is.null(graph_artifact) &&
+                !is.null(graph_artifact$clustering) &&
+                !is.null(graph_artifact$clustering$labels)) {
+                graph_artifact$clustering$labels
+            } else {
+                NULL
+            },
+            prev_target = port_artifact$target_weights
+        ),
         warnings = unique(warns)
     )
 

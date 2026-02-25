@@ -9,54 +9,102 @@
 #' Rolling ridge regression: y ~ X with L2 penalty
 #' @export
 me_rolling_ridge <- function(y, X, lambda = 0.01) {
-    # y: n_obs vector of labels (lagged returns)
-    # X: n_obs x p feature matrix
     n <- nrow(X)
     p <- ncol(X)
+
+    if (is.null(colnames(X))) {
+        colnames(X) <- paste0("x", seq_len(p))
+    }
+
     if (n < max(5, p + 1)) {
         return(list(
-            beta = rep(0, p), intercept = 0,
-            fitted = FALSE, reason = "insufficient_obs"
+            beta = setNames(rep(0, p), colnames(X)),
+            intercept = 0,
+            feature_names = colnames(X),
+            fitted = FALSE,
+            reason = "insufficient_obs"
         ))
     }
-    # Standardize X
+
     mu_X <- colMeans(X, na.rm = TRUE)
     sd_X <- apply(X, 2, sd, na.rm = TRUE)
     sd_X[sd_X < 1e-8 | !is.finite(sd_X)] <- 1
+
     X_s <- scale(X, center = mu_X, scale = sd_X)
     X_s[!is.finite(X_s)] <- 0
 
     mu_y <- mean(y, na.rm = TRUE)
     y_c <- y - mu_y
+    y_c[!is.finite(y_c)] <- 0
 
     XtX <- crossprod(X_s)
     Xty <- crossprod(X_s, y_c)
+
     beta_s <- tryCatch(
         solve(XtX + lambda * diag(p), Xty),
         error = function(e) NULL
     )
+
     if (is.null(beta_s)) {
         return(list(
-            beta = rep(0, p), intercept = 0,
-            fitted = FALSE, reason = "solve_failed"
+            beta = setNames(rep(0, p), colnames(X)),
+            intercept = 0,
+            feature_names = colnames(X),
+            fitted = FALSE,
+            reason = "solve_failed"
         ))
     }
 
-    beta <- as.vector(beta_s) / sd_X
+    beta_s <- as.vector(beta_s)
+    names(beta_s) <- colnames(X)
+
+    beta <- beta_s / sd_X
+    names(beta) <- colnames(X)
+
     intercept <- mu_y - sum(beta * mu_X)
 
-    list(beta = beta, intercept = intercept, fitted = TRUE, reason = "ok")
+    list(
+        beta = beta,
+        intercept = intercept,
+        feature_names = colnames(X),
+        fitted = TRUE,
+        reason = "ok"
+    )
 }
 
 #' §12.1 Component c forecast: f_hat_i^c = X_i * beta_c + intercept_c
 #' @export
 me_component_forecast <- function(X_current, model_fit) {
+    syms <- rownames(X_current)
+    if (is.null(syms)) syms <- seq_len(nrow(X_current))
+
     if (!isTRUE(model_fit$fitted)) {
-        return(setNames(rep(0, nrow(X_current)), rownames(X_current)))
+        out <- setNames(rep(0, nrow(X_current)), syms)
+        return(out)
     }
-    pred <- as.vector(X_current %*% model_fit$beta) + model_fit$intercept
+
+    feat_names <- model_fit$feature_names %||% names(model_fit$beta)
+    if (is.null(feat_names) || length(feat_names) == 0) {
+        out <- setNames(rep(0, nrow(X_current)), syms)
+        return(out)
+    }
+
+    X_use <- matrix(0,
+        nrow = nrow(X_current), ncol = length(feat_names),
+        dimnames = list(syms, feat_names)
+    )
+
+    common <- intersect(feat_names, colnames(X_current))
+    if (length(common) > 0) {
+        X_use[, common] <- X_current[, common, drop = FALSE]
+    }
+
+    beta <- model_fit$beta[feat_names]
+    beta[!is.finite(beta)] <- 0
+
+    pred <- as.vector(X_use %*% beta) + model_fit$intercept
     pred[!is.finite(pred)] <- 0
-    names(pred) <- rownames(X_current)
+    names(pred) <- syms
     pred
 }
 
@@ -294,8 +342,10 @@ me_run_forecast_engine <- function(X_current, R_window, X_hist_window,
 
     if (!isTRUE(label_result$valid)) {
         # Can't train → use raw signal-based forecast
-        fc <- X_current[, 1]
-        if (is.null(dim(fc))) fc <- setNames(rep(0, n), syms)
+        fc <- X_current[, 1, drop = TRUE]
+        fc <- as.vector(fc)
+        names(fc) <- syms
+        fc[!is.finite(fc)] <- 0
         return(list(
             combined_forecast = fc,
             component_forecasts = list(fallback = fc),
@@ -311,15 +361,41 @@ me_run_forecast_engine <- function(X_current, R_window, X_hist_window,
 
     # 2. Align feature history with labels
     n_train <- label_result$n_train
-    X_train <- if (!is.null(X_hist_window) && nrow(X_hist_window) >= n_train) {
-        X_hist_window[1:n_train, , drop = FALSE]
-    } else {
-        # Fallback: replicate current features (suboptimal but functional)
-        X_rep <- matrix(0, n_train, ncol(X_current),
-            dimnames = list(NULL, colnames(X_current))
-        )
-        X_rep
+    if (is.null(X_hist_window) || nrow(X_hist_window) < n_train) {
+        # Honest fallback: no historical feature panel available yet
+        # Use current feature signals directly rather than fake regression training
+        fc_fallback <- if ("f_mom" %in% colnames(X_current)) {
+            X_current[, "f_mom"]
+        } else if ("f_kal" %in% colnames(X_current)) {
+            X_current[, "f_kal"]
+        } else if (ncol(X_current) > 0) {
+            X_current[, 1]
+        } else {
+            setNames(rep(0, nrow(X_current)), rownames(X_current))
+        }
+
+        fc_fallback <- as.vector(fc_fallback)
+        names(fc_fallback) <- rownames(X_current)
+        fc_fallback[!is.finite(fc_fallback)] <- 0
+
+        return(list(
+            combined_forecast = fc_fallback,
+            component_forecasts = list(fallback = fc_fallback),
+            gating_weights = c(fallback = 1),
+            confidence = list(kappa = list(), agreement = abs(sign(fc_fallback)), avg_confidence = mean(abs(sign(fc_fallback)))),
+            uncertainty = data.frame(
+                symbol = names(fc_fallback),
+                forecast = fc_fallback,
+                sigma_fc = rep(0.01, length(fc_fallback)),
+                z_score = rep(0, length(fc_fallback)),
+                stringsAsFactors = FALSE
+            ),
+            models = list(),
+            diag = list(reason = "no_feature_history_fallback", label_horizon = horizon)
+        ))
     }
+
+    X_train <- X_hist_window[1:n_train, , drop = FALSE]
 
     # Use cross-sectional median returns as labels
     y_train <- label_result$y
