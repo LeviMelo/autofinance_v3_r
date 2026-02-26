@@ -98,7 +98,7 @@ came_run_stage <- function(stage, expr, warnings_acc = NULL) {
   withCallingHandlers(
     tryCatch(expr, error = function(e) {
       if (inherits(e, "came_error")) stop(e)
-      came_stop(paste0(stage, "_error"), conditionMessage(e))
+      came_stop(paste0(stage, "_error"), paste0("[", stage, "] ", conditionMessage(e)))
     }),
     warning = function(w) {
       if (!is.null(warnings_acc) && is.function(warnings_acc)) {
@@ -112,9 +112,17 @@ came_run_stage <- function(stage, expr, warnings_acc = NULL) {
 # ---- numerics ----
 
 came_sigmoid <- function(z) {
-  z <- as.numeric(z)
-  z[!is.finite(z)] <- 0
-  1 / (1 + exp(-z))
+  z0 <- z
+  v <- as.numeric(z0)
+  v[!is.finite(v)] <- 0
+  out <- 1 / (1 + exp(-v))
+
+  # preserve matrix/array shape when input had dimensions
+  if (!is.null(dim(z0))) {
+    dim(out) <- dim(z0)
+    dimnames(out) <- dimnames(z0)
+  }
+  out
 }
 
 came_softmax <- function(z, temperature = 1.0) {
@@ -1208,6 +1216,9 @@ came_risk_update <- function(R_window, state, spec) {
     theta_alpha["xi"] * xi
 
   A <- came_sigmoid(z)
+  if (!is.matrix(A)) {
+    A <- matrix(A, nrow = nrow(z), ncol = ncol(z), dimnames = dimnames(z))
+  }
   diag(A) <- 1
   A[!is.finite(A)] <- 0.5
   came_symmetrize(A)
@@ -1914,11 +1925,11 @@ came_signals_update <- function(P_last, R_window, risk_art, struct_art, state, s
   D <- risk_art$D_series
 
   # align residual series to current symbols
-  common <- intersect(colnames(E), syms)
-  came_assert(length(common) >= 3, "signals_resid_common", "Residual series must cover >=3 symbols in current universe")
+  syms2 <- intersect(syms, colnames(E))
+  came_assert(length(syms2) >= 3, "signals_resid_common", "Residual series must cover >=3 symbols")
 
-  E <- E[, syms, drop = FALSE]
-  D <- D[, syms, drop = FALSE]
+  E <- E[, syms2, drop = FALSE]
+  D <- D[, syms2, drop = FALSE]
 
   R_perp <- E * D
   R_perp[!is.finite(R_perp)] <- 0
@@ -3339,13 +3350,20 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   if (!is.finite(disp)) disp <- 0
 
   R_eta <- tail(R_win, min(nrow(R_win), 126L))
+  R_eta <- as.matrix(R_eta) # force 2D
 
-  Cmat <- tryCatch(cor(R_eta, use = "pairwise.complete.obs"), error = function(e) NULL)
+  Cmat <- suppressWarnings(
+    tryCatch(cor(R_eta, use = "pairwise.complete.obs"),
+      error = function(e) NULL
+    )
+  )
 
-  # Robust: cor() can return non-matrix in degenerate cases; never diag<- unless matrix
-  if (is.null(Cmat) || !is.matrix(Cmat) || nrow(Cmat) < 2L || ncol(Cmat) < 2L) {
+  # Robust dim check: must be 2D and at least 2x2
+  if (is.null(Cmat) || is.null(dim(Cmat)) || length(dim(Cmat)) != 2L ||
+    any(dim(Cmat) < 2L)) {
     eta <- 0
   } else {
+    Cmat <- as.matrix(Cmat) # coerce any odd class to base matrix
     Cmat[!is.finite(Cmat)] <- 0
     diag(Cmat) <- 1
 

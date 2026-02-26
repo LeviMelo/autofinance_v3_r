@@ -54,7 +54,7 @@ end_d <- max(dt$refdate, na.rm = TRUE)
 last_dates <- sort(unique(dt$refdate))
 last63 <- tail(last_dates, 63)
 
-topN <- 40L
+topN <- 400L
 top_syms <- dt[refdate %in% last63,
     .(
         med_tv = median(traded_value, na.rm = TRUE),
