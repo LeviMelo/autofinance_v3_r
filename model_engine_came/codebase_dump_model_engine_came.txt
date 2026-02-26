@@ -20,7 +20,7 @@ Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_v3_r/model_en
 ### FILE: R/00_utils.R
 ###############################################################################
 # CAME — Causal Architecture Model Engine
-# 00_utils.R — utilities, assertions, error handling, stage runner
+# 00_utils.R — utilities, assertions, error handling, numerics
 
 `%||%` <- function(a, b) if (is.null(a)) b else a
 
@@ -33,7 +33,7 @@ came_require <- function(pkgs) {
   invisible(TRUE)
 }
 
-# ---- conditions ----
+# ---- typed conditions ----
 
 came_error <- function(code, message, data = NULL) {
   structure(
@@ -49,8 +49,23 @@ came_warning <- function(code, message, data = NULL) {
   )
 }
 
+came_stop <- function(code, message, data = NULL) {
+  stop(came_error(code, message, data = data))
+}
+
+came_warn <- function(code, message, data = NULL) {
+  warning(came_warning(code, message, data = data), call. = FALSE)
+}
+
+# ---- assertions ----
+
 came_assert <- function(ok, code, message, data = NULL) {
-  if (!isTRUE(ok)) stop(came_error(code, message, data = data))
+  if (!isTRUE(ok)) came_stop(code, message, data = data)
+  invisible(TRUE)
+}
+
+came_assert_scalar_numeric <- function(x, code, message) {
+  came_assert(is.numeric(x) && length(x) == 1L && is.finite(x), code, message)
   invisible(TRUE)
 }
 
@@ -63,19 +78,27 @@ came_assert_named <- function(x, code, message) {
 came_assert_square_named_matrix <- function(M, code, message) {
   came_assert(is.matrix(M), code, message)
   came_assert(nrow(M) == ncol(M), code, message)
-  rn <- rownames(M); cn <- colnames(M)
+  rn <- rownames(M)
+  cn <- colnames(M)
   came_assert(!is.null(rn) && !is.null(cn), code, message)
   came_assert(identical(rn, cn), code, message)
   invisible(TRUE)
 }
 
+came_assert_date <- function(x, code, message) {
+  d <- tryCatch(as.Date(x), error = function(e) NA)
+  came_assert(!is.na(d), code, message)
+  invisible(TRUE)
+}
+
 # ---- stage runner (no silent fallbacks) ----
+# Captures warnings (optional) but never continues after an error.
 
 came_run_stage <- function(stage, expr, warnings_acc = NULL) {
   withCallingHandlers(
     tryCatch(expr, error = function(e) {
       if (inherits(e, "came_error")) stop(e)
-      stop(came_error(paste0(stage, "_error"), conditionMessage(e)))
+      came_stop(paste0(stage, "_error"), conditionMessage(e))
     }),
     warning = function(w) {
       if (!is.null(warnings_acc) && is.function(warnings_acc)) {
@@ -84,6 +107,14 @@ came_run_stage <- function(stage, expr, warnings_acc = NULL) {
       invokeRestart("muffleWarning")
     }
   )
+}
+
+# ---- numerics ----
+
+came_sigmoid <- function(z) {
+  z <- as.numeric(z)
+  z[!is.finite(z)] <- 0
+  1 / (1 + exp(-z))
 }
 
 came_softmax <- function(z, temperature = 1.0) {
@@ -104,9 +135,9 @@ came_symmetrize <- function(M) {
 }
 
 came_near_psd <- function(S, eps = 1e-10) {
-  came_require(c("Matrix"))
+  came_require("Matrix")
+  came_assert(is.matrix(S), "near_psd_type", "S must be a matrix")
   S <- came_symmetrize(S)
-  # add small ridge to diagonal for numerical stability
   diag(S) <- diag(S) + eps
   as.matrix(Matrix::nearPD(S, corr = FALSE)$mat)
 }
@@ -116,15 +147,37 @@ came_hash <- function(x) {
   digest::digest(x)
 }
 
+# ---- small helpers ----
+
+came_rank01 <- function(x) {
+  x <- as.numeric(x)
+  x[!is.finite(x)] <- NA_real_
+  r <- rank(x, ties.method = "average", na.last = "keep")
+  out <- r / (sum(is.finite(x)) + 1)
+  out[!is.finite(out)] <- 0.5
+  out
+}
+
+came_quantile_safe <- function(x, p, default = NA_real_) {
+  x <- as.numeric(x)
+  x <- x[is.finite(x)]
+  if (length(x) < 2) {
+    return(default)
+  }
+  as.numeric(stats::quantile(x, probs = p, na.rm = TRUE, names = FALSE, type = 7))
+}
+
 
 
 ###############################################################################
 ### FILE: R/01_contracts.R
 ###############################################################################
-# 01_contracts.R — spec, artifact contracts, state validation
+# 01_contracts.R — spec defaults + validation, state/snapshot contracts
+# Aligned to architecture.md: strict causality, Glasso-only residual precision,
+# graph operators distinct, component mixture + kappa + reliability + QP optimizer.
 
 came_spec_default <- function() {
-  # Global state vector m_t dimensions (trimmed but architecture-consistent)
+  # Global state vector m_t dimension (architecture §11.5.5)
   # [disp, eta_mode, VoV, dens, eto, chi, liq_med_logv, liq_med_logntr, liq_frac_active]
   d_m <- 9L
 
@@ -135,43 +188,62 @@ came_spec_default <- function() {
       allowed_types = c("equity", "fii", "etf", "bdr"),
       eps_hold = 1e-8
     ),
+
+    # ---- risk (architecture §5) ----
     risk = list(
       lookback = 252L,
       k = 5L,
       lambda_sigma = 0.94,
       lambda_f = 0.97,
       lambda_e = 0.97,
+      vov_lambda = 0.97,
       glasso_lambda = 0.10,
       psd_eps = 1e-8,
       align_factors = TRUE
     ),
+
+    # ---- structure (architecture §6 + §9 + §10) ----
     structure = list(
-      # smoothing
+      # §6.2 smoothing
       lambda_edge = 0.95,
       theta_alpha = c(intercept = -0.2, edge_stab = 1.0, chi = -1.0, xi = -0.2),
-      # activation
-      k_min = 2L, k_max = 10L,
+
+      # §6.3 activation / persistence / degree targeting (operationally trimmed but real)
+      k_min = 2L,
+      k_max = 10L,
       beta_w = 1.0,
       q_on_base = 0.90,
       q_on_chi_scale = 0.10,
       hysteresis_ratio = 0.7,
       q_global = 0.995,
-      K_min = 2L, K_max = 8L
+
+      # optional density target (for diagnostics; may be used later for delta_t)
+      dens_target = 0.05,
+
+      # clustering bounds
+      K_min = 2L,
+      K_max = 8L
     ),
+
+    # ---- signals (architecture §7) ----
     signals = list(
       mom_horizons = c(21L, 63L, 126L, 252L),
       mom_scale = 2.0,
-      kalman = list(q_var = 1e-5, r_var = 1e-3),
+      kalman = list(
+        q_var = 1e-5,
+        r_var = 1e-3
+      ),
       factor_horizons = c(21L, 63L),
       scalarization = list(
         enabled = TRUE,
         lambda_omega = 0.95,
         ridge_lambda = 0.05,
-        # trimmed change: scalarization target horizon for omega update
-        # (architecture suggests matured H; operationally we use 1-day ahead for stability)
+        # architecture suggests matured H; operational trim allowed but must stay causal
         omega_target_horizon = 1L
       )
     ),
+
+    # ---- forecast (architecture §12) ----
     forecast = list(
       H = 21L,
       n_components = 5L,
@@ -181,30 +253,41 @@ came_spec_default <- function() {
       kappa_min = 0.7,
       kappa_max = 1.3,
       lambda_err = 0.97,
-      history_keep = 300L
+      history_keep = 300L,
+
+      # strict cold-start policy: "error" or "skip"
+      # "skip" must be handled explicitly by runner (not silently)
+      cold_start_policy = "error"
     ),
+
+    # ---- gating (architecture §12.4) ----
     gating = list(
-      # A_pi: C x d_m, b_pi: C
       A_pi = matrix(0, nrow = 5, ncol = d_m),
       b_pi = rep(0, 5),
       temperature = 1.0
     ),
+
+    # ---- reliability (architecture §12.8) ----
     reliability = list(
-      # deterministic initial coefficients (can be learned later)
-      # rho_rel = sigmoid(a0 + a1*liq_z - a2*illiq_z + a3*node_stab - a4*eto - a5*chi)
+      # rho_rel = sigmoid(a0 + a1*liq_z + a2*illiq_z + a3*node_stab + a4*eto + a5*chi)
+      # (signs are up to calibration; keep deterministic initial)
       a = c(intercept = 0.5, liq_z = 0.6, illiq_z = -0.7, node_stab = 0.5, eto = -0.5, chi = -0.3),
       eps = 1e-6
     ),
+
+    # ---- optimizer controls (architecture §13) + core QP (architecture §14) ----
     optimizer = list(
       max_weight_base = 0.15,
       max_weight_min = 0.01,
-      turnover_cost_base = 5.0,    # linear cost coefficient
+      turnover_cost_base = 5.0,
       turnover_cost_illiq_scale = 2.0,
       gamma_base = 1.0,
-      # state maps (trimmed initial)
       gamma_vov_scale = 1.0,
       tau_disp_scale = 0.5,
-      gross_base = 0.95
+      gross_base = 0.95,
+
+      # post-shaping (architecture §14.3)
+      drop_thr = 1e-6
     ),
     meta = list(
       strict = TRUE,
@@ -214,49 +297,116 @@ came_spec_default <- function() {
 }
 
 came_spec_validate <- function(spec) {
-  req <- c("data","risk","structure","signals","forecast","gating","optimizer","meta","reliability")
+  req <- c("data", "risk", "structure", "signals", "forecast", "gating", "optimizer", "meta", "reliability")
   miss <- setdiff(req, names(spec))
-  came_assert(length(miss) == 0, "spec_missing_sections",
-              paste("Missing sections:", paste(miss, collapse=", ")))
+  came_assert(
+    length(miss) == 0, "spec_missing_sections",
+    paste("Missing sections:", paste(miss, collapse = ", "))
+  )
 
+  # gating dims
   came_assert(is.matrix(spec$gating$A_pi), "spec_gating_A_pi", "gating$A_pi must be a matrix")
-  came_assert(length(spec$gating$b_pi) == nrow(spec$gating$A_pi), "spec_gating_b_pi",
-              "gating$b_pi length must match nrow(A_pi)")
-  came_assert(nrow(spec$gating$A_pi) == spec$forecast$n_components, "spec_components",
-              "n_components must match gating matrix rows")
+  came_assert(
+    length(spec$gating$b_pi) == nrow(spec$gating$A_pi), "spec_gating_b_pi",
+    "gating$b_pi length must match nrow(A_pi)"
+  )
+  came_assert(
+    nrow(spec$gating$A_pi) == as.integer(spec$forecast$n_components), "spec_components",
+    "forecast$n_components must match gating$A_pi rows"
+  )
+
+  # basic numeric ranges
+  for (nm in c("lambda_sigma", "lambda_f", "lambda_e", "vov_lambda")) {
+    v <- spec$risk[[nm]]
+    came_assert(
+      is.numeric(v) && length(v) == 1 && is.finite(v) && v > 0 && v < 1,
+      paste0("spec_risk_", nm), paste0("risk$", nm, " must be in (0,1)")
+    )
+  }
+  came_assert(
+    is.numeric(spec$risk$glasso_lambda) && is.finite(spec$risk$glasso_lambda) && spec$risk$glasso_lambda >= 0,
+    "spec_risk_glasso_lambda", "risk$glasso_lambda must be >= 0"
+  )
+  came_assert(
+    is.numeric(spec$risk$psd_eps) && is.finite(spec$risk$psd_eps) && spec$risk$psd_eps > 0,
+    "spec_risk_psd_eps", "risk$psd_eps must be > 0"
+  )
+
+  # structure theta_alpha
+  ta <- spec$structure$theta_alpha
+  came_assert(is.numeric(ta) && length(ta) >= 4, "spec_theta_alpha", "structure$theta_alpha must be numeric length>=4")
+  came_assert(
+    all(c("intercept", "edge_stab", "chi", "xi") %in% names(ta)),
+    "spec_theta_alpha_names", "structure$theta_alpha must have names: intercept, edge_stab, chi, xi"
+  )
+
+  # forecast cold start policy
+  csp <- spec$forecast$cold_start_policy %||% "error"
+  came_assert(
+    csp %in% c("error", "skip"), "spec_cold_start_policy",
+    "forecast$cold_start_policy must be 'error' or 'skip'"
+  )
 
   invisible(spec)
 }
 
+# ---- state validation (shape/type checks only; values may be NULL on cold start) ----
+
 came_state_validate <- function(state) {
-  if (is.null(state)) return(invisible(NULL))
+  if (is.null(state)) {
+    return(invisible(NULL))
+  }
   came_assert(is.list(state), "state_type", "state must be a list or NULL")
 
   if (!is.null(state$prev_target)) {
     pt <- state$prev_target
-    came_assert(is.data.frame(pt) && all(c("symbol","weight_target") %in% names(pt)),
-                "state_prev_target", "prev_target must be data.frame(symbol, weight_target)")
+    came_assert(
+      is.data.frame(pt) && all(c("symbol", "weight_target") %in% names(pt)),
+      "state_prev_target", "prev_target must be data.frame(symbol, weight_target)"
+    )
   }
 
-  # key recursive fields (optional)
+  # risk
   if (!is.null(state$risk$sigma2)) came_assert(is.numeric(state$risk$sigma2), "state_sigma2", "risk$sigma2 must be numeric")
+  if (!is.null(state$risk$sigma2_hist)) came_assert(is.matrix(state$risk$sigma2_hist), "state_sigma2_hist", "risk$sigma2_hist must be matrix")
   if (!is.null(state$risk$Sigma_f)) came_assert(is.matrix(state$risk$Sigma_f), "state_Sigma_f", "risk$Sigma_f must be matrix")
   if (!is.null(state$risk$S_e)) came_assert(is.matrix(state$risk$S_e), "state_S_e", "risk$S_e must be matrix")
   if (!is.null(state$risk$B_prev)) came_assert(is.matrix(state$risk$B_prev), "state_B_prev", "risk$B_prev must be matrix")
+  if (!is.null(state$risk$bar_sigma_prev)) {
+    came_assert(
+      is.numeric(state$risk$bar_sigma_prev) && length(state$risk$bar_sigma_prev) == 1L,
+      "state_bar_sigma_prev", "risk$bar_sigma_prev must be scalar numeric"
+    )
+  }
+  if (!is.null(state$risk$vov2)) {
+    came_assert(
+      is.numeric(state$risk$vov2) && length(state$risk$vov2) == 1L,
+      "state_vov2", "risk$vov2 must be scalar numeric"
+    )
+  }
 
+  # structure
   if (!is.null(state$structure$P_bar)) came_assert(is.matrix(state$structure$P_bar), "state_P_bar", "structure$P_bar must be matrix")
   if (!is.null(state$structure$M_prev)) came_assert(is.matrix(state$structure$M_prev), "state_M_prev", "structure$M_prev must be matrix")
   if (!is.null(state$structure$edge_stab)) came_assert(is.matrix(state$structure$edge_stab), "state_edge_stab", "structure$edge_stab must be matrix")
-  if (!is.null(state$structure$labels)) came_assert(is.integer(state$structure$labels) || is.numeric(state$structure$labels),
-                                                    "state_labels", "structure$labels must be integer-like")
+  if (!is.null(state$structure$node_stab)) came_assert(is.numeric(state$structure$node_stab), "state_node_stab", "structure$node_stab must be numeric")
+  if (!is.null(state$structure$labels)) {
+    came_assert(
+      is.integer(state$structure$labels) || is.numeric(state$structure$labels),
+      "state_labels", "structure$labels must be integer-like"
+    )
+  }
 
+  # signals
   if (!is.null(state$signals$kalman)) came_assert(is.list(state$signals$kalman), "state_kalman", "signals$kalman must be list")
   if (!is.null(state$signals$omega)) came_assert(is.list(state$signals$omega), "state_omega", "signals$omega must be list")
 
+  # forecast
   if (!is.null(state$forecast$models)) came_assert(is.list(state$forecast$models), "state_models", "forecast$models must be list")
   if (!is.null(state$forecast$error_buckets)) came_assert(is.list(state$forecast$error_buckets), "state_err", "forecast$error_buckets must be list")
   if (!is.null(state$forecast$hist)) came_assert(is.list(state$forecast$hist), "state_fhist", "forecast$hist must be list")
 
+  # history
   if (!is.null(state$history)) {
     h <- state$history
     came_assert(is.list(h$snapshots), "state_hist_snapshots", "history$snapshots must be list")
@@ -265,20 +415,42 @@ came_state_validate <- function(state) {
   invisible(state)
 }
 
+# ---- snapshot contract (core invariants) ----
+
 came_snapshot_validate <- function(x) {
-  req <- c("as_of_date","universe","weights","cash_weight","risk","structure","signals","features","forecast","optimizer","meta","state_out")
+  req <- c(
+    "as_of_date", "universe", "a_t", "m_t",
+    "weights", "cash_weight",
+    "risk", "structure", "signals",
+    "features", "forecast", "optimizer",
+    "meta", "state_out"
+  )
   miss <- setdiff(req, names(x))
-  came_assert(length(miss) == 0, "snapshot_missing", paste("Missing fields:", paste(miss, collapse=", ")))
+  came_assert(length(miss) == 0, "snapshot_missing", paste("Missing fields:", paste(miss, collapse = ", ")))
 
+  # weights budget
   wdf <- x$weights
-  came_assert(is.data.frame(wdf) && all(c("symbol","weight_target") %in% names(wdf)),
-              "snapshot_weights", "weights must be data.frame(symbol, weight_target)")
-
+  came_assert(
+    is.data.frame(wdf) && all(c("symbol", "weight_target") %in% names(wdf)),
+    "snapshot_weights", "weights must be data.frame(symbol, weight_target)"
+  )
   tot <- sum(wdf$weight_target, na.rm = TRUE) + x$cash_weight
   came_assert(is.finite(tot) && abs(tot - 1.0) <= 1e-6, "snapshot_budget", "weights must sum to 1")
 
+  # covariance invariants
   Sigma <- x$risk$Sigma_H
   came_assert_square_named_matrix(Sigma, "snapshot_sigma", "risk$Sigma_H must be named square covariance")
+  came_assert(max(abs(Sigma - t(Sigma))) < 1e-6, "snapshot_sigma_sym", "risk$Sigma_H must be symmetric")
+
+  # graph invariants
+  M <- x$structure$M
+  came_assert(is.matrix(M), "snapshot_M_type", "structure$M must be a matrix")
+  came_assert(max(abs(M - t(M))) == 0, "snapshot_M_sym", "structure$M must be symmetric")
+  came_assert(all(diag(M) == 0), "snapshot_M_diag", "structure$M diagonal must be zero")
+
+  # gating weights
+  pi <- x$forecast$pi
+  came_assert(is.numeric(pi) && is.finite(sum(pi)) && abs(sum(pi) - 1.0) < 1e-6, "snapshot_pi", "forecast$pi must sum to 1")
 
   invisible(x)
 }
@@ -288,7 +460,7 @@ came_snapshot_validate <- function(x) {
 ###############################################################################
 ### FILE: R/02_state.R
 ###############################################################################
-# 02_state.R — universe mapping Π_t and state initialization
+# 02_state.R — universe mapping Π_t, recursive state schema, VoV recursion
 
 came_pi_vector <- function(v, new_univ, init_val = 0) {
   out <- setNames(rep(init_val, length(new_univ)), new_univ)
@@ -313,6 +485,20 @@ came_pi_matrix <- function(M, new_univ, init_diag = 1e-4) {
   came_symmetrize(out)
 }
 
+came_pi_mask <- function(M_prev, new_univ) {
+  p <- length(new_univ)
+  out <- matrix(FALSE, p, p, dimnames = list(new_univ, new_univ))
+  if (!is.null(M_prev) && is.matrix(M_prev)) {
+    rn <- rownames(M_prev) %||% colnames(M_prev)
+    if (!is.null(rn)) {
+      common <- intersect(rn, new_univ)
+      if (length(common) > 0) out[common, common] <- (M_prev[common, common, drop = FALSE] != 0)
+    }
+  }
+  diag(out) <- FALSE
+  out
+}
+
 came_pi_list <- function(lst, new_univ, init_fn = function() NULL) {
   out <- setNames(vector("list", length(new_univ)), new_univ)
   if (is.null(lst) || !is.list(lst)) {
@@ -325,20 +511,86 @@ came_pi_list <- function(lst, new_univ, init_fn = function() NULL) {
   out
 }
 
+# Canonical recursive state schema aligned to architecture §4.1
 came_state_init <- function() {
   list(
-    risk = list(sigma2 = NULL, Sigma_f = NULL, S_e = NULL, B_prev = NULL),
-    structure = list(P_bar = NULL, M_prev = NULL, edge_stab = NULL, labels = NULL),
-    signals = list(kalman = NULL, omega = NULL),
-    forecast = list(models = NULL, error_buckets = NULL, hist = NULL, step = 0L),
-    history = list(schema = "came_history_v1", snapshots = list()),
+    risk = list(
+      sigma2 = NULL,
+      sigma2_hist = NULL,
+      Sigma_f = NULL,
+      S_e = NULL,
+      B_prev = NULL,
+      bar_sigma_prev = NULL,
+      vov2 = NULL
+    ),
+    structure = list(
+      P_bar = NULL,
+      M_prev = NULL,
+      edge_stab = NULL,
+      node_stab = NULL,
+      labels = NULL
+    ),
+    signals = list(
+      kalman = NULL,
+      omega = NULL
+    ),
+    forecast = list(
+      models = NULL,
+      error_buckets = NULL,
+      hist = NULL,
+      step = 0L
+    ),
+    history = list(
+      schema = "came_history_v1",
+      snapshots = list()
+    ),
     prev_target = NULL
   )
 }
 
+# Apply Π_t to state objects that are universe-indexed.
+# Call this once at the beginning of a snapshot run (before any updates).
+came_state_pi <- function(state, new_univ) {
+  st <- state %||% came_state_init()
+
+  # risk sigma2
+  if (!is.null(st$risk$sigma2)) {
+    init <- stats::median(st$risk$sigma2[is.finite(st$risk$sigma2) & st$risk$sigma2 > 0], na.rm = TRUE)
+    if (!is.finite(init) || init <= 0) init <- 1e-4
+    st$risk$sigma2 <- came_pi_vector(st$risk$sigma2, new_univ, init_val = init)
+  }
+
+  # S_e
+  if (!is.null(st$risk$S_e)) {
+    initd <- stats::median(diag(st$risk$S_e), na.rm = TRUE)
+    if (!is.finite(initd) || initd <= 0) initd <- 1e-4
+    st$risk$S_e <- came_pi_matrix(st$risk$S_e, new_univ, init_diag = initd)
+  }
+
+  # structure P_bar and M_prev and edge stability
+  if (!is.null(st$structure$P_bar)) st$structure$P_bar <- came_pi_matrix(st$structure$P_bar, new_univ, init_diag = 0)
+  if (!is.null(st$structure$M_prev)) st$structure$M_prev <- came_pi_mask(st$structure$M_prev, new_univ)
+  if (!is.null(st$structure$edge_stab)) st$structure$edge_stab <- came_pi_matrix(st$structure$edge_stab, new_univ, init_diag = 0.5)
+
+  # node stability vector
+  if (!is.null(st$structure$node_stab)) {
+    st$structure$node_stab <- came_pi_vector(st$structure$node_stab, new_univ, init_val = 1.0)
+  }
+
+  # signals: Kalman list is per-asset
+  if (!is.null(st$signals$kalman)) {
+    st$signals$kalman <- came_pi_list(st$signals$kalman, new_univ, init_fn = function() NULL)
+  }
+
+  st
+}
+
 came_history_append <- function(state, as_of_date, X, keep = 300L) {
   st <- state
-  if (is.null(st$history) || !is.list(st$history$snapshots)) st$history <- list(schema="came_history_v1", snapshots=list())
+  if (is.null(st$history) || !is.list(st$history$snapshots)) {
+    st$history <- list(schema = "came_history_v1", snapshots = list())
+  }
+
   snaps <- st$history$snapshots
   snaps[[length(snaps) + 1L]] <- list(date = as.Date(as_of_date), X = X)
 
@@ -349,18 +601,49 @@ came_history_append <- function(state, as_of_date, X, keep = 300L) {
     snaps <- snaps[keep_idx]
   }
   if (length(snaps) > keep) snaps <- tail(snaps, keep)
+
   st$history$snapshots <- snaps
   st
 }
 
 came_extract_prev_weights <- function(prev_target_df) {
-  if (is.null(prev_target_df)) return(NULL)
-  if (is.data.frame(prev_target_df) && all(c("symbol","weight_target") %in% names(prev_target_df))) {
+  if (is.null(prev_target_df)) {
+    return(NULL)
+  }
+  if (is.data.frame(prev_target_df) && all(c("symbol", "weight_target") %in% names(prev_target_df))) {
     w <- setNames(prev_target_df$weight_target, prev_target_df$symbol)
     w[!is.finite(w)] <- 0
     return(w)
   }
   NULL
+}
+
+# VoV recursion (architecture §11.5.3)
+came_update_vov <- function(state, sigma2_t, lambda_vov = 0.97) {
+  st <- state
+  sigma <- sqrt(as.numeric(sigma2_t))
+  sigma <- sigma[is.finite(sigma) & sigma > 0]
+  bar_sigma <- if (length(sigma) > 0) stats::median(sigma) else 1e-4
+
+  prev_bar <- st$risk$bar_sigma_prev %||% bar_sigma
+  if (!is.finite(prev_bar) || prev_bar <= 0) prev_bar <- bar_sigma
+
+  dlog <- log(bar_sigma) - log(prev_bar)
+  if (!is.finite(dlog)) dlog <- 0
+
+  vov2_prev <- st$risk$vov2 %||% 0
+  if (!is.finite(vov2_prev) || vov2_prev < 0) vov2_prev <- 0
+
+  lam <- lambda_vov
+  if (!is.finite(lam) || lam <= 0 || lam >= 1) lam <- 0.97
+
+  vov2 <- lam * vov2_prev + (1 - lam) * (dlog^2)
+  if (!is.finite(vov2) || vov2 < 0) vov2 <- 0
+
+  st$risk$bar_sigma_prev <- bar_sigma
+  st$risk$vov2 <- vov2
+
+  list(state = st, VoV = sqrt(vov2))
 }
 
 
@@ -481,184 +764,297 @@ came_make_data_adapter <- function(data_bundle_or_panel) {
 ###############################################################################
 ### FILE: R/04_risk_engine.R
 ###############################################################################
-# 04_risk_engine.R — architecture-aligned risk recursion (EWMA vol, PCA align, EWMA cov, Glasso)
+# 04_risk_engine.R — Risk engine (architecture §5)
+# Outputs: Sigma^(1), Sigma^(H), Theta (Glasso precision), PCA loadings/factors, EWMA vol state.
+# Key invariant: residual precision uses Glasso only.
 
-.came_risk_build_sigma2_series <- function(R, sigma2_start, lambda_sigma) {
-  # Reconstruct daily sigma2 over the window given starting variance (vector) and realized returns.
-  # Returns list(sigma2_T = last, D_series = T x p daily sigma, sigma2_series = T x p)
-  Tn <- nrow(R); p <- ncol(R)
+# ---- internal: build/extend sigma2 history over a dated return window ----
+.came_risk_build_sigma2_hist <- function(R, sigma2_prev, sigma2_hist_prev, lambda_sigma) {
+  came_assert(is.matrix(R) && nrow(R) >= 2, "risk_sigma2_hist_R", "R must be matrix with >=2 rows")
   syms <- colnames(R)
-  sigma2 <- sigma2_start[syms]
-  sigma2[!is.finite(sigma2) | sigma2 <= 0] <- 1e-4
+  Tn <- nrow(R)
 
-  sigma2_series <- matrix(NA_real_, Tn, p, dimnames = list(rownames(R), syms))
-  D_series <- matrix(NA_real_, Tn, p, dimnames = list(rownames(R), syms))
+  # dates must exist and be Date-coercible
+  if (is.null(rownames(R))) came_stop("risk_dates_missing", "R must have rownames as Date strings")
+  dR <- as.Date(rownames(R))
+  came_assert(!any(is.na(dR)), "risk_dates_invalid", "R rownames must be Date-coercible strings")
 
-  for (t in seq_len(Tn)) {
-    r_t <- R[t, ]
-    r_t[!is.finite(r_t)] <- 0
-    sigma2 <- lambda_sigma * sigma2 + (1 - lambda_sigma) * (r_t^2)
-    sigma2[!is.finite(sigma2) | sigma2 <= 0] <- 1e-4
-    sigma2_series[t, ] <- sigma2
-    D_series[t, ] <- sqrt(sigma2)
+  lam <- lambda_sigma
+  if (!is.finite(lam) || lam <= 0 || lam >= 1) came_stop("risk_lambda_sigma", "lambda_sigma must be in (0,1)")
+
+  # align sigma2_prev to current universe (for correct sigma2_t update)
+  if (is.null(sigma2_prev) || length(sigma2_prev) == 0) {
+    init <- apply(R[seq_len(min(21, Tn)), , drop = FALSE], 2, function(x) {
+      v <- stats::var(x, na.rm = TRUE)
+      if (!is.finite(v) || v <= 0) 1e-4 else v
+    })
+    sigma2_prev_aligned <- setNames(as.numeric(init), syms)
+  } else {
+    init_val <- stats::median(sigma2_prev[is.finite(sigma2_prev) & sigma2_prev > 0], na.rm = TRUE)
+    if (!is.finite(init_val) || init_val <= 0) init_val <- 1e-4
+    sigma2_prev_aligned <- came_pi_vector(sigma2_prev, syms, init_val = init_val)
+  }
+  sigma2_prev_aligned[!is.finite(sigma2_prev_aligned) | sigma2_prev_aligned <= 0] <- 1e-4
+
+  # canonical one-step update for *current* day (t = last row of R)
+  r_last <- as.numeric(R[Tn, ])
+  r_last[!is.finite(r_last)] <- 0
+  sigma2_t <- lam * sigma2_prev_aligned + (1 - lam) * (r_last^2)
+  sigma2_t[!is.finite(sigma2_t) | sigma2_t <= 0] <- 1e-4
+  names(sigma2_t) <- syms
+
+  # attempt safe extension from sigma2_hist_prev if it contains all dates up to t-1
+  can_extend <- FALSE
+  if (!is.null(sigma2_hist_prev) && is.matrix(sigma2_hist_prev) && !is.null(rownames(sigma2_hist_prev))) {
+    dPrev <- as.Date(rownames(sigma2_hist_prev))
+    if (!any(is.na(dPrev))) {
+      want_dates <- as.character(dR[seq_len(Tn - 1)])
+      have_dates <- as.character(dPrev)
+      can_extend <- all(want_dates %in% have_dates)
+    }
   }
 
-  list(sigma2_T = sigma2, D_series = D_series, sigma2_series = sigma2_series)
+  if (can_extend) {
+    # take prior history for window up to t-1, align columns, then append t
+    Hprev <- sigma2_hist_prev[as.character(dR[seq_len(Tn - 1)]), , drop = FALSE]
+    H <- matrix(NA_real_, Tn, length(syms), dimnames = list(as.character(dR), syms))
+
+    common <- intersect(colnames(Hprev), syms)
+    if (length(common) > 0) H[seq_len(Tn - 1), common] <- Hprev[, common, drop = FALSE]
+
+    # initialize any missing columns on those dates with sigma2_prev_aligned (prior)
+    for (nm in syms) {
+      if (all(is.na(H[seq_len(Tn - 1), nm]))) H[seq_len(Tn - 1), nm] <- sigma2_prev_aligned[nm]
+    }
+
+    # last row: enforce canonical sigma2_t (state-consistent)
+    H[Tn, ] <- sigma2_t
+  } else {
+    # cold start rebuild over the window (legitimate prior for missing latent sigma2_{t-L})
+    H <- matrix(NA_real_, Tn, length(syms), dimnames = list(as.character(dR), syms))
+
+    sigma2 <- apply(R[seq_len(min(21, Tn)), , drop = FALSE], 2, function(x) {
+      v <- stats::var(x, na.rm = TRUE)
+      if (!is.finite(v) || v <= 0) 1e-4 else v
+    })
+    sigma2 <- setNames(as.numeric(sigma2), syms)
+
+    for (t in seq_len(Tn)) {
+      rt <- as.numeric(R[t, ])
+      rt[!is.finite(rt)] <- 0
+      sigma2 <- lam * sigma2 + (1 - lam) * (rt^2)
+      sigma2[!is.finite(sigma2) | sigma2 <= 0] <- 1e-4
+      H[t, ] <- sigma2
+    }
+
+    # enforce canonical sigma2_t on last row (state-consistent)
+    H[Tn, ] <- sigma2_t
+  }
+
+  list(sigma2_hist = H, sigma2_t = sigma2_t)
 }
 
+# ---- PCA via SVD on centered standardized returns ----
 .came_pca_svd <- function(R_std, k) {
-  n <- ncol(R_std); Tn <- nrow(R_std)
-  came_assert(n >= 3 && Tn >= 10, "risk_pca_min", "PCA requires >=3 assets and >=10 obs")
+  n <- ncol(R_std)
+  Tn <- nrow(R_std)
+  came_assert(n >= 3 && Tn >= 10, "risk_pca_min", "PCA requires >=3 assets and >=10 observations")
+
   k <- min(as.integer(k), n - 1L, Tn - 1L)
+  came_assert(k >= 1, "risk_pca_k", "k must be >= 1 after bounding")
+
   centers <- colMeans(R_std, na.rm = TRUE)
   X <- scale(R_std, center = centers, scale = FALSE)
   X[!is.finite(X)] <- 0
+
   sv <- svd(X, nu = k, nv = k)
   B_raw <- sv$v[, 1:k, drop = FALSE]
   rownames(B_raw) <- colnames(R_std)
   colnames(B_raw) <- paste0("PC", seq_len(k))
+
   F_raw <- X %*% B_raw
   colnames(F_raw) <- colnames(B_raw)
-  list(B_raw = B_raw, F_raw = F_raw, centers = centers, d = sv$d[1:k], k = k)
+
+  list(B_raw = B_raw, F_raw = F_raw, centers = centers, k = k)
 }
 
+# ---- PCA factor identity alignment (architecture §5.3) ----
 .came_align_factors <- function(B_raw, F_raw, B_prev) {
-  # exact assignment via clue::solve_LSAP on cost = -abs(C)
   came_require("clue")
+
   k <- ncol(B_raw)
   if (is.null(B_prev) || !is.matrix(B_prev) || ncol(B_prev) != k) {
     return(list(B = B_raw, F = F_raw, R = diag(k), used = FALSE))
   }
+
   common <- intersect(rownames(B_prev), rownames(B_raw))
   if (length(common) < max(5L, k)) {
     return(list(B = B_raw, F = F_raw, R = diag(k), used = FALSE))
   }
-  C <- t(B_prev[common, , drop = FALSE]) %*% B_raw[common, , drop = FALSE]
+
+  C <- t(B_prev[common, , drop = FALSE]) %*% B_raw[common, , drop = FALSE] # k x k
   cost <- -abs(C)
-  perm <- as.integer(clue::solve_LSAP(cost))  # assignment of rows to columns
-  # perm[j] = assigned row for column j
+
+  perm <- as.integer(clue::solve_LSAP(cost))
   signs <- rep(1, k)
   for (j in seq_len(k)) {
     v <- C[perm[j], j]
-    s <- sign(v); if (!is.finite(s) || s == 0) s <- 1
+    s <- sign(v)
+    if (!is.finite(s) || s == 0) s <- 1
     signs[j] <- s
   }
+
   R <- matrix(0, k, k)
   for (j in seq_len(k)) R[perm[j], j] <- signs[j]
+
   B <- B_raw %*% R
   F <- F_raw %*% R
   colnames(B) <- colnames(B_raw)
   colnames(F) <- colnames(B_raw)
+
   list(B = B, F = F, R = R, used = TRUE)
 }
 
+# ---- main risk update ----
 came_risk_update <- function(R_window, state, spec) {
-  came_require(c("glasso","Matrix"))
-  came_assert(is.matrix(R_window) && nrow(R_window) >= 10 && ncol(R_window) >= 3,
-              "risk_R_window", "R_window must be matrix with >=10 obs and >=3 assets")
+  came_require(c("glasso", "Matrix", "clue"))
+
+  came_assert(
+    is.matrix(R_window) && nrow(R_window) >= 10 && ncol(R_window) >= 3,
+    "risk_R_window", "R_window must be matrix with >=10 obs and >=3 assets"
+  )
+  came_assert(!is.null(colnames(R_window)), "risk_colnames", "R_window must have colnames (symbols)")
+  came_assert(!is.null(rownames(R_window)), "risk_rownames", "R_window must have rownames (Date strings)")
 
   syms <- colnames(R_window)
-  L <- spec$risk$lookback %||% nrow(R_window)
+  L <- as.integer(spec$risk$lookback %||% nrow(R_window))
   R <- tail(R_window, min(nrow(R_window), L))
-  # Ensure rownames are dates (for alignment in training later)
-  if (is.null(rownames(R))) rownames(R) <- paste0("t", seq_len(nrow(R)))
 
-  sigma2_prev <- state$risk$sigma2
-  if (is.null(sigma2_prev) || length(sigma2_prev) == 0) {
-    # initialize from sample variance of first 21 days
-    init <- apply(R, 2, function(x) {
-      v <- var(x[seq_len(min(21, length(x)))], na.rm = TRUE)
-      if (!is.finite(v) || v <= 0) 1e-4 else v
-    })
-    sigma2_prev <- setNames(init, syms)
-  } else {
-    sigma2_prev <- came_pi_vector(sigma2_prev, syms, init_val = median(sigma2_prev[sigma2_prev > 0], na.rm = TRUE))
-  }
+  # --- EWMA volatility state (architecture §5.1) ---
+  lambda_sigma <- spec$risk$lambda_sigma
+  sig_hist <- .came_risk_build_sigma2_hist(
+    R = R,
+    sigma2_prev = state$risk$sigma2,
+    sigma2_hist_prev = state$risk$sigma2_hist,
+    lambda_sigma = lambda_sigma
+  )
 
-  lambda_sigma <- spec$risk$lambda_sigma %||% 0.94
-  sig_series <- .came_risk_build_sigma2_series(R, sigma2_prev, lambda_sigma)
-  sigma2_t <- sig_series$sigma2_T
-  D_series <- sig_series$D_series
-  D_t <- D_series[nrow(D_series), ]
-  D_t[D_t <= 0 | !is.finite(D_t)] <- 1e-4
+  sigma2_hist <- sig_hist$sigma2_hist
+  sigma2_t <- sig_hist$sigma2_t
 
-  # standardized window
+  D_series <- sqrt(pmax(sigma2_hist, 1e-12)) # T x p
+  D_t <- D_series[nrow(D_series), ] # p
+  D_t[!is.finite(D_t) | D_t <= 0] <- 1e-4
+
+  # standardized returns window: r_tilde = D^{-1} r (architecture §5.1)
   R_std <- R
-  for (j in seq_len(ncol(R_std))) R_std[, j] <- R_std[, j] / D_series[, j]
+  for (j in seq_len(ncol(R_std))) {
+    R_std[, j] <- R_std[, j] / D_series[, j]
+  }
   R_std[!is.finite(R_std)] <- 0
 
-  # PCA
+  # --- PCA systematic layer (architecture §5.2) ---
   pca <- .came_pca_svd(R_std, spec$risk$k %||% 5L)
   B_raw <- pca$B_raw
   F_raw <- pca$F_raw
+  centers <- pca$centers
 
   align_used <- FALSE
   if (isTRUE(spec$risk$align_factors %||% TRUE)) {
     al <- .came_align_factors(B_raw, F_raw, state$risk$B_prev)
-    B <- al$B; F <- al$F; align_used <- al$used
+    B <- al$B
+    F <- al$F
+    align_used <- al$used
   } else {
-    B <- B_raw; F <- F_raw
+    B <- B_raw
+    F <- F_raw
   }
 
-  # factor covariance recursion
   k <- ncol(B)
+  came_assert(k >= 1, "risk_k", "k must be >= 1")
+
+  # --- factor covariance recursion (architecture §5.4) ---
   f_t <- as.numeric(F[nrow(F), ])
   f_t[!is.finite(f_t)] <- 0
+
   Sigma_f_prev <- state$risk$Sigma_f
-  if (is.null(Sigma_f_prev) || !is.matrix(Sigma_f_prev) || nrow(Sigma_f_prev) != k) {
+  if (is.null(Sigma_f_prev) || !is.matrix(Sigma_f_prev) || nrow(Sigma_f_prev) != k || ncol(Sigma_f_prev) != k) {
     Sigma_f_prev <- diag(1, k)
   }
-  lambda_f <- spec$risk$lambda_f %||% 0.97
+  lambda_f <- spec$risk$lambda_f
   Sigma_f <- lambda_f * Sigma_f_prev + (1 - lambda_f) * (f_t %*% t(f_t))
   Sigma_f <- came_symmetrize(Sigma_f)
 
-  # standardized residuals e_t = r_std - B f_t (per-day residual series)
-  Sys <- F %*% t(B)
-  E_std <- (scale(R_std, center = pca$centers, scale = FALSE) %>% {.[!is.finite(.)] <- 0; .}) - Sys
+  # --- residuals (architecture §5.5): e_t = r_tilde_centered - B f_t ---
+  Xc <- scale(R_std, center = centers, scale = FALSE)
+  Xc[!is.finite(Xc)] <- 0
+  Sys <- F %*% t(B) # T x p reconstruction in centered space
+  E_std <- Xc - Sys # T x p residuals in centered standardized space
   dimnames(E_std) <- dimnames(R_std)
+
   e_t <- as.numeric(E_std[nrow(E_std), ])
+  e_t[!is.finite(e_t)] <- 0
   names(e_t) <- syms
 
-  # residual target recursion S_e (standardized)
+  # --- residual target recursion S_e and Glasso precision Theta (architecture §5.5) ---
   S_e_prev <- state$risk$S_e
   if (is.null(S_e_prev) || !is.matrix(S_e_prev)) {
     S_e_prev <- diag(1e-4, length(syms))
     dimnames(S_e_prev) <- list(syms, syms)
   } else {
-    S_e_prev <- came_pi_matrix(S_e_prev, syms, init_diag = median(diag(S_e_prev), na.rm = TRUE))
+    initd <- stats::median(diag(S_e_prev), na.rm = TRUE)
+    if (!is.finite(initd) || initd <= 0) initd <- 1e-4
+    S_e_prev <- came_pi_matrix(S_e_prev, syms, init_diag = initd)
   }
-  lambda_e <- spec$risk$lambda_e %||% 0.97
+
+  lambda_e <- spec$risk$lambda_e
   ee <- e_t %*% t(e_t)
   dimnames(ee) <- list(syms, syms)
+
   S_e <- lambda_e * S_e_prev + (1 - lambda_e) * ee
   S_e <- came_symmetrize(S_e)
   diag(S_e) <- pmax(diag(S_e), 1e-10)
 
-  # Glasso precision Θ on S_e (Glasso-only; numeric stabilization allowed)
-  lam <- spec$risk$glasso_lambda %||% 0.10
+  lam_gl <- spec$risk$glasso_lambda %||% 0.10
+  psd_eps <- spec$risk$psd_eps %||% 1e-8
+
   S_in <- came_symmetrize(S_e)
-  diag(S_in) <- diag(S_in) + spec$risk$psd_eps %||% 1e-8
-  gl <- tryCatch(glasso::glasso(S_in, rho = lam, penalize.diagonal = FALSE), error = function(e) e)
-  if (inherits(gl, "error")) stop(came_error("risk_glasso_failed", gl$message))
+  diag(S_in) <- diag(S_in) + psd_eps
+
+  gl <- tryCatch(glasso::glasso(S_in, rho = lam_gl, penalize.diagonal = FALSE), error = function(e) e)
+  if (inherits(gl, "error")) came_stop("risk_glasso_failed", gl$message)
+
   Theta <- gl$wi
   Sigma_e <- gl$w
   dimnames(Theta) <- list(syms, syms)
   dimnames(Sigma_e) <- list(syms, syms)
 
-  # standardized daily covariance Σ̃ = B Σ_f B' + Σ_e
+  # --- recomposition and numerical repair (architecture §5.6) ---
   Sigma_std <- B %*% Sigma_f %*% t(B) + Sigma_e
   Sigma_std <- came_symmetrize(Sigma_std)
 
-  # unstandardize Σ = D Σ̃ D (daily)
   Sigma_1 <- diag(D_t) %*% Sigma_std %*% diag(D_t)
   dimnames(Sigma_1) <- list(syms, syms)
+  Sigma_1 <- came_near_psd(Sigma_1, eps = psd_eps)
 
-  # PSD repair
-  Sigma_1 <- came_near_psd(Sigma_1, eps = spec$risk$psd_eps %||% 1e-8)
-
+  # --- horizon covariance (architecture §5.7 default approximation) ---
   H <- as.integer(spec$forecast$H %||% 1L)
   if (!is.finite(H) || H < 1L) H <- 1L
   Sigma_H <- H * Sigma_1
+
+  # Keep enough series for residual momentum (architecture §7.1)
+  mom_keep <- max(as.integer(spec$signals$mom_horizons %||% 252L))
+  keep_T <- min(nrow(E_std), mom_keep)
+  E_keep <- tail(E_std, keep_T)
+  D_keep <- tail(D_series, keep_T)
+
+  # Update state (store sigma2_hist as rolling window aligned to R dates)
+  st_out <- state
+  st_out$risk$sigma2 <- sigma2_t
+  st_out$risk$sigma2_hist <- sigma2_hist
+  st_out$risk$Sigma_f <- Sigma_f
+  st_out$risk$S_e <- S_e
+  st_out$risk$B_prev <- B
 
   list(
     risk = list(
@@ -666,27 +1062,23 @@ came_risk_update <- function(R_window, state, spec) {
       D_t = D_t,
       B = B,
       F = F,
+      centers = centers,
       Sigma_f = Sigma_f,
       S_e = S_e,
       Theta = Theta,
       Sigma_e = Sigma_e,
       Sigma_1 = Sigma_1,
       Sigma_H = Sigma_H,
-      E_std = if (isTRUE(spec$meta$retain_debug)) E_std else NULL,
-      D_series = if (isTRUE(spec$meta$retain_debug)) D_series else NULL
+      E_std = E_keep,
+      D_series = D_keep
     ),
-    state_out = within(state, {
-      risk$sigma2 <- sigma2_t
-      risk$Sigma_f <- Sigma_f
-      risk$S_e <- S_e
-      risk$B_prev <- B
-    }),
+    state_out = st_out,
     diag = list(
       k = k,
       align_used = align_used,
-      min_eig = min(eigen(Sigma_1, symmetric = TRUE, only.values = TRUE)$values),
-      glasso_lambda = lam,
-      H = H
+      glasso_lambda = lam_gl,
+      H = H,
+      min_eig = min(eigen(Sigma_1, symmetric = TRUE, only.values = TRUE)$values)
     )
   )
 }
@@ -696,8 +1088,11 @@ came_risk_update <- function(R_window, state, spec) {
 ###############################################################################
 ### FILE: R/05_structure_engine.R
 ###############################################################################
-# 05_structure_engine.R — partial corr, adaptive smoothing, mask, operators, clustering
+# 05_structure_engine.R — Structure/graph engine (architecture §6, §9, §10)
+# Input: Theta (Glasso precision)
+# Output: P_t, Pbar_t, M_t, W_abs, W_sgn, operators (A, A_sgn, L, L_norm), clusters, diagnostics, node stability.
 
+# ---- §6.1 partial correlation from precision ----
 .came_partial_corr <- function(Theta) {
   came_assert_square_named_matrix(Theta, "struct_theta", "Theta must be named square precision")
   d <- sqrt(diag(Theta))
@@ -709,10 +1104,15 @@ came_risk_update <- function(R_window, state, spec) {
   P
 }
 
+# ---- §6.2 structural shock chi ----
 .came_structural_shock <- function(P_t, P_prev) {
-  if (is.null(P_prev)) return(0)
+  if (is.null(P_prev)) {
+    return(0)
+  }
   common <- intersect(colnames(P_t), colnames(P_prev))
-  if (length(common) < 2) return(0)
+  if (length(common) < 2) {
+    return(0)
+  }
   D <- P_t[common, common] - P_prev[common, common]
   nf <- sqrt(sum(D^2, na.rm = TRUE))
   denom <- sqrt(length(common) * (length(common) - 1))
@@ -720,6 +1120,7 @@ came_risk_update <- function(R_window, state, spec) {
   if (!is.finite(chi)) 0 else chi
 }
 
+# ---- §6.2 edge stability recursion ----
 .came_edge_stability <- function(edge_prev, P_t, P_bar_prev, univ, lambda_edge) {
   p <- length(univ)
   if (is.null(edge_prev) || is.null(P_bar_prev)) {
@@ -727,156 +1128,300 @@ came_risk_update <- function(R_window, state, spec) {
     diag(out) <- 1
     return(out)
   }
+
   s_prev <- came_pi_matrix(edge_prev, univ, init_diag = 0.5)
   common <- intersect(univ, intersect(colnames(P_t), colnames(P_bar_prev)))
   out <- s_prev
+
   if (length(common) >= 2) {
     sm <- sign(P_t[common, common]) == sign(P_bar_prev[common, common])
     sm[is.na(sm)] <- TRUE
     diag(sm) <- TRUE
     out[common, common] <- lambda_edge * s_prev[common, common] + (1 - lambda_edge) * (sm * 1.0)
   }
+
   diag(out) <- 1
   came_symmetrize(out)
 }
 
+# ---- §6.2 adaptive smoothing gain alpha_ij ----
 .came_alpha_matrix <- function(P_t, P_bar_prev, edge_stab, chi, theta_alpha) {
-  # z = b0 + b1*s_edge + b2*chi + b3*xi, xi = |P_t - P_bar_prev|
   syms <- colnames(P_t)
   xi <- abs(P_t - P_bar_prev)
   xi[!is.finite(xi)] <- 0
-  s <- edge_stab[syms, syms]
+
+  s <- edge_stab[syms, syms, drop = FALSE]
+
   z <- theta_alpha["intercept"] +
     theta_alpha["edge_stab"] * s +
     theta_alpha["chi"] * chi +
     theta_alpha["xi"] * xi
-  A <- 1 / (1 + exp(-z))
+
+  A <- came_sigmoid(z)
   diag(A) <- 1
   A[!is.finite(A)] <- 0.5
   came_symmetrize(A)
 }
 
 .came_smooth_P <- function(P_t, P_bar_prev, alpha_mat) {
-  if (is.null(P_bar_prev)) return(P_t)
+  if (is.null(P_bar_prev)) {
+    return(P_t)
+  }
   syms <- colnames(P_t)
-  P_prev_m <- P_bar_prev[syms, syms, drop=FALSE]
+  P_prev_m <- P_bar_prev[syms, syms, drop = FALSE]
   A <- alpha_mat
   P_bar <- A * P_prev_m + (1 - A) * P_t
   diag(P_bar) <- 0
   came_symmetrize(P_bar)
 }
 
-.came_liquidity_rank <- function(activity_snapshot) {
-  # rank log(1+traded_value) cross-section, returns [0,1]
-  tv <- activity_snapshot$traded_value
-  tv[!is.finite(tv) | tv < 0] <- 0
-  x <- log1p(tv)
-  r <- rank(x, ties.method = "average") / (length(x) + 1)
+# ---- liquidity rank proxy r_liq in [0,1] (architecture §6.3.1) ----
+.came_liquidity_rank <- function(traded_value_vec) {
+  x <- as.numeric(traded_value_vec)
+  names(x) <- names(traded_value_vec)
+  x[!is.finite(x) | x < 0] <- 0
+  lx <- log1p(x)
+  r <- rank(lx, ties.method = "average") / (length(lx) + 1)
+  names(r) <- names(traded_value_vec)
+  r[!is.finite(r)] <- 0.5
   r
 }
 
-.came_mask_build <- function(P_bar, spec, prev_M = NULL, liq_rank = NULL, chi = 0) {
+# ---- diagnostics: density, edge turnover, node stability (architecture §6.6) ----
+.came_graph_density <- function(M) {
+  n <- ncol(M)
+  if (n < 2) {
+    return(0)
+  }
+  sum(M) / (n * (n - 1))
+}
+
+.came_edge_turnover <- function(M, M_prev) {
+  if (is.null(M_prev)) {
+    return(0)
+  }
+  common <- intersect(colnames(M), colnames(M_prev))
+  if (length(common) < 2) {
+    return(0)
+  }
+
+  A <- M[common, common, drop = FALSE]
+  B <- M_prev[common, common, drop = FALSE]
+
+  prev_edges <- sum(B) / 2
+  if (prev_edges <= 0) {
+    return(0)
+  }
+  overlap <- sum(A & B) / 2
+  1 - overlap / prev_edges
+}
+
+.came_node_stability <- function(M, M_prev) {
+  univ <- colnames(M)
+  out <- setNames(rep(1, length(univ)), univ)
+  if (is.null(M_prev)) {
+    return(out)
+  }
+
+  common <- intersect(colnames(M_prev), univ)
+  if (length(common) < 2) {
+    return(out)
+  }
+
+  for (nm in common) {
+    prev_deg <- sum(M_prev[nm, common])
+    if (prev_deg > 0) {
+      changed <- sum(abs(as.numeric(M[nm, common]) - as.numeric(M_prev[nm, common])))
+      out[nm] <- 1 - changed / max(1, prev_deg)
+    } else {
+      out[nm] <- 1
+    }
+  }
+  out[!is.finite(out)] <- 1
+  out
+}
+
+# ---- §6.3/§6.4 mask construction (directed -> union -> post-prune) ----
+.came_mask_build <- function(P_bar, spec, M_prev = NULL, node_stab_prev = NULL, liq_rank = NULL, chi = 0, delta = 0) {
   syms <- colnames(P_bar)
   n <- length(syms)
-  U <- abs(P_bar); diag(U) <- 0
 
-  # per-node k_i and q_on(i)
-  k_min <- as.integer(spec$structure$k_min %||% 2L)
-  k_max <- as.integer(spec$structure$k_max %||% 10L)
+  U <- abs(P_bar)
+  diag(U) <- 0
+  U[!is.finite(U)] <- 0
+
   if (is.null(liq_rank)) liq_rank <- setNames(rep(0.5, n), syms)
   liq_rank <- liq_rank[syms]
   liq_rank[!is.finite(liq_rank)] <- 0.5
 
-  # k_i increases with liquidity, decreases with shock
-  k_i <- k_min + floor((k_max - k_min) * (liq_rank) * exp(-chi))
+  if (is.null(node_stab_prev)) node_stab_prev <- setNames(rep(1.0, n), syms)
+  node_stab_prev <- node_stab_prev[syms]
+  node_stab_prev[!is.finite(node_stab_prev)] <- 1.0
+
+  # --- rowwise activation quantile q_on(i)
+  # Spec currently provides q_on_base + q_on_chi_scale; we also add small deterministic adjustments for delta and liquidity.
+  q_base <- spec$structure$q_on_base %||% 0.90
+  q_chi <- spec$structure$q_on_chi_scale %||% 0.10
+  q_i <- q_base - q_chi * chi + 0.05 * (liq_rank - 0.5) + 0.05 * (-delta)
+  q_i <- pmin(0.995, pmax(0.50, q_i))
+
+  # --- persistence: tau_off = rho_off * tau_on ; here rho_off is constant hysteresis_ratio (allowed special case)
+  rho_off <- spec$structure$hysteresis_ratio %||% 0.7
+  rho_off <- pmin(0.99, pmax(0.10, rho_off))
+
+  # --- adaptive degree target k_i (architecture §6.3.3; operational deterministic special case)
+  k_min <- as.integer(spec$structure$k_min %||% 2L)
+  k_max <- as.integer(spec$structure$k_max %||% 10L)
+  k_i <- k_min + floor((k_max - k_min) * came_sigmoid(2 * (liq_rank - 0.5) + 1.0 * (node_stab_prev - 0.5) - 1.0 * chi))
   k_i <- pmax(k_min, pmin(k_max, k_i))
 
-  q_base <- spec$structure$q_on_base %||% 0.90
-  q_chi_scale <- spec$structure$q_on_chi_scale %||% 0.10
-  q_i <- pmin(0.99, pmax(0.50, q_base - q_chi_scale * chi + 0.05 * (liq_rank - 0.5)))
-
-  hysteresis <- spec$structure$hysteresis_ratio %||% 0.7
-  M_dir <- matrix(FALSE, n, n, dimnames = list(syms, syms))
+  # directed candidate mask
+  Mhat <- matrix(FALSE, n, n, dimnames = list(syms, syms))
 
   for (i in seq_len(n)) {
     s <- U[i, ]
     s[i] <- 0
     vals <- s[is.finite(s)]
     if (length(vals) < 2) next
-    thr_on <- as.numeric(stats::quantile(vals, probs = q_i[i], na.rm = TRUE, names = FALSE, type = 7))
-    thr_off <- thr_on * hysteresis
 
-    eligible_on <- which(is.finite(s) & s >= thr_on)
+    tau_on <- came_quantile_safe(vals, q_i[i], default = Inf)
+    if (!is.finite(tau_on)) next
+    tau_off <- rho_off * tau_on
+
+    eligible_on <- which(is.finite(s) & s >= tau_on)
     eligible <- eligible_on
 
-    # hysteresis: keep previous edges above off threshold
-    if (!is.null(prev_M)) {
-      prev_row <- prev_M[syms[i], syms]
-      keep_prev <- which(prev_row & is.finite(s) & s >= thr_off)
+    if (!is.null(M_prev) && is.matrix(M_prev)) {
+      prev_row <- as.logical(M_prev[syms[i], syms])
+      keep_prev <- which(prev_row & is.finite(s) & s >= tau_off)
       eligible <- unique(c(eligible_on, keep_prev))
     }
+
     if (length(eligible) == 0) next
 
-    # top-k_i control
+    # top-k_i within eligible
     ord <- eligible[order(s[eligible], decreasing = TRUE)]
     keep <- head(ord, k_i[i])
-    M_dir[i, keep] <- TRUE
+    Mhat[i, keep] <- TRUE
   }
 
-  # global exceptions
+  # global exception preservation (architecture §6.3.4)
   qg <- spec$structure$q_global %||% 0.995
   uvals <- U[upper.tri(U)]
   uvals <- uvals[is.finite(uvals)]
   if (length(uvals) > 10) {
-    thr_g <- as.numeric(stats::quantile(uvals, probs = qg, na.rm = TRUE, names = FALSE))
+    thr_g <- came_quantile_safe(uvals, qg, default = NA_real_)
     if (is.finite(thr_g) && thr_g > 0) {
       idx <- which(U >= thr_g, arr.ind = TRUE)
       for (k in seq_len(nrow(idx))) {
-        i <- idx[k,1]; j <- idx[k,2]
-        if (i != j) M_dir[i,j] <- TRUE
+        ii <- idx[k, 1]
+        jj <- idx[k, 2]
+        if (ii != jj) Mhat[ii, jj] <- TRUE
       }
     }
   }
 
-  M <- M_dir | t(M_dir)
-  diag(M) <- FALSE
+  # union symmetrization (architecture §6.4.1)
+  Mu <- Mhat | t(Mhat)
+  diag(Mu) <- FALSE
 
-  beta_w <- spec$structure$beta_w %||% 1.0
-  W_abs <- (U^beta_w) * M
-  W_abs <- came_symmetrize(W_abs); diag(W_abs) <- 0
-  W_sgn <- (P_bar * (U^(beta_w - 1))) * M
-  W_sgn <- came_symmetrize(W_sgn); diag(W_sgn) <- 0
+  # post-symmetry pruning (architecture §6.4.2) — simple density band control
+  dens_target <- spec$structure$dens_target %||% 0
+  dens_target <- if (is.finite(dens_target) && dens_target > 0) dens_target else 0
+  if (dens_target > 0 && n >= 3) {
+    dens_u <- .came_graph_density(Mu)
+    dens_max <- max(dens_target * 1.25, dens_target + 0.01)
 
-  list(M = M, W_abs = W_abs, W_sgn = W_sgn)
+    if (is.finite(dens_u) && dens_u > dens_max) {
+      # prune weakest edges globally until density <= dens_max
+      edges <- which(Mu[upper.tri(Mu)], arr.ind = FALSE)
+      # build list of (i,j,u)
+      ij <- which(upper.tri(Mu) & Mu, arr.ind = TRUE)
+      if (nrow(ij) > 0) {
+        w <- U[cbind(ij[, 1], ij[, 2])]
+        ord <- order(w, decreasing = FALSE) # remove smallest first
+        Mu2 <- Mu
+        current_edges <- nrow(ij)
+        target_edges <- ceiling(dens_max * (n * (n - 1) / 2))
+
+        if (target_edges < current_edges) {
+          remove_n <- current_edges - target_edges
+          rem <- ij[ord[seq_len(remove_n)], , drop = FALSE]
+          for (r in seq_len(nrow(rem))) {
+            i <- rem[r, 1]
+            j <- rem[r, 2]
+            Mu2[i, j] <- FALSE
+            Mu2[j, i] <- FALSE
+          }
+          Mu <- Mu2
+        }
+      }
+    }
+  }
+
+  list(M = Mu, U = U)
 }
 
-.came_operators <- function(W_abs, W_sgn) {
-  syms <- colnames(W_abs); n <- length(syms)
+# ---- §6.5 weights + operators ----
+.came_operators <- function(P_bar, M, beta_w) {
+  syms <- colnames(P_bar)
+  U <- abs(P_bar)
+  diag(U) <- 0
+  U[!is.finite(U)] <- 0
+
+  bw <- beta_w %||% 1.0
+  if (!is.finite(bw) || bw <= 0) bw <- 1.0
+
+  W_abs <- (U^bw) * M
+  W_abs <- came_symmetrize(W_abs)
+  diag(W_abs) <- 0
+  W_abs[!is.finite(W_abs)] <- 0
+
+  # signed weights
+  U_pow <- if (abs(bw - 1.0) < 1e-12) matrix(1, nrow(U), ncol(U)) else (U^(bw - 1))
+  U_pow[!is.finite(U_pow)] <- 0
+  W_sgn <- (P_bar * U_pow) * M
+  W_sgn <- came_symmetrize(W_sgn)
+  diag(W_sgn) <- 0
+  W_sgn[!is.finite(W_sgn)] <- 0
+
   deg <- rowSums(W_abs)
-  deg[!is.finite(deg) | deg <= 0] <- 1e-12
-  A <- W_abs / deg
-  A_sgn <- W_sgn / deg
-  D <- diag(deg)
-  L <- D - W_abs
-  d_inv_sqrt <- 1 / sqrt(deg)
+  deg[!is.finite(deg) | deg <= 0] <- 0
+  deg_safe <- pmax(deg, 1e-12)
+
+  A <- W_abs / deg_safe
+  A_sgn <- W_sgn / deg_safe
+
+  Dg <- diag(deg_safe)
+  L <- Dg - W_abs
+
+  d_inv_sqrt <- 1 / sqrt(deg_safe)
   d_inv_sqrt[!is.finite(d_inv_sqrt)] <- 0
   L_norm <- diag(d_inv_sqrt) %*% L %*% diag(d_inv_sqrt)
   L_norm <- came_symmetrize(L_norm)
 
+  dimnames(W_abs) <- list(syms, syms)
+  dimnames(W_sgn) <- list(syms, syms)
   dimnames(A) <- list(syms, syms)
   dimnames(A_sgn) <- list(syms, syms)
   dimnames(L) <- list(syms, syms)
   dimnames(L_norm) <- list(syms, syms)
   names(deg) <- syms
-  list(A=A, A_sgn=A_sgn, L=L, L_norm=L_norm, deg=deg)
+
+  list(W_abs = W_abs, W_sgn = W_sgn, A = A, A_sgn = A_sgn, L = L, L_norm = L_norm, deg = deg)
 }
 
+# ---- clustering (architecture §10) ----
 .came_choose_K <- function(evals, K_min, K_max) {
   n <- length(evals)
   K_cand <- min(K_max, n - 1L)
-  if (K_cand < K_min) return(K_min)
+  if (K_cand < K_min) {
+    return(K_min)
+  }
   gaps <- diff(evals[1:min(n, K_cand + 1L)])
-  if (length(gaps) < K_min) return(K_min)
+  if (length(gaps) < K_min) {
+    return(K_min)
+  }
   idx <- which.max(gaps[K_min:length(gaps)]) + K_min - 1L
   max(K_min, min(K_max, idx))
 }
@@ -885,34 +1430,43 @@ came_risk_update <- function(R_window, state, spec) {
   n <- ncol(L_norm)
   if (n < K_min) {
     lab <- setNames(rep(1L, n), colnames(L_norm))
-    return(list(labels = lab, K = 1L, method="trivial"))
+    return(list(labels = lab, K = 1L, method = "trivial"))
   }
   eig <- eigen(L_norm, symmetric = TRUE)
   ord <- order(eig$values)
   evals <- eig$values[ord]
-  evecs <- eig$vectors[, ord, drop=FALSE]
+  evecs <- eig$vectors[, ord, drop = FALSE]
+
   K <- .came_choose_K(evals, K_min, K_max)
-  V <- evecs[, 1:K, drop=FALSE]
-  rn <- sqrt(rowSums(V^2)); rn[rn <= 1e-12] <- 1
+  V <- evecs[, 1:K, drop = FALSE]
+  rn <- sqrt(rowSums(V^2))
+  rn[rn <= 1e-12] <- 1
   Vn <- V / rn
+
   km <- kmeans(Vn, centers = K, nstart = 10, iter.max = 100)
   lab <- setNames(as.integer(km$cluster), colnames(L_norm))
-  list(labels=lab, K=K, method="spectral", within=km$tot.withinss)
+  list(labels = lab, K = K, method = "spectral", within = km$tot.withinss)
 }
 
 .came_persist_labels <- function(labels_new, labels_prev) {
   came_require("clue")
-  if (is.null(labels_prev)) return(labels_new)
+  if (is.null(labels_prev)) {
+    return(labels_new)
+  }
+
   common <- intersect(names(labels_new), names(labels_prev))
-  if (length(common) < 2) return(labels_new)
-  K_new <- max(labels_new[common]); K_prev <- max(labels_prev[common])
+  if (length(common) < 2) {
+    return(labels_new)
+  }
+
+  K_new <- max(labels_new[common])
+  K_prev <- max(labels_prev[common])
   K <- max(K_new, K_prev)
+
   overlap <- matrix(0, K, K)
   for (nm in common) overlap[labels_new[nm], labels_prev[nm]] <- overlap[labels_new[nm], labels_prev[nm]] + 1
 
-  # maximize overlap => cost = -overlap
   perm <- as.integer(clue::solve_LSAP(-overlap))
-  # perm[j] = row assigned to column j; we want map new_cluster(row) -> prev_cluster(col)
   map <- rep(NA_integer_, K)
   for (col in seq_len(K)) map[perm[col]] <- col
 
@@ -924,75 +1478,104 @@ came_risk_update <- function(R_window, state, spec) {
   out
 }
 
-came_structure_update <- function(Theta, activity_last, state, spec) {
+# ---- main structure update ----
+came_structure_update <- function(Theta, traded_value_last, state, spec) {
   P_t <- .came_partial_corr(Theta)
   univ <- colnames(P_t)
 
+  # previous states mapped (runner should call came_state_pi, but we defend by mapping here too)
   P_bar_prev <- state$structure$P_bar
-  edge_prev <- state$structure$edge_stab
+  if (!is.null(P_bar_prev)) P_bar_prev <- came_pi_matrix(P_bar_prev, univ, init_diag = 0)
+
   M_prev <- state$structure$M_prev
+  if (!is.null(M_prev)) M_prev <- came_pi_mask(M_prev, univ)
+
+  edge_prev <- state$structure$edge_stab
+  if (!is.null(edge_prev)) edge_prev <- came_pi_matrix(edge_prev, univ, init_diag = 0.5)
+
+  node_prev <- state$structure$node_stab
+  if (!is.null(node_prev)) node_prev <- came_pi_vector(node_prev, univ, init_val = 1.0)
 
   chi <- .came_structural_shock(P_t, P_bar_prev)
 
   lambda_edge <- spec$structure$lambda_edge %||% 0.95
+  if (!is.finite(lambda_edge) || lambda_edge <= 0 || lambda_edge >= 1) came_stop("struct_lambda_edge", "structure$lambda_edge must be in (0,1)")
   edge_stab <- .came_edge_stability(edge_prev, P_t, P_bar_prev, univ, lambda_edge)
 
-  # adaptive smoothing
+  # adaptive smoothing (architecture §6.2)
   if (is.null(P_bar_prev)) {
     P_bar <- P_t
   } else {
-    P_bar_prev_m <- came_pi_matrix(P_bar_prev, univ, init_diag = 0)
     theta <- spec$structure$theta_alpha
-    alpha_mat <- .came_alpha_matrix(P_t, P_bar_prev_m, edge_stab, chi, theta)
-    P_bar <- .came_smooth_P(P_t, P_bar_prev_m, alpha_mat)
+    alpha_mat <- .came_alpha_matrix(P_t, P_bar_prev, edge_stab, chi, theta)
+    P_bar <- .came_smooth_P(P_t, P_bar_prev, alpha_mat)
   }
 
-  liq_rank <- .came_liquidity_rank(activity_last[univ])
-  mask <- .came_mask_build(P_bar, spec, prev_M = M_prev, liq_rank = liq_rank, chi = chi)
-  ops <- .came_operators(mask$W_abs, mask$W_sgn)
+  # density deviation delta_t (architecture §6.6): dens_{t-1} - dens_target (lagged is causal)
+  dens_prev <- if (!is.null(M_prev)) .came_graph_density(M_prev) else 0
+  dens_target <- spec$structure$dens_target %||% 0.05
+  if (!is.finite(dens_target) || dens_target <= 0) dens_target <- 0.05
+  delta <- dens_prev - dens_target
 
-  # diagnostics
-  dens <- if (length(univ) > 1) sum(mask$M) / (length(univ) * (length(univ) - 1)) else 0
-  eto <- 0
-  if (!is.null(M_prev) && is.matrix(M_prev)) {
-    common <- intersect(colnames(M_prev), univ)
-    if (length(common) >= 2) {
-      prev_edges <- sum(M_prev[common, common]) / 2
-      if (prev_edges > 0) {
-        overlap <- sum(mask$M[common, common] & M_prev[common, common]) / 2
-        eto <- 1 - overlap / prev_edges
-      }
-    }
-  }
-  node_stab <- setNames(rep(1, length(univ)), univ)
-  if (!is.null(M_prev) && is.matrix(M_prev)) {
-    common <- intersect(colnames(M_prev), univ)
-    for (nm in common) {
-      prev_deg <- sum(M_prev[nm, common])
-      if (prev_deg > 0) {
-        changed <- sum(abs(as.numeric(mask$M[nm, common]) - as.numeric(M_prev[nm, common])))
-        node_stab[nm] <- 1 - changed / max(1, prev_deg)
-      }
-    }
-  }
+  # build mask
+  names(traded_value_last) <- names(traded_value_last)
+  tv_vec <- traded_value_last[univ]
+  tv_vec[!is.finite(tv_vec)] <- 0
 
+  liq_rank <- .came_liquidity_rank(tv_vec)
+
+  mask_res <- .came_mask_build(
+    P_bar = P_bar,
+    spec = spec,
+    M_prev = M_prev,
+    node_stab_prev = node_prev,
+    liq_rank = liq_rank,
+    chi = chi,
+    delta = delta
+  )
+  M <- mask_res$M
+
+  # diagnostics (architecture §6.6)
+  dens <- .came_graph_density(M)
+  eto <- .came_edge_turnover(M, M_prev)
+  node_stab <- .came_node_stability(M, M_prev)
+
+  # operators (architecture §6.5)
+  beta_w <- spec$structure$beta_w %||% 1.0
+  ops <- .came_operators(P_bar, M, beta_w = beta_w)
+
+  # clustering (architecture §10) + persistence
   cl <- .came_spectral_cluster(ops$L_norm, spec$structure$K_min, spec$structure$K_max)
   labels_prev <- state$structure$labels
-  if (!is.null(labels_prev)) labels_prev <- labels_prev[names(labels_prev) %||% names(cl$labels)]
+  if (!is.null(labels_prev)) {
+    labels_prev <- labels_prev[names(labels_prev) %||% names(cl$labels)]
+  }
   cl$labels <- .came_persist_labels(cl$labels, labels_prev)
 
+  # state update
   st_out <- state
   st_out$structure$P_bar <- P_bar
-  st_out$structure$M_prev <- mask$M
+  st_out$structure$M_prev <- M
   st_out$structure$edge_stab <- edge_stab
+  st_out$structure$node_stab <- node_stab
   st_out$structure$labels <- as.integer(cl$labels)
 
   list(
     structure = list(
-      P = P_t, P_bar = P_bar, M = mask$M,
-      W_abs = mask$W_abs, W_sgn = mask$W_sgn,
-      ops = ops, clustering = cl,
-      diag = list(chi=chi, density=dens, eto=eto)
+      P = P_t,
+      P_bar = P_bar,
+      M = M,
+      ops = ops,
+      clustering = cl,
+      node_stab = node_stab,
+      diag = list(
+        chi = chi,
+        density = dens,
+        eto = eto,
+        delta = delta,
+        dens_prev = dens_prev,
+        dens_target = dens_target
+      )
     ),
     state_out = st_out
   )
@@ -1003,18 +1586,24 @@ came_structure_update <- function(Theta, activity_last, state, spec) {
 ###############################################################################
 ### FILE: R/06_signals.R
 ###############################################################################
-# 06_signals.R — Kalman (local linear trend), multiscale TSMOM, factor trends, scalarization
+# 06_signals.R — Signal primitives + scalarization (architecture §7)
+# Provides:
+#   - multiscale raw momentum m_raw(h)
+#   - multiscale residual momentum m_res(h) using r_perp = D * e
+#   - per-asset Kalman local-linear-trend features
+#   - factor trend features g_q(h)
+#   - scalar signals s^(mom), s^(kal), s^(fac) with recursive omega updates
 
-.tanh <- function(x, scale) tanh(x / (scale %||% 1.0))
+.tanh_scaled <- function(x, scale) tanh(x / (scale %||% 1.0))
 
-# ---- Kalman local linear trend (2D state: level, slope) ----
-
-came_kalman_init <- function(y0, q_var, r_var) {
+# ---- Kalman local linear trend (architecture §7.2) ----
+came_kalman_init <- function(y0, q_var = NULL, r_var = NULL) {
+  # q_var / r_var are accepted for compatibility with callers, but init does not need them.
   list(m = c(level = y0, slope = 0), P = diag(c(1, 1)))
 }
 
 came_kalman_step <- function(state, y, q_var, r_var) {
-  Fm <- matrix(c(1, 1, 0, 1), 2, 2, byrow=TRUE)
+  Fm <- matrix(c(1, 1, 0, 1), 2, 2, byrow = TRUE)
   Hm <- matrix(c(1, 0), 1, 2)
   Q <- diag(c(q_var, q_var))
   R <- matrix(r_var, 1, 1)
@@ -1025,9 +1614,9 @@ came_kalman_step <- function(state, y, q_var, r_var) {
   m_pred <- Fm %*% m_prev
   P_pred <- Fm %*% P_prev %*% t(Fm) + Q
 
-  y_hat <- (Hm %*% m_pred)[1,1]
+  y_hat <- (Hm %*% m_pred)[1, 1]
   innov <- y - y_hat
-  S <- (Hm %*% P_pred %*% t(Hm) + R)[1,1]
+  S <- (Hm %*% P_pred %*% t(Hm) + R)[1, 1]
   if (!is.finite(S) || S <= 0) S <- r_var + 1e-8
   K <- P_pred %*% t(Hm) / S
 
@@ -1036,7 +1625,7 @@ came_kalman_step <- function(state, y, q_var, r_var) {
   P_new <- came_symmetrize(P_new)
 
   list(
-    m = c(level = m_new[1,1], slope = m_new[2,1]),
+    m = c(level = m_new[1, 1], slope = m_new[2, 1]),
     P = P_new,
     innov = innov,
     S = S
@@ -1045,12 +1634,15 @@ came_kalman_step <- function(state, y, q_var, r_var) {
 
 came_signals_kalman <- function(log_prices_last, kalman_prev, q_var, r_var) {
   syms <- names(log_prices_last)
-  init_fn <- function() NULL
-  kalman_prev <- came_pi_list(kalman_prev, syms, init_fn = init_fn)
+  kalman_prev <- came_pi_list(kalman_prev, syms, init_fn = function() NULL)
 
   out_slope <- setNames(rep(0, length(syms)), syms)
-  out_z <- setNames(rep(0, length(syms)), syms)
+  out_slope_var <- setNames(rep(1, length(syms)), syms)
+  out_slope_z <- setNames(rep(0, length(syms)), syms)
+  out_innov <- setNames(rep(0, length(syms)), syms)
   out_innov_z <- setNames(rep(0, length(syms)), syms)
+  out_S <- setNames(rep(0, length(syms)), syms)
+
   states_out <- setNames(vector("list", length(syms)), syms)
 
   for (nm in syms) {
@@ -1059,49 +1651,79 @@ came_signals_kalman <- function(log_prices_last, kalman_prev, q_var, r_var) {
       states_out[[nm]] <- kalman_prev[[nm]]
       next
     }
+
     st <- kalman_prev[[nm]]
-    if (is.null(st)) st <- came_kalman_init(y, q_var, r_var)
+    if (is.null(st)) st <- came_kalman_init(y)
+
     st2 <- came_kalman_step(st, y, q_var, r_var)
 
     slope <- st2$m["slope"]
-    slope_var <- st2$P[2,2]
-    slope_sd <- sqrt(max(slope_var, 1e-10))
-    out_slope[nm] <- slope
-    out_z[nm] <- slope / slope_sd
+    slope_var <- st2$P[2, 2]
+    slope_var <- if (!is.finite(slope_var) || slope_var <= 1e-12) 1e-12 else slope_var
+    slope_sd <- sqrt(slope_var)
 
-    innov_z <- st2$innov / sqrt(max(st2$S, 1e-10))
-    out_innov_z[nm] <- innov_z
+    out_slope[nm] <- slope
+    out_slope_var[nm] <- slope_var
+    out_slope_z[nm] <- slope / slope_sd
+
+    out_innov[nm] <- st2$innov
+    out_innov_z[nm] <- st2$innov / sqrt(max(st2$S, 1e-12))
+    out_S[nm] <- st2$S
 
     states_out[[nm]] <- st2
   }
 
-  list(slope = out_slope, slope_z = out_z, innov_z = out_innov_z, state = states_out)
+  list(
+    slope = out_slope,
+    slope_var = out_slope_var,
+    slope_z = out_slope_z,
+    innov = out_innov,
+    S = out_S,
+    innov_z = out_innov_z,
+    state = states_out
+  )
 }
 
-# ---- Multiscale momentum ----
+# ---- multiscale momentum (architecture §7.1) ----
+came_signals_mom_multiscale <- function(R_window, sigma_daily, horizons, scale, prefix = "mom_h") {
+  syms <- colnames(R_window)
+  Tn <- nrow(R_window)
+  Hs <- as.integer(horizons)
+  Hs <- Hs[Hs >= 2]
+  came_assert(length(Hs) > 0, "signals_mom_horizons", "signals$mom_horizons must contain values >= 2")
 
-came_signals_mom_multiscale <- function(R_window, sigma_daily, horizons, scale) {
-  syms <- colnames(R_window); Tn <- nrow(R_window)
-  Hs <- as.integer(horizons); Hs <- Hs[Hs >= 2]
-  out <- matrix(0, length(syms), length(Hs), dimnames = list(syms, paste0("mom_h", Hs)))
+  out <- matrix(0, length(syms), length(Hs), dimnames = list(syms, paste0(prefix, Hs)))
+
   for (h in seq_along(Hs)) {
     hh <- min(Hs[h], Tn)
     rc <- colSums(tail(R_window, hh), na.rm = TRUE)
     denom <- sigma_daily[syms] * sqrt(hh)
-    denom[!is.finite(denom) | denom <= 0] <- median(denom[is.finite(denom) & denom > 0], na.rm = TRUE) %||% 1e-4
-    out[, h] <- .tanh(rc / (denom + 1e-8), scale)
+    denom[!is.finite(denom) | denom <= 0] <- stats::median(denom[is.finite(denom) & denom > 0], na.rm = TRUE) %||% 1e-4
+    out[, h] <- .tanh_scaled(rc / (denom + 1e-8), scale)
   }
   out
 }
 
+# ---- factor trends (architecture §7.3) ----
 came_signals_factor_trends <- function(F_window, horizons) {
-  if (is.null(F_window) || nrow(F_window) < 10) return(NULL)
-  k <- ncol(F_window); Tn <- nrow(F_window)
-  Hs <- as.integer(horizons); Hs <- Hs[Hs >= 2]
+  if (is.null(F_window) || nrow(F_window) < 10) {
+    return(NULL)
+  }
+
+  k <- ncol(F_window)
+  Tn <- nrow(F_window)
+  Hs <- as.integer(horizons)
+  Hs <- Hs[Hs >= 2]
+  if (length(Hs) == 0) {
+    return(NULL)
+  }
+
   out <- matrix(0, k, length(Hs), dimnames = list(colnames(F_window), paste0("fac_h", Hs)))
+
   for (q in seq_len(k)) {
     f <- F_window[, q]
-    f_sd <- sd(f, na.rm = TRUE); if (!is.finite(f_sd) || f_sd <= 0) f_sd <- 1
+    f_sd <- stats::sd(f, na.rm = TRUE)
+    if (!is.finite(f_sd) || f_sd <= 0) f_sd <- 1
     for (h in seq_along(Hs)) {
       hh <- min(Hs[h], Tn)
       out[q, h] <- sum(tail(f, hh), na.rm = TRUE) / (f_sd * sqrt(hh) + 1e-8)
@@ -1110,90 +1732,182 @@ came_signals_factor_trends <- function(F_window, horizons) {
   out
 }
 
-# ---- Scalarization (trimmed, but real) ----
-# Map multiscale vectors to scalar using omega; update omega via ridge on 1-day ahead returns (causal, operational trim).
-
+# ---- ridge helper (deterministic) ----
 .came_ridge <- function(X, y, lambda) {
-  X <- as.matrix(X); y <- as.numeric(y)
-  X[!is.finite(X)] <- 0; y[!is.finite(y)] <- 0
+  X <- as.matrix(X)
+  y <- as.numeric(y)
+  X[!is.finite(X)] <- 0
+  y[!is.finite(y)] <- 0
+
   p <- ncol(X)
   XtX <- crossprod(X) + lambda * diag(p)
   Xty <- crossprod(X, y)
+
   b <- tryCatch(solve(XtX, Xty), error = function(e) rep(0, p))
   as.numeric(b)
 }
 
+# ---- scalarize a family u_{i} in R^{d} to s_i with recursive omega (architecture §7.4) ----
 came_scalarize_family <- function(U_mat, y_cs, omega_prev, lambda_omega, ridge_lambda) {
-  # U_mat: n_assets x d
-  syms <- rownames(U_mat); d <- ncol(U_mat)
-  if (d == 0) return(list(s = setNames(rep(0, length(syms)), syms), omega = numeric(0)))
-  # standardize features cross-sectionally
-  mu <- colMeans(U_mat); sdv <- apply(U_mat, 2, sd); sdv[sdv <= 1e-8 | !is.finite(sdv)] <- 1
+  syms <- rownames(U_mat)
+  d <- ncol(U_mat)
+  if (d == 0) {
+    return(list(s = setNames(rep(0, length(syms)), syms), omega = numeric(0)))
+  }
+
+  # cross-sectional standardization of columns
+  mu <- colMeans(U_mat)
+  sdv <- apply(U_mat, 2, stats::sd)
+  sdv[!is.finite(sdv) | sdv <= 1e-8] <- 1
+
   U <- scale(U_mat, center = mu, scale = sdv)
   U[!is.finite(U)] <- 0
 
   omega_new <- .came_ridge(U, y_cs, ridge_lambda)
-  # stabilize
   if (sum(abs(omega_new)) > 0) omega_new <- omega_new / sum(abs(omega_new))
+
   if (!is.null(omega_prev) && length(omega_prev) == d) {
     omega_new <- lambda_omega * omega_prev + (1 - lambda_omega) * omega_new
     if (sum(abs(omega_new)) > 0) omega_new <- omega_new / sum(abs(omega_new))
   }
+
   s <- as.vector(U %*% omega_new)
   names(s) <- syms
-  list(s = s, omega = omega_new, mu = mu, sd = sdv)
+  list(s = s, omega = omega_new)
 }
 
+# ---- scalarize factor horizon vectors across factors (architecture §7.3) ----
+.came_scalarize_factor_horizons <- function(g_mat, f_t, omega_prev, lambda_omega, ridge_lambda) {
+  # g_mat: k x m horizons (rows=factors), f_t: k vector target (observed after close)
+  k <- nrow(g_mat)
+  m <- ncol(g_mat)
+  if (k < 1 || m < 1) {
+    return(list(g_scalar = rep(0, k), omega = omega_prev))
+  }
+
+  X <- g_mat
+  X[!is.finite(X)] <- 0
+
+  # standardize columns across factors (pooling)
+  mu <- colMeans(X)
+  sdv <- apply(X, 2, stats::sd)
+  sdv[!is.finite(sdv) | sdv <= 1e-8] <- 1
+  Xs <- scale(X, center = mu, scale = sdv)
+  Xs[!is.finite(Xs)] <- 0
+
+  y <- as.numeric(f_t)
+  y[!is.finite(y)] <- 0
+
+  omega_new <- .came_ridge(Xs, y, ridge_lambda)
+  if (sum(abs(omega_new)) > 0) omega_new <- omega_new / sum(abs(omega_new))
+
+  if (!is.null(omega_prev) && length(omega_prev) == m) {
+    omega_new <- lambda_omega * omega_prev + (1 - lambda_omega) * omega_new
+    if (sum(abs(omega_new)) > 0) omega_new <- omega_new / sum(abs(omega_new))
+  }
+
+  g_scalar <- as.vector(Xs %*% omega_new)
+  list(g_scalar = g_scalar, omega = omega_new)
+}
+
+# ---- main signals update ----
 came_signals_update <- function(P_last, R_window, risk_art, struct_art, state, spec) {
+  came_assert(is.matrix(R_window) && nrow(R_window) >= 5, "signals_R_window", "R_window must be matrix with >=5 rows")
   syms <- colnames(R_window)
-  # daily sigma (from EWMA var state) for mom normalization
+  came_assert(!is.null(syms) && length(syms) >= 3, "signals_syms", "R_window must have >=3 symbols")
+
+  # daily sigma for normalization (use EWMA state)
   sigma_daily <- sqrt(came_pi_vector(state$risk$sigma2, syms, init_val = 1e-4))
   sigma_daily[!is.finite(sigma_daily) | sigma_daily <= 0] <- 1e-4
 
-  # 1) momentum multiscale raw
+  # (1) raw multiscale momentum
   mom_h <- spec$signals$mom_horizons
-  mom_multi <- came_signals_mom_multiscale(R_window, sigma_daily, mom_h, spec$signals$mom_scale %||% 2.0)
+  mom_multi <- came_signals_mom_multiscale(
+    R_window = R_window,
+    sigma_daily = sigma_daily,
+    horizons = mom_h,
+    scale = spec$signals$mom_scale %||% 2.0,
+    prefix = "mom_h"
+  )
 
-  # 2) residual momentum multiscale: r_perp = D * e_std (use debug retention or recompute approximations)
-  resid_multi <- NULL
-  if (!is.null(risk_art$E_std) && !is.null(risk_art$D_series)) {
-    # D_series: T x p, E_std: T x p => r_perp = D * e
-    D <- risk_art$D_series[, syms, drop=FALSE]
-    E <- risk_art$E_std[, syms, drop=FALSE]
-    R_perp <- E * D
-    resid_multi <- came_signals_mom_multiscale(R_perp, sigma_daily, mom_h, spec$signals$mom_scale %||% 2.0)
-    colnames(resid_multi) <- paste0("resid_", colnames(resid_multi))
-  }
+  # (2) residual multiscale momentum (architecture §7.1): r_perp = D * e
+  came_assert(
+    !is.null(risk_art$E_std) && !is.null(risk_art$D_series),
+    "signals_missing_resid_inputs",
+    "risk_art must provide E_std and D_series (required for residual momentum)."
+  )
 
-  # 3) Kalman trend slope (stateful)
+  E <- risk_art$E_std
+  D <- risk_art$D_series
+
+  # align residual series to current symbols
+  common <- intersect(colnames(E), syms)
+  came_assert(length(common) >= 3, "signals_resid_common", "Residual series must cover >=3 symbols in current universe")
+
+  E <- E[, syms, drop = FALSE]
+  D <- D[, syms, drop = FALSE]
+
+  R_perp <- E * D
+  R_perp[!is.finite(R_perp)] <- 0
+
+  resid_multi <- came_signals_mom_multiscale(
+    R_window = R_perp,
+    sigma_daily = sigma_daily,
+    horizons = mom_h,
+    scale = spec$signals$mom_scale %||% 2.0,
+    prefix = "resid_mom_h"
+  )
+
+  # (3) Kalman features (architecture §7.2)
   qv <- spec$signals$kalman$q_var %||% 1e-5
   rv <- spec$signals$kalman$r_var %||% 1e-3
+  if (!is.finite(qv) || qv <= 0) came_stop("signals_kalman_q", "signals$kalman$q_var must be > 0")
+  if (!is.finite(rv) || rv <= 0) came_stop("signals_kalman_r", "signals$kalman$r_var must be > 0")
+
   logp <- log(pmax(P_last[syms], 1e-12))
   kal_prev <- state$signals$kalman
-  kal <- came_signals_kalman(logp, kal_prev, qv, rv)
+  kal <- came_signals_kalman(logp, kal_prev, q_var = qv, r_var = rv)
 
-  # 4) factor trends + projection
+  # (4) factor trends (architecture §7.3) and factor-projected continuation via horizon scalarization
   fac_tr <- came_signals_factor_trends(risk_art$F, spec$signals$factor_horizons)
   fac_proj <- setNames(rep(0, length(syms)), syms)
-  if (!is.null(fac_tr)) {
-    g_bar <- fac_tr[, 1, drop=TRUE]  # shortest horizon
-    g_bar[!is.finite(g_bar)] <- 0
-    B <- risk_art$B[syms, , drop=FALSE]
-    fac_proj <- as.vector(B %*% g_bar)
-    names(fac_proj) <- syms
-  }
+  g_scalar <- NULL
 
-  # 5) scalarization (operational trim; still causal and recursive)
-  scalar_enabled <- isTRUE(spec$signals$scalarization$enabled %||% TRUE)
   omega_prev <- state$signals$omega %||% list()
   omega_cfg <- spec$signals$scalarization
   lambda_omega <- omega_cfg$lambda_omega %||% 0.95
   ridge_lambda <- omega_cfg$ridge_lambda %||% 0.05
 
-  # target y_cs: next-day return proxy = last day return cross-sectional rank (no lookahead)
-  r1 <- R_window[nrow(R_window), ]
-  r1[!is.finite(r1)] <- 0
-  y_cs <- rank(r1) / (length(r1) + 1) - 0.5
+  if (!is.null(fac_tr)) {
+    f_t <- as.numeric(risk_art$F[nrow(risk_art$F), ])
+    f_t[!is.finite(f_t)] <- 0
+
+    # scalarize horizons pooled across factors (causal target: observed f_t)
+    sc <- .came_scalarize_factor_horizons(
+      g_mat = fac_tr,
+      f_t = f_t,
+      omega_prev = omega_prev$fac_h,
+      lambda_omega = lambda_omega,
+      ridge_lambda = ridge_lambda
+    )
+    g_scalar <- sc$g_scalar
+    omega_prev$fac_h <- sc$omega
+
+    # project to assets: phi_facproj = B * g_scalar
+    B <- risk_art$B[syms, , drop = FALSE]
+    fac_proj <- as.vector(B %*% g_scalar)
+    names(fac_proj) <- syms
+  }
+
+  # (5) scalar signals s^(mom), s^(kal), s^(fac) with recursive omega (architecture §7.4)
+  scalar_enabled <- isTRUE(omega_cfg$enabled %||% TRUE)
+
+  # causal cross-sectional target for omega updates:
+  # use realized r_{i,t} (last row of R_window), observed after close.
+  r_t <- R_window[nrow(R_window), ]
+  r_t[!is.finite(r_t)] <- 0
+  y_cs <- came_rank01(r_t) - 0.5
+  y_cs[!is.finite(y_cs)] <- 0
 
   s_mom <- setNames(rep(0, length(syms)), syms)
   s_kal <- setNames(rep(0, length(syms)), syms)
@@ -1202,27 +1916,41 @@ came_signals_update <- function(P_last, R_window, risk_art, struct_art, state, s
   omega_out <- list()
 
   if (scalar_enabled) {
-    U_mom <- mom_multi[, , drop=FALSE]
+    # momentum family: multiscale features
+    U_mom <- mom_multi
+    rownames(U_mom) <- syms
     sres <- came_scalarize_family(U_mom, y_cs, omega_prev$mom, lambda_omega, ridge_lambda)
-    s_mom <- sres$s; omega_out$mom <- sres$omega
+    s_mom <- sres$s
+    omega_out$mom <- sres$omega
 
-    U_kal <- cbind(kal$slope_z, kal$innov_z)
-    colnames(U_kal) <- c("kal_slope_z","kal_innov_z")
+    # kalman family: slope_z + innov_z + slope_var (variance is informative)
+    U_kal <- cbind(
+      kal_slope_z = kal$slope_z,
+      kal_innov_z = kal$innov_z,
+      kal_slope_var = log1p(kal$slope_var)
+    )
     rownames(U_kal) <- syms
     sres <- came_scalarize_family(U_kal, y_cs, omega_prev$kal, lambda_omega, ridge_lambda)
-    s_kal <- sres$s; omega_out$kal <- sres$omega
+    s_kal <- sres$s
+    omega_out$kal <- sres$omega
 
-    U_fac <- cbind(fac_proj)
-    colnames(U_fac) <- "fac_proj"
+    # factor family: projected continuation (1-d) -> omega is trivial but we keep the same mechanism
+    U_fac <- cbind(fac_proj = fac_proj)
     rownames(U_fac) <- syms
     sres <- came_scalarize_family(U_fac, y_cs, omega_prev$fac, lambda_omega, ridge_lambda)
-    s_fac <- sres$s; omega_out$fac <- sres$omega
+    s_fac <- sres$s
+    omega_out$fac <- sres$omega
+
+    # store factor-horizon omega too (pooled across factors)
+    if (!is.null(omega_prev$fac_h)) omega_out$fac_h <- omega_prev$fac_h
   } else {
-    s_mom <- setNames(mom_multi[,1], syms)
+    # if scalarization disabled, expose simple deterministic scalars
+    s_mom <- setNames(mom_multi[, 1], syms)
     s_kal <- kal$slope_z
     s_fac <- fac_proj
   }
 
+  # update state
   st_out <- state
   st_out$signals$kalman <- kal$state
   st_out$signals$omega <- omega_out
@@ -1233,6 +1961,7 @@ came_signals_update <- function(P_last, R_window, risk_art, struct_art, state, s
       resid_mom_multi = resid_multi,
       kalman = kal,
       factor_trends = fac_tr,
+      factor_g_scalar = g_scalar,
       fac_proj = fac_proj,
       s_mom = s_mom,
       s_kal = s_kal,
@@ -1247,109 +1976,240 @@ came_signals_update <- function(P_last, R_window, risk_art, struct_art, state, s
 ###############################################################################
 ### FILE: R/07_features.R
 ###############################################################################
-# 07_features.R — feature assembly X_{i,t}
+# 07_features.R — Feature engine assembly X_{i,t} (architecture §11)
+# Produces a causal feature matrix X_now (rows=assets, cols=features).
+# Includes:
+#  - temporal block: raw/residual TSMOM multiscale, Kalman, factor-projected continuation
+#  - structural context block: graph operator transforms for s_mom/s_kal/s_fac
+#  - PCA–graph interaction block: cf1/cf2
+#  - liquidity/activity block: explicit + rolling z + interactions + local mismatch vs neighbors
+#  - global state context block: broadcast m_t
+#
+# No placeholder logic; numerical regularization is explicit and minimal.
+
+# --- helpers ---------------------------------------------------------------
 
 .came_graph_mv <- function(M, s) {
+  came_assert(is.matrix(M), "feat_graph_M", "Graph operator must be a matrix")
+  came_assert(!is.null(rownames(M)) && !is.null(colnames(M)), "feat_graph_dimnames", "Graph operator must have dimnames")
+  s <- s[colnames(M)]
+  s[!is.finite(s)] <- 0
   out <- as.vector(M %*% s)
   names(out) <- rownames(M)
   out
 }
 
-.came_cluster_z <- function(s, labels, eps=1e-8) {
+.came_graph_shrink <- function(L_norm, s, lambda_g = 0.1, eps = 1e-8) {
+  came_assert(is.matrix(L_norm), "feat_shr_L", "L_norm must be a matrix")
+  n <- ncol(L_norm)
+  came_assert(n == nrow(L_norm), "feat_shr_square", "L_norm must be square")
+  s <- s[colnames(L_norm)]
+  s[!is.finite(s)] <- 0
+
+  lam <- lambda_g %||% 0.1
+  if (!is.finite(lam) || lam < 0) lam <- 0.1
+
+  A <- diag(n) + lam * L_norm
+  # mathematically legitimate numerical ridge if solve is ill-conditioned
+  sol <- tryCatch(solve(A, s), error = function(e) NULL)
+  if (is.null(sol)) {
+    sol <- tryCatch(solve(A + eps * diag(n), s), error = function(e) NULL)
+  }
+  if (is.null(sol)) stop(came_error("feat_shr_solve_failed", "Failed to compute (I+lambda L_norm)^{-1}s"))
+  names(sol) <- colnames(L_norm)
+  sol
+}
+
+.came_cluster_center <- function(s, labels) {
+  s <- s[names(labels)]
   out <- s
   for (k in sort(unique(labels))) {
     idx <- names(labels)[labels == k]
     idx <- intersect(idx, names(s))
-    if (length(idx) >= 2) {
-      mu <- mean(s[idx], na.rm=TRUE)
-      sdv <- sd(s[idx], na.rm=TRUE); if (!is.finite(sdv) || sdv < eps) sdv <- eps
-      out[idx] <- (s[idx] - mu) / sdv
-    } else if (length(idx) == 1) {
-      out[idx] <- 0
+    if (length(idx) >= 1) {
+      mu <- mean(s[idx], na.rm = TRUE)
+      if (!is.finite(mu)) mu <- 0
+      out[idx] <- mu
     }
   }
   out
 }
 
-came_liquidity_features <- function(activity_window, R_window) {
-  # activity_window fields: traded_value, traded_units, n_trades matrices (T x p)
+.came_cluster_z <- function(s, labels, eps = 1e-8) {
+  s <- s[names(labels)]
+  out <- s
+  for (k in sort(unique(labels))) {
+    idx <- names(labels)[labels == k]
+    idx <- intersect(idx, names(s))
+    if (length(idx) >= 2) {
+      mu <- mean(s[idx], na.rm = TRUE)
+      sdv <- sd(s[idx], na.rm = TRUE)
+      if (!is.finite(mu)) mu <- 0
+      if (!is.finite(sdv) || sdv < eps) sdv <- eps
+      out[idx] <- (s[idx] - mu) / sdv
+    } else if (length(idx) == 1) {
+      out[idx] <- 0
+    }
+  }
+  out[!is.finite(out)] <- 0
+  out
+}
+
+# EWMA z-score of a per-asset series X (T x p), return last z (p)
+.came_ewma_z_last <- function(X, lambda = 0.97, eps = 1e-8) {
+  came_assert(is.matrix(X) && nrow(X) >= 2, "feat_ewma_z_X", "X must be a matrix with >=2 rows")
+  lam <- lambda
+  if (!is.finite(lam) || lam <= 0 || lam >= 1) lam <- 0.97
+
+  Tn <- nrow(X)
+  p <- ncol(X)
+  mu <- X[1, ]
+  mu[!is.finite(mu)] <- 0
+  v <- rep(0, p)
+
+  for (t in 2:Tn) {
+    x <- X[t, ]
+    x[!is.finite(x)] <- mu[!is.finite(x)]
+    # EWMA variance update around previous mean (stable)
+    v <- lam * v + (1 - lam) * (x - mu)^2
+    mu <- lam * mu + (1 - lam) * x
+  }
+
+  sdv <- sqrt(pmax(v, eps))
+  z <- (X[Tn, ] - mu) / sdv
+  z[!is.finite(z)] <- 0
+  z
+}
+
+# --- liquidity / activity block (architecture §8) --------------------------
+
+came_liquidity_features <- function(activity_window, R_window, ew_lambda = 0.97) {
   tv <- activity_window$traded_value
   tu <- activity_window$traded_units
   nt <- activity_window$n_trades
-  syms <- colnames(tv); Tn <- nrow(tv)
 
-  # current day fields (last row)
-  tv_t <- tv[Tn, ]; tu_t <- tu[Tn, ]; nt_t <- nt[Tn, ]
+  came_assert(is.matrix(tv) && is.matrix(tu) && is.matrix(nt), "feat_liq_mats", "activity_window must contain matrices")
+  syms <- colnames(tv)
+  came_assert(identical(colnames(tu), syms) && identical(colnames(nt), syms), "feat_liq_cols", "activity matrices must share identical columns")
+
+  # Align R_window to activity dates if possible
+  if (!is.null(rownames(tv)) && !is.null(rownames(R_window))) {
+    d_tv <- as.character(rownames(tv))
+    d_r <- as.character(rownames(R_window))
+    common_dates <- intersect(d_tv, d_r)
+    if (length(common_dates) >= 5) {
+      Rw <- R_window[common_dates, syms, drop = FALSE]
+    } else {
+      Rw <- R_window[, syms, drop = FALSE]
+    }
+  } else {
+    Rw <- R_window[, syms, drop = FALSE]
+  }
+
+  Tn <- nrow(tv)
+
+  tv_t <- tv[Tn, ]
+  tu_t <- tu[Tn, ]
+  nt_t <- nt[Tn, ]
   tv_t[!is.finite(tv_t) | tv_t < 0] <- 0
   tu_t[!is.finite(tu_t) | tu_t < 0] <- 0
   nt_t[!is.finite(nt_t) | nt_t < 0] <- 0
 
-  l1 <- log1p(tv_t)
-  l2 <- log1p(tu_t)
-  l3 <- log1p(nt_t)
+  f_active <- as.numeric((tv_t > 0) & (nt_t > 0))
 
+  # core logs
+  ltv <- log1p(tv_t)
+  ltu <- log1p(tu_t)
+  lnt <- log1p(nt_t)
+
+  # avg trade sizes
   avg_trade_brl <- tv_t / (nt_t + 1e-6)
   avg_trade_units <- tu_t / (nt_t + 1e-6)
+
+  # implied price proxy
   implied_px <- tv_t / (tu_t + 1e-6)
 
-  # Amihud-like illiquidity (rolling mean |r|/tv)
-  R_abs <- abs(R_window)
-  tv_pos <- tv[-1, , drop=FALSE]
-  tv_pos[tv_pos <= 0 | !is.finite(tv_pos)] <- 1
-  illiq <- colMeans(R_abs / tv_pos, na.rm=TRUE)
-  illiq[!is.finite(illiq)] <- 0
-
-  # rolling z-scores for liquidity logs
-  z_roll <- function(x) {
-    mu <- colMeans(x, na.rm=TRUE)
-    sdv <- apply(x, 2, sd, na.rm=TRUE); sdv[sdv <= 1e-8 | !is.finite(sdv)] <- 1
-    (x[Tn, ] - mu) / sdv
+  # Amihud-like daily illiquidity series: |r|/(V^BRL + eps), then EWMA z on last
+  # use aligned traded_value dates when possible
+  # Build tv series for those return dates (shift-safe by direct date match)
+  if (!is.null(rownames(tv)) && !is.null(rownames(Rw))) {
+    tv_r <- tv[rownames(Rw), syms, drop = FALSE]
+  } else {
+    # best-effort: use last min rows
+    m <- min(nrow(tv), nrow(Rw))
+    tv_r <- tail(tv, m)
+    Rw <- tail(Rw, m)
   }
-  z_tv <- z_roll(log1p(tv))
-  z_nt <- z_roll(log1p(nt))
 
-  data.frame(
-    f_ltv = l1,
-    f_ltu = l2,
-    f_lnt = l3,
+  tv_r[tv_r <= 0 | !is.finite(tv_r)] <- 1
+  illiq_daily <- abs(Rw) / tv_r
+  illiq_daily[!is.finite(illiq_daily)] <- 0
+
+  # rolling mean illiquidity (level) + EWMA z of daily illiq
+  illiq_lvl <- colMeans(illiq_daily, na.rm = TRUE)
+  illiq_lvl[!is.finite(illiq_lvl)] <- 0
+
+  # EWMA z-scores (per asset) for ltv, lnt, illiq_daily
+  ltv_series <- log1p(tv)
+  lnt_series <- log1p(nt)
+  ltv_z <- .came_ewma_z_last(ltv_series, lambda = ew_lambda)
+  lnt_z <- .came_ewma_z_last(lnt_series, lambda = ew_lambda)
+  illiq_z <- .came_ewma_z_last(illiq_daily, lambda = ew_lambda)
+
+  out <- data.frame(
+    f_active = f_active,
+    f_ltv = ltv,
+    f_ltu = ltu,
+    f_lnt = lnt,
     f_avg_trade_brl = log1p(avg_trade_brl),
     f_avg_trade_units = log1p(avg_trade_units),
     f_implied_px = log1p(implied_px),
-    f_illiq = log1p(illiq),
-    f_ltv_z = z_tv,
-    f_lnt_z = z_nt,
+    f_illiq = log1p(illiq_lvl),
+    f_ltv_z = ltv_z,
+    f_lnt_z = lnt_z,
+    f_illiq_z = illiq_z,
     row.names = syms,
     stringsAsFactors = FALSE
   )
+
+  # Robust sanitize: data.frame is list-like, so sanitize column-wise
+  out[] <- lapply(out, function(v) {
+    v <- as.numeric(v)
+    v[!is.finite(v)] <- 0
+    v
+  })
+
+  out
 }
 
-came_features_build <- function(risk_art, struct_art, sig_art, activity_window, R_window, m_t, spec) {
-  syms <- colnames(R_window)
-  n <- length(syms)
+# --- main feature assembly --------------------------------------------------
 
-  # temporal: multiscale mom + residual mom + kalman + factor trends projection
-  mom_multi <- sig_art$mom_multi[syms, , drop=FALSE]
+came_features_build <- function(risk_art, struct_art, sig_art, activity_window, R_window, m_t, spec) {
+  came_assert(is.matrix(R_window), "feat_R_window", "R_window must be matrix")
+  syms <- colnames(R_window)
+  came_assert(length(syms) >= 3, "feat_syms", "Need >=3 assets for features")
+
+  # --- Temporal block (§11.1) ---
+  mom_multi <- sig_art$mom_multi[syms, , drop = FALSE]
   colnames(mom_multi) <- paste0("f_", colnames(mom_multi))
 
-  resid_multi <- sig_art$resid_mom_multi
-  if (!is.null(resid_multi)) {
-    resid_multi <- resid_multi[syms, , drop=FALSE]
-    colnames(resid_multi) <- paste0("f_", colnames(resid_multi))
-  } else {
-    resid_multi <- matrix(0, n, 0, dimnames=list(syms, character(0)))
-  }
+  resid_multi <- sig_art$resid_mom_multi[syms, , drop = FALSE]
+  colnames(resid_multi) <- paste0("f_", colnames(resid_multi))
 
   kal <- sig_art$kalman
   f_kal <- cbind(
     f_kal_slope = kal$slope[syms],
     f_kal_slope_z = kal$slope_z[syms],
+    f_kal_slope_var = log1p(kal$slope_var[syms]),
+    f_kal_innov = kal$innov[syms],
     f_kal_innov_z = kal$innov_z[syms]
   )
   rownames(f_kal) <- syms
+
   f_facproj <- cbind(f_facproj = sig_art$fac_proj[syms])
   rownames(f_facproj) <- syms
 
-  # scalar signals
+  # Scalar signals
   f_scalar <- cbind(
     f_s_mom = sig_art$s_mom[syms],
     f_s_kal = sig_art$s_kal[syms],
@@ -1357,79 +2217,168 @@ came_features_build <- function(risk_art, struct_art, sig_art, activity_window, 
   )
   rownames(f_scalar) <- syms
 
-  # structural / graph transforms (on scalar signals)
+  # --- Structural context via graph operators (§11.2 + §9) ---
   ops <- struct_art$ops
-  A <- ops$A; A_sgn <- ops$A_sgn; L <- ops$L; L_norm <- ops$L_norm
+  A <- ops$A
+  A_sgn <- ops$A_sgn
+  L <- ops$L
+  L_norm <- ops$L_norm
+  deg <- ops$deg[syms]
+  deg[!is.finite(deg)] <- 0
+
   labels <- struct_art$clustering$labels
   labels <- labels[syms]
-  s_mom <- sig_art$s_mom[syms]; s_kal <- sig_art$s_kal[syms]; s_fac <- sig_art$s_fac[syms]
+  labels[!is.finite(labels)] <- 1L
+  labels <- as.integer(labels)
 
-  peer_mom <- .came_graph_mv(A, s_mom)
-  rel_mom <- s_mom - peer_mom
-  sgn_mom <- .came_graph_mv(A_sgn, s_mom)
-  ten_mom <- .came_graph_mv(L, s_mom)
-  shr_mom <- tryCatch(as.vector(solve(diag(n) + 0.1 * L_norm, s_mom)), error = function(e) s_mom)
-  names(shr_mom) <- syms
+  node_stab <- struct_art$node_stab
+  if (is.null(node_stab)) node_stab <- setNames(rep(1, length(syms)), syms)
+  node_stab <- node_stab[syms]
+  node_stab[!is.finite(node_stab)] <- 1
 
-  clz_mom <- .came_cluster_z(s_mom, labels)
+  lambda_g <- (spec$features$lambda_g %||% 0.1)
+  if (!is.finite(lambda_g) || lambda_g < 0) lambda_g <- 0.1
 
-  f_graph <- cbind(
-    f_peer_mom = peer_mom,
-    f_rel_mom = rel_mom,
-    f_sgn_mom = sgn_mom,
-    f_ten_mom = ten_mom,
-    f_shr_mom = shr_mom,
-    f_clz_mom = clz_mom,
-    f_deg = ops$deg[syms]
+  build_graph_block <- function(s, tag) {
+    s <- s[syms]
+    s[!is.finite(s)] <- 0
+
+    peer <- .came_graph_mv(A, s)
+    rel <- s - peer
+    sgn <- .came_graph_mv(A_sgn, s)
+    ten <- .came_graph_mv(L, s)
+    shr <- .came_graph_shrink(L_norm, s, lambda_g = lambda_g)
+
+    clctr <- .came_cluster_center(s, labels)
+    clz <- .came_cluster_z(s, labels)
+
+    out <- cbind(
+      peer = peer,
+      rel = rel,
+      sgn = sgn,
+      ten = ten,
+      shr = shr,
+      clctr = clctr,
+      clz = clz
+    )
+    colnames(out) <- paste0("f_", colnames(out), "_", tag)
+    rownames(out) <- syms
+    out
+  }
+
+  g_mom <- build_graph_block(sig_art$s_mom, "mom")
+  g_kal <- build_graph_block(sig_art$s_kal, "kal")
+  g_fac <- build_graph_block(sig_art$s_fac, "fac")
+
+  f_graph_meta <- cbind(
+    f_deg = deg,
+    f_node_stab = node_stab
   )
-  rownames(f_graph) <- syms
+  rownames(f_graph_meta) <- syms
 
-  # PCA–graph interaction (architecture φ_cf1, φ_cf2)
-  B <- risk_art$B[syms, , drop=FALSE]
-  fac_tr <- sig_art$factor_trends
-  g_bar <- if (!is.null(fac_tr)) fac_tr[, 1, drop=TRUE] else rep(0, ncol(B))
-  g_bar[!is.finite(g_bar)] <- 0
-  # cluster centroids of loadings
-  phi_cf1 <- as.vector(B %*% g_bar)
-  names(phi_cf1) <- syms
+  # --- PCA–graph interaction (§11.3) ---
+  B <- risk_art$B[syms, , drop = FALSE]
+  g_scalar <- sig_art$factor_g_scalar
+  if (is.null(g_scalar)) {
+    # If unavailable, fall back to shortest-horizon factor trends (still causal)
+    fac_tr <- sig_art$factor_trends
+    if (!is.null(fac_tr)) g_scalar <- fac_tr[, 1, drop = TRUE] else g_scalar <- rep(0, ncol(B))
+  }
+  g_scalar <- as.numeric(g_scalar)
+  g_scalar[!is.finite(g_scalar)] <- 0
 
-  phi_cf2 <- setNames(rep(0, n), syms)
+  f_cf1 <- as.vector(B %*% g_scalar)
+  names(f_cf1) <- syms
+
+  f_cf2 <- setNames(rep(0, length(syms)), syms)
   for (k in sort(unique(labels))) {
     idx <- names(labels)[labels == k]
     idx <- intersect(idx, syms)
     if (length(idx) >= 2) {
-      b_bar <- colMeans(B[idx, , drop=FALSE])
+      b_bar <- colMeans(B[idx, , drop = FALSE])
       for (nm in idx) {
-        phi_cf2[nm] <- sum((B[nm, ] - b_bar) * g_bar)
+        f_cf2[nm] <- sum((B[nm, ] - b_bar) * g_scalar)
       }
     }
   }
-  f_pca_graph <- cbind(f_cf1 = phi_cf1, f_cf2 = phi_cf2)
+  f_pca_graph <- cbind(f_cf1 = f_cf1, f_cf2 = f_cf2)
   rownames(f_pca_graph) <- syms
 
-  # liquidity/activity
-  f_liq <- came_liquidity_features(activity_window, R_window)
-  f_liq <- f_liq[syms, , drop=FALSE]
+  # --- Liquidity/activity block (§8 + §11.4) ---
+  f_liq <- came_liquidity_features(activity_window, R_window, ew_lambda = spec$risk$lambda_e %||% 0.97)
+  f_liq <- f_liq[syms, , drop = FALSE]
 
-  # global state context (broadcast)
+  # Liquidity interactions (§11.4): |s| * illiq_z
+  f_liq_int <- cbind(
+    f_liq_x_mom = abs(sig_art$s_mom[syms]) * f_liq$f_illiq_z,
+    f_liq_x_kal = abs(sig_art$s_kal[syms]) * f_liq$f_illiq_z,
+    f_liq_x_fac = abs(sig_art$s_fac[syms]) * f_liq$f_illiq_z
+  )
+  rownames(f_liq_int) <- syms
+  f_liq_int[!is.finite(f_liq_int)] <- 0
+
+  # Local liquidity mismatch vs neighbors (architecture §12.2 comp5)
+  peer_ltvz <- .came_graph_mv(A, setNames(f_liq$f_ltv_z, syms))
+  peer_illiqz <- .came_graph_mv(A, setNames(f_liq$f_illiq_z, syms))
+  f_liq_local <- cbind(
+    f_peer_ltv_z = peer_ltvz,
+    f_mismatch_ltv_z = f_liq$f_ltv_z - peer_ltvz,
+    f_peer_illiq_z = peer_illiqz,
+    f_mismatch_illiq_z = f_liq$f_illiq_z - peer_illiqz
+  )
+  rownames(f_liq_local) <- syms
+  f_liq_local[!is.finite(f_liq_local)] <- 0
+
+  # --- Ensure liquidity block is a numeric matrix for final assembly ---
+  # (keep f_liq as data.frame above because we use $ access)
+  f_liq_m <- as.data.frame(f_liq, stringsAsFactors = FALSE)
+  for (j in seq_along(f_liq_m)) f_liq_m[[j]] <- as.numeric(f_liq_m[[j]])
+  f_liq_m <- as.matrix(f_liq_m)
+  storage.mode(f_liq_m) <- "double"
+  rownames(f_liq_m) <- syms
+
+  # --- Global state context (§11.5) ---
   m <- m_t
   m[!is.finite(m)] <- 0
-  f_state <- matrix(rep(as.numeric(m), each = n), nrow = n, byrow = FALSE)
+  f_state <- matrix(rep(as.numeric(m), each = length(syms)), nrow = length(syms), byrow = FALSE)
   colnames(f_state) <- paste0("f_state_", names(m))
   rownames(f_state) <- syms
 
-  X <- cbind(mom_multi, resid_multi, f_kal, f_facproj, f_scalar, f_graph, f_pca_graph, f_liq, f_state)
+  # --- Assemble X ---
+  X <- cbind(
+    mom_multi,
+    resid_multi,
+    f_kal,
+    f_facproj,
+    f_scalar,
+    g_mom, g_kal, g_fac,
+    f_graph_meta,
+    f_pca_graph,
+    f_liq_m,
+    f_liq_int,
+    f_liq_local,
+    f_state
+  )
+
+  # enforce numeric matrix (avoid data.frame/list issues)
+  X <- as.matrix(X)
+  storage.mode(X) <- "double"
   X[!is.finite(X)] <- 0
 
   groups <- list(
-    temporal = colnames(mom_multi),
+    temporal_raw = colnames(mom_multi),
     temporal_resid = colnames(resid_multi),
     kalman = colnames(f_kal),
     factor = colnames(f_facproj),
     scalars = colnames(f_scalar),
-    graph = colnames(f_graph),
+    graph_mom = colnames(g_mom),
+    graph_kal = colnames(g_kal),
+    graph_fac = colnames(g_fac),
+    graph_meta = colnames(f_graph_meta),
     pca_graph = colnames(f_pca_graph),
     liquidity = colnames(f_liq),
+    liq_interactions = colnames(f_liq_int),
+    liq_local = colnames(f_liq_local),
     state = colnames(f_state)
   )
 
@@ -1441,35 +2390,100 @@ came_features_build <- function(risk_art, struct_art, sig_art, activity_window, 
 ###############################################################################
 ### FILE: R/08_forecast.R
 ###############################################################################
-# 08_forecast.R — 5-component panel forecast, gating, confidence, error buckets, reliability
+# 08_forecast.R — Forecast engine (architecture §12)
+# 5-component mixture with:
+#   - rolling EW-weighted ridge per component (matured labels only)
+#   - global softmax gating pi_t from m_t
+#   - bounded confidence multipliers kappa_{i,c}
+#   - overlap-aware stagger-bucket component error states (H buckets)
+#   - diagonal Omega (component error covariance) allowed by architecture
+#   - reliability score rho_rel and effective moments (mu_eff, s_eff)
 
-# Component feature subsets (regex-based, architecture-aligned)
+# --- component feature subsets (explicit by patterns) ----------------------
+
 .came_comp_cols <- function(cols, comp) {
   comp <- as.integer(comp)
-  if (comp == 1L) return(grep("^f_(mom_h|resid_mom_h|kal_|facproj|s_).|^f_l", cols, value=TRUE))
-  if (comp == 2L) return(grep("^f_(peer_|shr_|clz_|deg|sgn_).", cols, value=TRUE))
-  if (comp == 3L) return(grep("^f_(rel_|ten_|clz_|deg).", cols, value=TRUE))
-  if (comp == 4L) return(grep("^f_(cf1|cf2|factor_exposure|idio|vol).|^f_facproj", cols, value=TRUE))
-  if (comp == 5L) return(grep("^f_(ltv|lnt|illiq|avg_trade|implied_px|ltv_z|lnt_z)", cols, value=TRUE))
+
+  # Component 1: temporal continuation
+  if (comp == 1L) {
+    return(unique(c(
+      grep("^f_mom_h", cols, value = TRUE),
+      grep("^f_resid_mom_h", cols, value = TRUE),
+      grep("^f_kal_", cols, value = TRUE),
+      "f_facproj",
+      grep("^f_l", cols, value = TRUE), # liquidity logs/z/illiq
+      grep("^f_liq_x_", cols, value = TRUE) # liquidity interactions
+    )))
+  }
+
+  # Component 2: structural continuation / peer confirmation
+  if (comp == 2L) {
+    return(unique(c(
+      grep("^f_peer_", cols, value = TRUE),
+      grep("^f_shr_", cols, value = TRUE),
+      grep("^f_sgn_", cols, value = TRUE),
+      grep("^f_clz_", cols, value = TRUE),
+      grep("^f_clctr_", cols, value = TRUE),
+      "f_deg", "f_node_stab"
+    )))
+  }
+
+  # Component 3: neighborhood mean-reversion risk (required)
+  if (comp == 3L) {
+    return(unique(c(
+      grep("^f_rel_", cols, value = TRUE),
+      grep("^f_ten_", cols, value = TRUE),
+      "f_deg", "f_node_stab",
+      grep("^f_mismatch_", cols, value = TRUE) # local mismatch often drives reversion
+    )))
+  }
+
+  # Component 4: PCA–graph structural dislocation
+  if (comp == 4L) {
+    return(unique(c(
+      "f_cf1", "f_cf2",
+      "f_facproj",
+      "f_deg", "f_node_stab",
+      grep("^f_state_", cols, value = TRUE)
+    )))
+  }
+
+  # Component 5: liquidity/friction-conditioned correction
+  if (comp == 5L) {
+    return(unique(c(
+      grep("^f_l", cols, value = TRUE),
+      grep("^f_liq_x_", cols, value = TRUE),
+      grep("^f_peer_l", cols, value = TRUE),
+      grep("^f_mismatch_", cols, value = TRUE),
+      "f_active"
+    )))
+  }
+
   cols
 }
 
+# --- weighted ridge --------------------------------------------------------
+
 .came_weighted_ridge <- function(X, y, w, lambda) {
-  # minimize sum w_i (y - Xb)^2 + lambda||b||^2 ; returns beta, intercept, scale params
-  X <- as.matrix(X); y <- as.numeric(y)
-  X[!is.finite(X)] <- 0; y[!is.finite(y)] <- 0
-  w <- as.numeric(w); w[!is.finite(w) | w < 0] <- 0
+  X <- as.matrix(X)
+  y <- as.numeric(y)
+  w <- as.numeric(w)
+
+  X[!is.finite(X)] <- 0
+  y[!is.finite(y)] <- 0
+  w[!is.finite(w) | w < 0] <- 0
   if (sum(w) <= 0) w <- rep(1, length(y))
 
-  # standardize
+  # standardize X columns
   mu <- colMeans(X)
-  sdv <- apply(X, 2, sd); sdv[sdv <= 1e-8 | !is.finite(sdv)] <- 1
-  Xs <- scale(X, center = mu, scale = sdv); Xs[!is.finite(Xs)] <- 0
+  sdv <- apply(X, 2, sd)
+  sdv[!is.finite(sdv) | sdv <= 1e-8] <- 1
+  Xs <- scale(X, center = mu, scale = sdv)
+  Xs[!is.finite(Xs)] <- 0
 
   y0 <- weighted.mean(y, w)
   yc <- y - y0
 
-  # apply weights
   sw <- sqrt(w)
   Xw <- Xs * sw
   yw <- yc * sw
@@ -1477,75 +2491,134 @@ came_features_build <- function(risk_art, struct_art, sig_art, activity_window, 
   p <- ncol(Xw)
   XtX <- crossprod(Xw) + lambda * diag(p)
   Xty <- crossprod(Xw, yw)
-  b_std <- tryCatch(solve(XtX, Xty), error = function(e) rep(0, p))
+
+  b_std <- tryCatch(solve(XtX, Xty), error = function(e) NULL)
+  if (is.null(b_std)) stop(came_error("forecast_ridge_solve_failed", "Ridge solve failed (ill-conditioned)"))
+
   b <- as.numeric(b_std) / sdv
   names(b) <- colnames(X)
   intercept <- y0 - sum(b * mu)
-  list(beta=b, intercept=intercept, mu=mu, sd=sdv)
+
+  list(beta = b, intercept = intercept, cols = colnames(X))
 }
 
 .came_predict <- function(X, model) {
-  if (is.null(model) || is.null(model$beta)) return(rep(0, nrow(X)))
+  came_assert(!is.null(model$beta), "forecast_model_beta", "Model missing beta")
   cols <- intersect(names(model$beta), colnames(X))
-  if (length(cols) == 0) return(rep(0, nrow(X)))
-  pred <- as.vector(as.matrix(X[, cols, drop=FALSE]) %*% model$beta[cols]) + model$intercept
+  came_assert(length(cols) > 0, "forecast_predict_cols", "No overlapping columns between model and X")
+  pred <- as.vector(as.matrix(X[, cols, drop = FALSE]) %*% model$beta[cols]) + model$intercept
   pred[!is.finite(pred)] <- 0
   pred
 }
 
-came_build_training_panel <- function(history_snapshots, R_history, H) {
-  # history_snapshots: list(date, X matrix)
-  # R_history: matrix of daily returns with rownames=Date strings and colnames=symbols
-  came_assert(is.matrix(R_history) && !is.null(rownames(R_history)),
-              "forecast_R_history", "R_history must be matrix with rownames as dates")
+# --- training panel builder (strict on feature schema) ---------------------
+
+came_build_training_panel <- function(history_snapshots, R_history, H, required_cols = NULL) {
+  came_assert(
+    is.matrix(R_history) && !is.null(rownames(R_history)),
+    "forecast_R_history", "R_history must be matrix with rownames (Date strings)"
+  )
+
   if (is.null(history_snapshots) || length(history_snapshots) < (H + 5L)) {
-    return(list(X=NULL, y=NULL, w=NULL, asset=NULL, date=NULL, n=0L))
+    return(list(X = NULL, y = NULL, age = NULL, asset = NULL, date = NULL, n = 0L))
   }
 
-  rows_X <- list(); rows_y <- c(); rows_w <- c(); rows_asset <- c(); rows_date <- c()
   dates_R <- as.Date(rownames(R_history))
+  came_assert(!any(is.na(dates_R)), "forecast_R_dates", "R_history rownames must be Date-coercible")
+
+  # Determine schema from required_cols (preferred) or from most recent snapshot
+  if (is.null(required_cols)) {
+    required_cols <- colnames(as.matrix(history_snapshots[[length(history_snapshots)]]$X))
+  }
+  came_assert(!is.null(required_cols) && length(required_cols) > 0, "forecast_required_cols", "No feature schema provided")
+
+  rows_X <- list()
+  rows_y <- c()
+  rows_age <- c()
+  rows_asset <- c()
+  rows_date <- c()
 
   for (snap in history_snapshots) {
     d <- as.Date(snap$date)
     ix <- match(d, dates_R)
-    if (!is.finite(ix) || is.na(ix)) next
-    if (ix + H > nrow(R_history)) next  # label not matured yet
-    X <- as.matrix(snap$X)
-    if (is.null(rownames(X)) || nrow(X) == 0) next
-    syms <- rownames(X)
+    if (is.na(ix)) next
+    if (ix + H > nrow(R_history)) next # label not matured
 
-    # label y_{i,d}^(H) = sum_{h=1..H} r_{i, ix+h}
+    Xs <- as.matrix(snap$X)
+    if (is.null(rownames(Xs)) || nrow(Xs) == 0) next
+
+    # strict schema enforcement
+    came_assert(
+      identical(colnames(Xs), required_cols), "forecast_schema_drift",
+      "Feature schema drift detected across history snapshots (colnames not identical). Rebuild history."
+    )
+
+    syms <- rownames(Xs)
+    # y_{i,d}^{(H)} = sum_{h=1..H} r_{i, ix+h}
     for (sym in syms) {
       if (!(sym %in% colnames(R_history))) next
-      y <- sum(R_history[(ix+1):(ix+H), sym], na.rm = TRUE)
+      y <- sum(R_history[(ix + 1):(ix + H), sym], na.rm = TRUE)
       if (!is.finite(y)) next
-      rows_X[[length(rows_X)+1L]] <- X[sym, , drop=TRUE]
+
+      rows_X[[length(rows_X) + 1L]] <- Xs[sym, , drop = TRUE]
       rows_y <- c(rows_y, y)
       rows_asset <- c(rows_asset, sym)
       rows_date <- c(rows_date, as.character(d))
-      # EW weight by recency: w = ew_lambda^(age)
+
       age <- (nrow(R_history) - (ix + H))
-      rows_w <- c(rows_w, age)
+      rows_age <- c(rows_age, age)
     }
   }
 
-  if (length(rows_y) < 50) return(list(X=NULL, y=NULL, w=NULL, asset=NULL, date=NULL, n=0L))
+  if (length(rows_y) < 100) {
+    return(list(X = NULL, y = NULL, age = NULL, asset = NULL, date = NULL, n = 0L))
+  }
+
   X_panel <- do.call(rbind, rows_X)
-  colnames(X_panel) <- colnames(as.matrix(history_snapshots[[length(history_snapshots)]]$X))
+  colnames(X_panel) <- required_cols
   X_panel[!is.finite(X_panel)] <- 0
-  list(X = X_panel, y = rows_y, age = rows_w, asset = rows_asset, date = rows_date, n=length(rows_y))
+
+  list(X = X_panel, y = rows_y, age = rows_age, asset = rows_asset, date = rows_date, n = length(rows_y))
 }
 
-.came_kappa <- function(liq_z, illiq_z, node_stab, eto, chi, kmin, kmax) {
-  # deterministic, bounded around 1
-  z <- 0.0 +
-    0.6 * (liq_z %||% 0) +
-    (-0.7) * (illiq_z %||% 0) +
-    0.5 * (node_stab %||% 1) +
-    (-0.5) * (eto %||% 0) +
-    (-0.3) * (chi %||% 0)
-  raw <- 1 / (1 + exp(-z))
-  kmin + (kmax - kmin) * raw
+# --- kappa and reliability --------------------------------------------------
+
+.came_kappa_matrix <- function(syms, C, X_now, node_stab, struct_diag, kmin, kmax) {
+  # bounded multipliers around 1; component-specific tilts
+  liq_z <- if ("f_ltv_z" %in% colnames(X_now)) X_now[, "f_ltv_z"] else rep(0, length(syms))
+  illiq_z <- if ("f_illiq_z" %in% colnames(X_now)) X_now[, "f_illiq_z"] else rep(0, length(syms))
+  liq_z[!is.finite(liq_z)] <- 0
+  illiq_z[!is.finite(illiq_z)] <- 0
+
+  eto <- struct_diag$eto %||% 0
+  chi <- struct_diag$chi %||% 0
+
+  ns <- node_stab[syms]
+  ns[!is.finite(ns)] <- 1
+
+  # component-specific scores (deterministic, non-placeholder)
+  # Intuition:
+  #  c1 continuation: likes liquidity, dislikes illiq, dislikes shock
+  #  c2 structural confirmation: likes stability and density/low eto
+  #  c3 mean reversion: rises with dislocation + instability (we proxy via eto/chi)
+  #  c4 pca-graph: likes stable clusters and moderate liquidity (proxy via ns, liq)
+  #  c5 friction correction: higher when illiq is high (so the correction component is "active")
+  z1 <- 0.6 * liq_z - 0.6 * illiq_z + 0.3 * ns - 0.3 * chi
+  z2 <- 0.3 * liq_z - 0.2 * illiq_z + 0.8 * ns - 0.6 * eto - 0.3 * chi
+  z3 <- -0.1 * liq_z + 0.2 * illiq_z + 0.2 * eto + 0.4 * chi
+  z4 <- 0.2 * liq_z - 0.2 * illiq_z + 0.5 * ns - 0.2 * chi
+  z5 <- -0.2 * liq_z + 0.8 * illiq_z - 0.2 * ns + 0.2 * chi
+
+  Z <- cbind(z1, z2, z3, z4, z5)
+  if (C != 5L) {
+    # If C differs, recycle first column pattern safely (strictly deterministic)
+    Z <- Z[, rep(1, C), drop = FALSE]
+  }
+
+  raw <- 1 / (1 + exp(-Z))
+  kappa <- kmin + (kmax - kmin) * raw
+  dimnames(kappa) <- list(syms, paste0("C", seq_len(C)))
+  kappa
 }
 
 .came_rho_rel <- function(liq_z, illiq_z, node_stab, eto, chi, a) {
@@ -1560,24 +2633,26 @@ came_build_training_panel <- function(history_snapshots, R_history, H) {
   r
 }
 
-came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_snapshots, R_history,
-                                 state, spec) {
+# --- main forecast update ---------------------------------------------------
+
+came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_snapshots, R_history, state, spec) {
   C <- as.integer(spec$forecast$n_components %||% 5L)
   H <- as.integer(spec$forecast$H %||% 21L)
+  came_assert(C >= 1, "forecast_C", "n_components must be >= 1")
+  came_assert(H >= 1, "forecast_H", "H must be >= 1")
+
   ridge_lambda <- spec$forecast$ridge_lambda %||% 0.10
   ew_lambda <- spec$forecast$ew_lambda %||% 0.99
   refit_every <- as.integer(spec$forecast$refit_every %||% 5L)
+  lambda_err <- spec$forecast$lambda_err %||% 0.97
 
   syms <- rownames(X_now)
-  came_assert(length(syms) > 0, "forecast_X_now", "X_now must have rownames symbols")
+  came_assert(length(syms) >= 3, "forecast_syms", "X_now must have >=3 rows and rownames as symbols")
 
   st <- state
   st$forecast$step <- as.integer((st$forecast$step %||% 0L) + 1L)
 
-  # training panel
-  panel <- came_build_training_panel(history_snapshots, R_history, H)
-
-  # gating weights π_t
+  # gating pi_t (architecture §12.4)
   A_pi <- spec$gating$A_pi
   b_pi <- spec$gating$b_pi
   came_assert(is.matrix(A_pi) && nrow(A_pi) == C, "forecast_A_pi", "A_pi dims mismatch")
@@ -1587,108 +2662,118 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   pi <- came_softmax(A_pi %*% mtv + b_pi, temperature = spec$gating$temperature %||% 1.0)
   names(pi) <- paste0("C", seq_len(C))
 
-  # Fit / reuse models
+  # training panel (matured labels only)
+  panel <- came_build_training_panel(history_snapshots, R_history, H, required_cols = colnames(X_now))
+
   models <- st$forecast$models
   should_refit <- is.null(models) || (st$forecast$step %% refit_every == 0L)
+
   if (should_refit) {
     came_assert(panel$n > 0, "forecast_no_panel", "Insufficient matured history to fit forecast models (cold start).")
-    # convert age to EW weights
-    w <- (ew_lambda ^ panel$age)
+    w <- (ew_lambda^panel$age)
+
     models <- vector("list", C)
     names(models) <- paste0("C", seq_len(C))
+
     for (c in seq_len(C)) {
       cols <- .came_comp_cols(colnames(panel$X), c)
       cols <- intersect(cols, colnames(panel$X))
       came_assert(length(cols) > 0, "forecast_no_features", paste("No features for component", c))
-      models[[c]] <- .came_weighted_ridge(panel$X[, cols, drop=FALSE], panel$y, w, ridge_lambda)
-      models[[c]]$cols <- cols
+      models[[c]] <- .came_weighted_ridge(panel$X[, cols, drop = FALSE], panel$y, w, ridge_lambda)
     }
+
     st$forecast$models <- models
   } else {
     came_assert(!is.null(models) && length(models) == C, "forecast_models_missing", "Models missing but refit disabled")
   }
 
-  # component means
+  # component means mu^{(c)}_{i,t}
   comp_mu <- matrix(0, length(syms), C, dimnames = list(syms, paste0("C", seq_len(C))))
   for (c in seq_len(C)) {
     cols <- models[[c]]$cols
-    comp_mu[, c] <- .came_predict(X_now[, cols, drop=FALSE], models[[c]])
+    comp_mu[, c] <- .came_predict(X_now[, cols, drop = FALSE], models[[c]])
   }
 
-  # per-asset bounded kappa and normalized q_{i,c}
+  # kappa_{i,c,t} and q_{i,c,t} (architecture §12.5)
   kmin <- spec$forecast$kappa_min %||% 0.7
   kmax <- spec$forecast$kappa_max %||% 1.3
-
-  # covariates from X_now (liquidity z, illiq)
-  liq_z <- if ("f_ltv_z" %in% colnames(X_now)) X_now[, "f_ltv_z"] else rep(0, length(syms))
-  illiq_z <- if ("f_illiq" %in% colnames(X_now)) scale(X_now[, "f_illiq"])[,1] else rep(0, length(syms))
-  liq_z[!is.finite(liq_z)] <- 0; illiq_z[!is.finite(illiq_z)] <- 0
-
-  eto <- struct_diag$eto %||% 0
-  chi <- struct_diag$chi %||% 0
-  ns <- node_stab[syms]; ns[!is.finite(ns)] <- 1
-
-  kappa <- matrix(1, length(syms), C, dimnames=list(syms, paste0("C",seq_len(C))))
-  for (i in seq_along(syms)) {
-    ki <- .came_kappa(liq_z[i], illiq_z[i], ns[i], eto, chi, kmin, kmax)
-    # trimmed choice: κ is per-asset per-component but seeded equal; component-specific extension can be added later
-    kappa[i, ] <- ki
-  }
+  kappa <- .came_kappa_matrix(syms, C, X_now, node_stab, struct_diag, kmin, kmax)
   q_raw <- sweep(kappa, 2, pi, "*")
   q <- q_raw / pmax(rowSums(q_raw), 1e-12)
 
   mu_hat <- rowSums(q * comp_mu)
   names(mu_hat) <- syms
 
-  # forecast history ring buffer: store comp_mu for maturity update
+  # --- store today's component means for future matured error updates
   if (is.null(st$forecast$hist) || !is.list(st$forecast$hist)) st$forecast$hist <- list()
-  st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(date = as.Date(tail(rownames(R_history), 1)), comp_mu = comp_mu)
-  # retain last (H + 30)
-  if (length(st$forecast$hist) > (H + 30L)) st$forecast$hist <- tail(st$forecast$hist, H + 30L)
+  today_date <- as.Date(tail(rownames(R_history), 1))
+  st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(date = today_date, comp_mu = comp_mu)
 
-  # update error buckets using matured date: take entry dated (today - H)
-  lambda_err <- spec$forecast$lambda_err %||% 0.97
+  # retain limited buffer
+  keep_hist <- as.integer(H + 60L)
+  if (length(st$forecast$hist) > keep_hist) st$forecast$hist <- tail(st$forecast$hist, keep_hist)
+
+  # --- stagger-bucket error states (architecture §12.6)
   if (is.null(st$forecast$error_buckets)) {
     st$forecast$error_buckets <- lapply(seq_len(C), function(.) rep(1e-4, H))
     names(st$forecast$error_buckets) <- paste0("C", seq_len(C))
   }
-  # find matured hist entry (by position, aligned to H within retained buffer)
-  # We use date alignment against R_history for correctness.
-  today <- as.Date(tail(rownames(R_history), 1))
-  matured_date <- today - H
-  hist_dates <- vapply(st$forecast$hist, function(h) as.character(h$date), character(1))
-  idx_m <- match(as.character(matured_date), hist_dates)
 
-  if (is.finite(idx_m) && !is.na(idx_m)) {
-    comp_mu_m <- st$forecast$hist[[idx_m]]$comp_mu
-    # actual y^(H) for matured_date
-    dates_R <- as.Date(rownames(R_history))
-    ix <- match(matured_date, dates_R)
-    if (is.finite(ix) && !is.na(ix) && ix + H <= nrow(R_history)) {
-      y_m <- rowSums(R_history[(ix+1):(ix+H), syms, drop=FALSE], na.rm=TRUE)
-      y_m[!is.finite(y_m)] <- 0
-      b <- ((ix - 1) %% H) + 1L
-      for (c in seq_len(C)) {
-        e2 <- (y_m - comp_mu_m[, c])^2
-        e2 <- median(e2, na.rm=TRUE)
-        if (is.finite(e2)) {
-          key <- paste0("C", c)
-          st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * e2
+  # Determine matured trading-day index (NOT calendar subtraction)
+  dates_R <- as.Date(rownames(R_history))
+  came_assert(!any(is.na(dates_R)), "forecast_R_dates2", "R_history rownames must be Date-coercible")
+
+  matured_ix <- nrow(R_history) - H
+  if (matured_ix >= 1 && matured_ix + H <= nrow(R_history)) {
+    matured_date <- dates_R[matured_ix]
+    b <- ((matured_ix - 1) %% H) + 1L
+
+    hist_dates <- vapply(st$forecast$hist, function(h) as.character(h$date), character(1))
+    idx_m <- match(as.character(matured_date), hist_dates)
+
+    if (is.finite(idx_m) && !is.na(idx_m)) {
+      comp_mu_m <- st$forecast$hist[[idx_m]]$comp_mu
+      # realized y^(H) at matured_ix
+      common_assets <- intersect(rownames(comp_mu_m), colnames(R_history))
+      if (length(common_assets) >= 3) {
+        y_m <- rowSums(R_history[(matured_ix + 1):(matured_ix + H), common_assets, drop = FALSE], na.rm = TRUE)
+        y_m[!is.finite(y_m)] <- 0
+
+        for (c in seq_len(C)) {
+          pred <- comp_mu_m[common_assets, c]
+          e2 <- (y_m - pred)^2
+          pool_e2 <- stats::median(e2, na.rm = TRUE)
+          if (is.finite(pool_e2)) {
+            key <- paste0("C", c)
+            st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pool_e2
+          }
         }
       }
     }
   }
 
-  # component uncertainty (diagonal Ω)
-  sig_c <- sapply(st$forecast$error_buckets, function(v) sqrt(median(v, na.rm=TRUE)))
-  sig_c[!is.finite(sig_c) | sig_c <= 0] <- 0.01
+  # Omega diagonal from buckets (architecture §12.7)
+  comp_sigma <- sapply(st$forecast$error_buckets, function(v) sqrt(stats::median(v, na.rm = TRUE)))
+  comp_sigma[!is.finite(comp_sigma) | comp_sigma <= 0] <- 0.01
+
+  # combined uncertainty s^(H) (architecture §12.7)
   sigma_hat <- setNames(rep(0, length(syms)), syms)
   for (i in seq_along(syms)) {
-    sigma_hat[i] <- sqrt(sum((q[i, ]^2) * (sig_c^2)))
+    sigma_hat[i] <- sqrt(sum((q[i, ]^2) * (comp_sigma^2)))
   }
   sigma_hat[!is.finite(sigma_hat) | sigma_hat <= 0] <- 0.01
 
-  # reliability
+  # reliability (architecture §12.8)
+  liq_z <- if ("f_ltv_z" %in% colnames(X_now)) X_now[, "f_ltv_z"] else rep(0, length(syms))
+  illiq_z <- if ("f_illiq_z" %in% colnames(X_now)) X_now[, "f_illiq_z"] else rep(0, length(syms))
+  liq_z[!is.finite(liq_z)] <- 0
+  illiq_z[!is.finite(illiq_z)] <- 0
+
+  eto <- struct_diag$eto %||% 0
+  chi <- struct_diag$chi %||% 0
+  ns <- node_stab[syms]
+  ns[!is.finite(ns)] <- 1
+
   a <- spec$reliability$a
   rho <- setNames(rep(0.8, length(syms)), syms)
   for (i in seq_along(syms)) {
@@ -1705,14 +2790,14 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
       sigma_hat = sigma_hat,
       s_eff = s_eff,
       pi = pi,
-      q = q,
       kappa = kappa,
+      q = q,
       comp_mu = comp_mu,
-      rho = rho,
-      comp_sigma = sig_c
+      comp_sigma = comp_sigma,
+      rho = rho
     ),
     state_out = st,
-    diag = list(refit = should_refit, panel_n = panel$n)
+    diag = list(refit = should_refit, panel_n = panel$n, matured_ix = matured_ix)
   )
 }
 
@@ -1721,17 +2806,15 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
 ###############################################################################
 ### FILE: R/09_optimizer.R
 ###############################################################################
-# 09_optimizer.R — continuous long-only QP with turnover auxiliaries, post-shaping
+# 09_optimizer.R — continuous long-only QP + portfolio wrapper with tradability/frozen carry
 
 came_optimizer_controls <- function(m_t, spec) {
-  # trimmed deterministic maps (architecture-compatible)
   vov <- m_t["VoV"] %||% 0
   disp <- m_t["disp"] %||% 0
 
   gamma <- (spec$optimizer$gamma_base %||% 1.0) * exp((spec$optimizer$gamma_vov_scale %||% 1.0) * vov)
   gamma <- pmin(20, pmax(0.1, gamma))
 
-  # turnover cost scalar (linear)
   tau <- (spec$optimizer$turnover_cost_base %||% 5.0) * (1 + (spec$optimizer$tau_disp_scale %||% 0.5) * abs(disp))
   tau <- pmax(0, tau)
 
@@ -1742,21 +2825,25 @@ came_optimizer_controls <- function(m_t, spec) {
 }
 
 .came_project_simplex_capped <- function(w, target_sum, cap) {
-  # simple deterministic projection: clip then renormalize iteratively
-  w <- pmax(0, w); w[!is.finite(w)] <- 0
-  if (target_sum <= 0) return(w*0)
+  w <- pmax(0, w)
+  w[!is.finite(w)] <- 0
+  if (!is.finite(target_sum) || target_sum <= 0) {
+    return(w * 0)
+  }
+
   cap <- max(cap, 0)
   w <- pmin(w, cap)
+
   s <- sum(w)
   if (s <= 0) {
-    # spread evenly
     n <- length(w)
     w[] <- min(cap, target_sum / n)
-    w <- w * (target_sum / sum(w))
+    if (sum(w) > 0) w <- w * (target_sum / sum(w))
     return(w)
   }
+
   w <- w * (target_sum / s)
-  # enforce cap again
+
   for (iter in 1:50) {
     over <- which(w > cap + 1e-12)
     if (length(over) == 0) break
@@ -1767,63 +2854,88 @@ came_optimizer_controls <- function(m_t, spec) {
     add <- excess * w[under] / sum(w[under])
     w[under] <- w[under] + add
     w <- pmax(0, w)
-    w <- w * (target_sum / sum(w))
+    if (sum(w) > 0) w <- w * (target_sum / sum(w))
   }
   w
 }
 
-came_optimize_qp <- function(mu_eff, Sigma_H, prev_w, caps, rho_gross, gamma, tau, illiq_z = NULL, strict = TRUE) {
+came_post_shape <- function(w, target_sum, cap, drop_thr = 1e-6) {
+  w[!is.finite(w)] <- 0
+  w[w < drop_thr] <- 0
+  w <- pmin(pmax(w, 0), cap)
+  if (sum(w) > 0 && target_sum > 0) w <- w * (target_sum / sum(w))
+  w
+}
+
+came_optimize_qp <- function(mu_eff, Sigma_H, prev_w, caps, rho_gross, gamma, tau,
+                             illiq_z = NULL, turnover_illiq_scale = 2.0, strict = TRUE) {
   came_require("quadprog")
+  came_assert(is.matrix(Sigma_H), "opt_Sigma_type", "Sigma_H must be a matrix")
+  came_assert(nrow(Sigma_H) == ncol(Sigma_H), "opt_Sigma_square", "Sigma_H must be square")
+
   syms <- colnames(Sigma_H)
+  came_assert(
+    !is.null(syms) && identical(syms, rownames(Sigma_H)),
+    "opt_Sigma_names", "Sigma_H must have identical row/col names"
+  )
+
   n <- length(syms)
 
-  mu <- mu_eff[syms]; mu[!is.finite(mu)] <- 0
-  prev <- prev_w[syms]; prev[!is.finite(prev)] <- 0
-  cap <- caps[syms]; cap[!is.finite(cap) | cap < 0] <- 0
+  if (!is.finite(rho_gross) || rho_gross < 0) rho_gross <- 0
+  if (rho_gross == 0 || n == 0) {
+    return(list(w = setNames(rep(0, n), syms), method = "trivial_zero", obj = NA_real_))
+  }
 
-  # turnover cost per asset: tau * (1 + scale*illiq_z)
+  mu <- mu_eff[syms]
+  mu[!is.finite(mu)] <- 0
+  prev <- prev_w[syms]
+  prev[!is.finite(prev)] <- 0
+  cap <- caps[syms]
+  cap[!is.finite(cap) | cap < 0] <- 0
+
+  # turnover cost per asset
   k_turn <- rep(tau, n)
   if (!is.null(illiq_z)) {
-    z <- illiq_z[syms]; z[!is.finite(z)] <- 0
-    k_turn <- tau * (1 + 0.5 * pmax(z, 0))
+    z <- illiq_z[syms]
+    z[!is.finite(z)] <- 0
+    scale_illiq <- turnover_illiq_scale
+    if (!is.finite(scale_illiq) || scale_illiq < 0) scale_illiq <- 2.0
+    k_turn <- tau * (1 + 0.5 * scale_illiq * pmax(z, 0))
   }
 
   # Variables x = [w (n), d (n)]
-  # Objective: maximize mu'w - (gamma/2) w'Sigma w - k_turn' d
-  # quadprog solves min 1/2 x'D x - dvec'x
   eps_d <- 1e-8
-  Dmat <- matrix(0, 2*n, 2*n)
-  Dmat[1:n, 1:n] <- gamma * came_symmetrize(Sigma_H)
-  diag(Dmat[(n+1):(2*n), (n+1):(2*n)]) <- eps_d  # make PD
+  eps_w <- 1e-10
+
+  Dmat <- matrix(0, 2 * n, 2 * n)
+  Ssym <- came_symmetrize(Sigma_H)
+  Dmat[1:n, 1:n] <- gamma * Ssym + eps_w * diag(n)
+  diag(Dmat[(n + 1):(2 * n), (n + 1):(2 * n)]) <- eps_d
 
   dvec <- c(mu, -k_turn)
 
   # Constraints Amat^T x >= bvec
-  # Equality: sum(w) = rho_gross => two inequalities: sum(w) >= rho_gross and -sum(w) >= -rho_gross with meq=0 is messy.
-  # quadprog supports meq; we set first constraint as equality.
-  Amat <- NULL; bvec <- NULL
-
-  # 1) equality sum(w)=rho_gross
+  # meq=1 => first constraint equality: sum(w)=rho_gross
   Amat <- cbind(c(rep(1, n), rep(0, n)))
   bvec <- c(rho_gross)
 
-  # 2) w >= 0
+  # w >= 0
   Amat <- cbind(Amat, rbind(diag(n), matrix(0, n, n)))
   bvec <- c(bvec, rep(0, n))
 
-  # 3) w <= cap => -w >= -cap
+  # w <= cap  => -w >= -cap
   Amat <- cbind(Amat, rbind(-diag(n), matrix(0, n, n)))
   bvec <- c(bvec, -cap)
 
-  # 4) d >= 0
+  # d >= 0
   Amat <- cbind(Amat, rbind(matrix(0, n, n), diag(n)))
   bvec <- c(bvec, rep(0, n))
 
-  # 5) d - w >= -prev  (d >= w - prev)
+  # d >= w - prev  => d - w >= -prev
   Amat <- cbind(Amat, rbind(-diag(n), diag(n)))
   bvec <- c(bvec, -prev)
 
-  # 6) d + w >= prev (d >= prev - w)
+  # d >= prev - w  => d + w >= prev
   Amat <- cbind(Amat, rbind(diag(n), diag(n)))
   bvec <- c(bvec, prev)
 
@@ -1831,9 +2943,9 @@ came_optimize_qp <- function(mu_eff, Sigma_H, prev_w, caps, rho_gross, gamma, ta
     quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 1L),
     error = function(e) e
   )
+
   if (inherits(sol, "error")) {
     if (isTRUE(strict)) stop(came_error("opt_qp_failed", sol$message))
-    # minimal legitimate fallback: capped simplex projection of prev weights to rho_gross
     w <- prev
     w <- .came_project_simplex_capped(w, rho_gross, max(cap))
     names(w) <- syms
@@ -1850,12 +2962,130 @@ came_optimize_qp <- function(mu_eff, Sigma_H, prev_w, caps, rho_gross, gamma, ta
   list(w = w, method = "qp", obj = sol$value)
 }
 
-came_post_shape <- function(w, rho_gross, cap, drop_thr = 1e-6) {
-  w[!is.finite(w)] <- 0
-  w[w < drop_thr] <- 0
-  w <- pmin(pmax(w, 0), cap)
-  if (sum(w) > 0) w <- w * (rho_gross / sum(w))
-  w
+came_optimize_portfolio <- function(mu_eff, Sigma_H, prev_w, caps, a_t,
+                                    rho_gross, gamma, tau,
+                                    illiq_z = NULL, turnover_illiq_scale = 2.0,
+                                    eps_hold = 1e-8, drop_thr = 1e-6,
+                                    strict = TRUE) {
+  came_assert(is.matrix(Sigma_H), "opt_port_Sigma", "Sigma_H must be matrix")
+  syms <- colnames(Sigma_H)
+  came_assert(
+    !is.null(syms) && identical(syms, rownames(Sigma_H)),
+    "opt_port_Sigma_names", "Sigma_H must have identical row/col names"
+  )
+
+  # align vectors
+  mu <- mu_eff[syms]
+  mu[!is.finite(mu)] <- 0
+  cap <- caps[syms]
+  cap[!is.finite(cap) | cap < 0] <- 0
+  prev <- prev_w[syms]
+  prev[!is.finite(prev)] <- 0
+  a <- a_t[syms]
+  came_assert(!any(is.na(a)), "opt_port_a_t", "a_t must be named logical for all symbols")
+
+  frozen <- syms[(!a) & (prev > (eps_hold %||% 1e-8))]
+  fixed_w <- prev[frozen]
+  fixed_w[!is.finite(fixed_w)] <- 0
+
+  if (isTRUE(strict)) {
+    if (length(frozen) > 0) {
+      overcap <- frozen[fixed_w > cap[frozen] + 1e-12]
+      came_assert(
+        length(overcap) == 0, "opt_port_frozen_overcap",
+        paste("Frozen names exceed cap:", paste(overcap, collapse = ", "))
+      )
+    }
+  }
+
+  fixed_sum <- sum(fixed_w)
+
+  # If frozen carry already exceeds rho_gross, strict must error.
+  # Non-strict: accept reality; set effective gross to fixed_sum.
+  rho_eff <- rho_gross
+  if (!is.finite(rho_eff) || rho_eff < 0) rho_eff <- 0
+
+  if (fixed_sum > rho_eff + 1e-12) {
+    if (isTRUE(strict)) {
+      stop(came_error(
+        "opt_port_fixed_exceeds_gross",
+        sprintf("Frozen carry sum %.6f exceeds rho_gross %.6f", fixed_sum, rho_eff)
+      ))
+    } else {
+      rho_eff <- fixed_sum
+    }
+  }
+
+  free <- syms[a]
+  rho_free <- max(0, rho_eff - fixed_sum)
+
+  w_all <- setNames(rep(0, length(syms)), syms)
+  if (length(frozen) > 0) w_all[frozen] <- fixed_w
+
+  method <- "frozen_only"
+  qp_diag <- NULL
+
+  if (rho_free > 0) {
+    came_assert(
+      length(free) >= 1, "opt_port_no_tradables",
+      "rho_free > 0 but no tradable assets available"
+    )
+
+    # Incorporate cross-covariance with fixed weights:
+    # objective includes - (gamma) w_free' Sigma_fF w_fixed as linear term
+    mu_adj <- mu[free]
+    if (length(frozen) > 0) {
+      cross <- Sigma_H[free, frozen, drop = FALSE] %*% fixed_w
+      cross <- as.numeric(cross)
+      names(cross) <- free
+      mu_adj <- mu_adj - gamma * cross
+    }
+
+    Sigma_ff <- Sigma_H[free, free, drop = FALSE]
+    prev_free <- prev[free]
+    cap_free <- cap[free]
+    illiq_free <- if (!is.null(illiq_z)) illiq_z[free] else NULL
+
+    sol <- came_optimize_qp(
+      mu_eff = mu_adj,
+      Sigma_H = Sigma_ff,
+      prev_w = prev_free,
+      caps = cap_free,
+      rho_gross = rho_free,
+      gamma = gamma,
+      tau = tau,
+      illiq_z = illiq_free,
+      turnover_illiq_scale = turnover_illiq_scale,
+      strict = strict
+    )
+
+    w_free <- sol$w
+    w_free <- came_post_shape(w_free, rho_free, cap_free, drop_thr = drop_thr)
+    w_all[free] <- w_free
+
+    method <- paste0("portfolio_", sol$method)
+    qp_diag <- list(
+      rho_eff = rho_eff, rho_free = rho_free, fixed_sum = fixed_sum,
+      n_free = length(free), n_frozen = length(frozen)
+    )
+  }
+
+  risky_sum <- sum(w_all)
+  cash <- 1 - risky_sum
+  if (!is.finite(cash)) cash <- 0
+  if (cash < -1e-8 && isTRUE(strict)) {
+    stop(came_error("opt_port_negative_cash", sprintf("cash=%.6f (sum weights=%.6f)", cash, risky_sum)))
+  }
+  cash <- max(0, cash)
+
+  list(
+    w = w_all,
+    cash = cash,
+    frozen = frozen,
+    free = free,
+    method = method,
+    diag = qp_diag
+  )
 }
 
 
@@ -1863,7 +3093,7 @@ came_post_shape <- function(w, rho_gross, cap, drop_thr = 1e-6) {
 ###############################################################################
 ### FILE: R/10_runner.R
 ###############################################################################
-# 10_runner.R — end-to-end snapshot runner (hard restart)
+# 10_runner.R — end-to-end snapshot runner (hard restart) with tradability-correct optimization
 
 came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, state = NULL, prev_target = NULL) {
   spec <- spec %||% came_spec_default()
@@ -1876,14 +3106,13 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   cal <- adapter$calendar()
   as_of_date <- as.Date(as_of_date)
   if (!(as_of_date %in% cal)) {
-    # strict causality: snap to latest available <= as_of_date
     as_of_date <- max(cal[cal <= as_of_date])
     came_assert(is.finite(as_of_date) && !is.na(as_of_date), "runner_no_date", "No calendar date <= as_of_date")
   }
 
-  # universe: investable ∪ previous holdings
   inv <- adapter$investable_universe(as_of_date, spec$data)
   eps_hold <- spec$data$eps_hold %||% 1e-8
+
   prev_hold <- character(0)
   if (!is.null(prev_target) && is.data.frame(prev_target)) {
     prev_hold <- prev_target$symbol[is.finite(prev_target$weight_target) & prev_target$weight_target > eps_hold]
@@ -1891,20 +3120,28 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   } else if (!is.null(state$prev_target)) {
     prev_hold <- state$prev_target$symbol[state$prev_target$weight_target > eps_hold]
   }
+
   univ <- unique(c(inv, prev_hold))
   came_assert(length(univ) >= 3, "runner_universe_small", "Universe too small to run model (need >=3 assets).")
 
-  # windows
   L <- spec$risk$lookback %||% 252L
   H <- spec$forecast$H %||% 21L
   lookback <- max(L, max(spec$signals$mom_horizons), 63L) + H + 5L
 
   P_win <- adapter$prices(as_of_date, lookback + 1L, univ, strict = TRUE)
   came_assert(ncol(P_win) >= 3, "runner_price_strict", "Too few assets with complete price history under strict policy.")
-  R_win <- diff(log(pmax(P_win, 1e-12))); R_win[!is.finite(R_win)] <- 0
+  R_win <- diff(log(pmax(P_win, 1e-12)))
+  R_win[!is.finite(R_win)] <- 0
 
-  # activity (for last 63 days)
   act <- adapter$activity(as_of_date, min(63L, nrow(P_win)), colnames(P_win), strict = FALSE)
+
+  # Tradability mask a_{i,t}
+  tv_t <- act$traded_value[nrow(act$traded_value), ]
+  nt_t <- act$n_trades[nrow(act$n_trades), ]
+  cl_t <- P_win[nrow(P_win), ]
+
+  a_t <- (is.finite(tv_t) & tv_t > 0) & (is.finite(nt_t) & nt_t > 0) & (is.finite(cl_t) & cl_t > 0)
+  a_t <- a_t[colnames(P_win)]
 
   # ---- risk ----
   risk_res <- came_risk_update(tail(R_win, L), state, spec)
@@ -1914,47 +3151,46 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   # ---- structure ----
   activity_last <- act$traded_value[nrow(act$traded_value), ]
   names(activity_last) <- colnames(act$traded_value)
+
   struct_res <- came_structure_update(risk_art$Theta, activity_last, state1, spec)
   struct_art <- struct_res$structure
   state2 <- struct_res$state_out
 
-  # ---- global state vector m_t (architecture §11.5 trimmed) ----
-  # disp: cross-sectional sd of last-day returns
+  # ---- global state vector m_t ----
   r_t <- R_win[nrow(R_win), ]
-  disp <- sd(r_t, na.rm = TRUE); if (!is.finite(disp)) disp <- 0
-  # eta_mode: market-mode dominance proxy (largest eigen / p) from rolling corr
+  disp <- sd(r_t, na.rm = TRUE)
+  if (!is.finite(disp)) disp <- 0
+
   R_eta <- tail(R_win, min(nrow(R_win), 126L))
-  C <- tryCatch(cor(R_eta, use="pairwise.complete.obs"), error = function(e) NULL)
-  if (is.null(C)) {
+  Cmat <- tryCatch(cor(R_eta, use = "pairwise.complete.obs"), error = function(e) NULL)
+  if (is.null(Cmat)) {
     eta <- 0
   } else {
-    C[!is.finite(C)] <- 0; diag(C) <- 1
-    ev <- tryCatch(eigen(C, symmetric=TRUE, only.values=TRUE)$values, error = function(e) NULL)
+    Cmat[!is.finite(Cmat)] <- 0
+    diag(Cmat) <- 1
+    ev <- tryCatch(eigen(Cmat, symmetric = TRUE, only.values = TRUE)$values, error = function(e) NULL)
     eta <- if (is.null(ev)) 0 else (max(ev) / length(ev))
     if (!is.finite(eta)) eta <- 0
   }
-  # VoV: sd of log median vol changes
-  med_vol <- apply(tail(R_win, min(nrow(R_win), 63L)), 1, function(r) {
-    v <- apply(matrix(r, nrow=1), 2, sd) # trivial but keeps structure; replaced below
-    NA_real_
-  })
-  # operational: use rolling median of sigma_daily from EWMA reconstruction
-  sigma_daily <- sqrt(came_pi_vector(state2$risk$sigma2, colnames(P_win), init_val = 1e-4))
-  VoV <- sd(diff(log(rep(median(sigma_daily, na.rm=TRUE), 10))), na.rm=TRUE) # conservative; improves when retain_debug enabled
+
+  vov_lambda <- spec$risk$vov_lambda %||% 0.97
+  vov_upd <- came_update_vov(state2, risk_art$sigma2, lambda_vov = vov_lambda)
+  state2 <- vov_upd$state
+  VoV <- vov_upd$VoV
   if (!is.finite(VoV)) VoV <- 0
 
   dens <- struct_art$diag$density %||% 0
   eto <- struct_art$diag$eto %||% 0
   chi <- struct_art$diag$chi %||% 0
 
-  tv_t <- act$traded_value[nrow(act$traded_value), ]
-  nt_t <- act$n_trades[nrow(act$n_trades), ]
-  frac_active <- mean(tv_t > 0 & nt_t > 0, na.rm=TRUE)
-  liq_med_logv <- median(log1p(tv_t), na.rm=TRUE)
-  liq_med_logntr <- median(log1p(nt_t), na.rm=TRUE)
+  frac_active <- mean(tv_t > 0 & nt_t > 0, na.rm = TRUE)
+  liq_med_logv <- median(log1p(tv_t), na.rm = TRUE)
+  liq_med_logntr <- median(log1p(nt_t), na.rm = TRUE)
 
-  m_t <- c(disp = disp, eta = eta, VoV = VoV, dens = dens, eto = eto, chi = chi,
-           liq_med_logv = liq_med_logv, liq_med_logntr = liq_med_logntr, liq_frac_active = frac_active)
+  m_t <- c(
+    disp = disp, eta = eta, VoV = VoV, dens = dens, eto = eto, chi = chi,
+    liq_med_logv = liq_med_logv, liq_med_logntr = liq_med_logntr, liq_frac_active = frac_active
+  )
   m_t[!is.finite(m_t)] <- 0
 
   # ---- signals ----
@@ -1966,66 +3202,77 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   # ---- features ----
   feat_res <- came_features_build(risk_art, struct_art, sig_art, act, tail(R_win, 63L), m_t, spec)
   X_now <- feat_res$X
+
   state4 <- came_history_append(state3, as_of_date, X_now, keep = spec$forecast$history_keep %||% 300L)
 
   # ---- forecast ----
   R_history <- tail(R_win, min(nrow(R_win), spec$forecast$history_keep %||% 300L))
-  # Ensure rownames are Dates (from prices)
-  rownames(R_history) <- rownames(R_win)[(nrow(R_win)-nrow(R_history)+1):nrow(R_win)]
+  rownames(R_history) <- rownames(R_win)[(nrow(R_win) - nrow(R_history) + 1):nrow(R_win)]
   hist_snaps <- state4$history$snapshots
 
-  node_stab <- struct_res$state_out$structure$labels # placeholder for now? NO. use computed stability:
-  node_stab <- struct_res$structure$ops$deg
-  node_stab <- node_stab / max(node_stab, 1e-8)
+  node_stab <- struct_art$node_stab
+  node_stab <- node_stab[colnames(P_win)]
   node_stab[!is.finite(node_stab)] <- 1
-  # use true node stability if available from internal computations
-  # (we already have node stability inside came_structure_update? currently not returned; keep deg-based as deterministic proxy)
 
   fc_res <- came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec)
   fc_art <- fc_res$forecast
   state5 <- fc_res$state_out
 
-  # ---- optimizer ----
+  # ---- optimizer controls ----
   ctrl <- came_optimizer_controls(m_t, spec)
 
-  # caps: liquidity-aware bound (monotone in traded_value)
-  tv <- act$traded_value[nrow(act$traded_value), ]
-  tv <- tv[colnames(P_win)]
+  # caps (liquidity-aware)
+  tv <- tv_t[colnames(P_win)]
   tv[!is.finite(tv) | tv < 0] <- 0
-  liq_z <- scale(log1p(tv))[,1]; liq_z[!is.finite(liq_z)] <- 0
+  liq_z <- scale(log1p(tv))[, 1]
+  liq_z[!is.finite(liq_z)] <- 0
+
   max_base <- spec$optimizer$max_weight_base %||% 0.15
   cap <- max_base * (0.5 + 0.5 * (1 / (1 + exp(-(liq_z)))))
   cap <- pmin(max_base, pmax(spec$optimizer$max_weight_min %||% 0.01, cap))
   names(cap) <- names(tv)
 
+  # prev weights vector
   prev_w <- came_extract_prev_weights(prev_target) %||% came_extract_prev_weights(state5$prev_target)
-  if (is.null(prev_w)) prev_w <- setNames(rep(0, length(cap)), names(cap))
-  prev_w <- came_pi_vector(prev_w, names(cap), init_val = 0)
+  if (is.null(prev_w)) prev_w <- setNames(rep(0, length(a_t)), names(a_t))
+  prev_w <- came_pi_vector(prev_w, names(a_t), init_val = 0)
 
-  opt <- came_optimize_qp(
+  # illiquidity z for turnover scaling
+  illiq_z <- NULL
+  if ("f_illiq" %in% colnames(X_now)) {
+    illiq_z <- scale(X_now[, "f_illiq"])[, 1]
+    illiq_z[!is.finite(illiq_z)] <- 0
+  }
+
+  # portfolio-level optimization with frozen carry handling
+  opt_res <- came_optimize_portfolio(
     mu_eff = fc_art$mu_eff,
     Sigma_H = risk_art$Sigma_H,
     prev_w = prev_w,
     caps = cap,
+    a_t = a_t,
     rho_gross = ctrl$rho_gross,
     gamma = ctrl$gamma,
     tau = ctrl$tau,
-    illiq_z = if ("f_illiq" %in% colnames(X_now)) scale(X_now[, "f_illiq"])[,1] else NULL,
+    illiq_z = illiq_z,
+    turnover_illiq_scale = spec$optimizer$turnover_cost_illiq_scale %||% 2.0,
+    eps_hold = eps_hold,
+    drop_thr = 1e-6,
     strict = isTRUE(spec$meta$strict)
   )
-  w_risky <- opt$w
-  w_risky <- came_post_shape(w_risky, ctrl$rho_gross, cap, drop_thr = 1e-6)
-  cash_w <- 1 - sum(w_risky); if (!is.finite(cash_w) || cash_w < 0) cash_w <- max(0, 1 - ctrl$rho_gross)
+
+  w_risky <- opt_res$w
+  cash_w <- opt_res$cash
 
   weights_df <- data.frame(symbol = names(w_risky), weight_target = as.numeric(w_risky), stringsAsFactors = FALSE)
-  weights_df <- weights_df[weights_df$weight_target > 1e-8, , drop=FALSE]
+  weights_df <- weights_df[weights_df$weight_target > 1e-8, , drop = FALSE]
 
-  # update prev_target in state
   state5$prev_target <- weights_df
 
   out <- list(
     as_of_date = as.Date(as_of_date),
     universe = names(cap),
+    m_t = m_t,
     weights = weights_df,
     cash_weight = cash_w,
     risk = list(Sigma_1 = risk_art$Sigma_1, Sigma_H = risk_art$Sigma_H, Theta = risk_art$Theta),
@@ -2033,7 +3280,14 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     signals = sig_art,
     features = list(n_features = ncol(X_now), groups = feat_res$groups),
     forecast = fc_art,
-    optimizer = list(method = opt$method, gamma = ctrl$gamma, tau = ctrl$tau, rho_gross = ctrl$rho_gross, caps = cap),
+    optimizer = list(
+      method = opt_res$method,
+      gamma = ctrl$gamma,
+      tau = ctrl$tau,
+      rho_gross = ctrl$rho_gross,
+      caps = cap,
+      frozen = opt_res$frozen
+    ),
     meta = list(spec_hash = came_hash(spec)),
     state_out = state5
   )
