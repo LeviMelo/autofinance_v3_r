@@ -381,10 +381,22 @@
 
   lsap <- clue::solve_LSAP
   if ("maximum" %in% names(formals(lsap))) {
+    overlap <- as.matrix(overlap)
+    overlap[!is.finite(overlap)] <- 0
+    overlap[overlap < 0] <- 0
     perm <- as.integer(lsap(overlap, maximum = TRUE))
   } else {
+    overlap <- as.matrix(overlap)
+    overlap[!is.finite(overlap)] <- 0
+    overlap[overlap < 0] <- 0
+
     m <- max(overlap)
+    if (!is.finite(m)) m <- 0
+
     cost <- m - overlap
+    cost[!is.finite(cost)] <- m
+    cost[cost < 0] <- 0 # <-- critical hard clamp
+
     perm <- as.integer(lsap(cost))
   }
 

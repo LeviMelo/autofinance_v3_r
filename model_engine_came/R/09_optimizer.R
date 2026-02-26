@@ -102,7 +102,9 @@ came_optimize_qp <- function(mu_eff, Sigma_H, prev_w, caps, rho_gross, gamma, ta
   Dmat <- matrix(0, 2 * n, 2 * n)
   Ssym <- came_symmetrize(Sigma_H)
   Dmat[1:n, 1:n] <- gamma * Ssym + eps_w * diag(n)
-  diag(Dmat[(n + 1):(2 * n), (n + 1):(2 * n)]) <- eps_d
+
+  idx <- (n + 1):(2 * n)
+  Dmat[cbind(idx, idx)] <- rep(eps_d, n)
 
   dvec <- c(mu, -k_turn)
 

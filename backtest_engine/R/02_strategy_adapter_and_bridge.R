@@ -174,8 +174,8 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
         spec_d$meta$no_trade <- !is_last
 
         # use prev_target only on the trade day (to reflect real holdings);
-        # on warmup days, pass NULL to avoid injecting false portfolio constraints (we changed this for some reason)
-        pt <- prev_target_trade
+        # Warmup/catch-up days run in no-trade mode and should not inject portfolio constraints.
+        pt <- if (is_last) prev_target_trade else NULL
 
         snap <- tryCatch(
             came_run_snapshot(

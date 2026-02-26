@@ -167,6 +167,33 @@ came_quantile_safe <- function(x, p, default = NA_real_) {
   as.numeric(stats::quantile(x, probs = p, na.rm = TRUE, names = FALSE, type = 7))
 }
 
+came_solve_lsap_max <- function(score_mat) {
+  # Solve linear sum assignment maximizing score_mat.
+  # Compatible with clue versions that require nonnegative entries
+  # and may or may not support solve_LSAP(..., maximum=TRUE).
+
+  came_require("clue")
+
+  S <- as.matrix(score_mat)
+  S[!is.finite(S)] <- 0
+  S[S < 0] <- 0
+
+  lsap <- clue::solve_LSAP
+
+  # Newer clue supports maximum=TRUE
+  if ("maximum" %in% names(formals(lsap))) {
+    return(as.integer(lsap(S, maximum = TRUE)))
+  }
+
+  # Older clue: convert to nonnegative minimization cost
+  m <- max(S)
+  cost <- m - S
+  cost[!is.finite(cost)] <- m
+  cost[cost < 0] <- 0
+
+  as.integer(lsap(cost))
+}
+
 
 
 ###############################################################################
@@ -893,9 +920,32 @@ came_make_data_adapter <- function(data_bundle_or_panel) {
   }
 
   C <- t(B_prev[common, , drop = FALSE]) %*% B_raw[common, , drop = FALSE] # k x k
-  cost <- -abs(C)
+  A <- abs(C)
+  A[!is.finite(A)] <- 0
 
-  perm <- as.integer(clue::solve_LSAP(cost))
+  lsap <- clue::solve_LSAP
+  if ("maximum" %in% names(formals(lsap))) {
+    # A is a score matrix; maximize it
+    A <- as.matrix(A)
+    A[!is.finite(A)] <- 0
+    A[A < 0] <- 0
+    perm <- as.integer(lsap(A, maximum = TRUE))
+  } else {
+    # Older clue: minimize a nonnegative cost matrix derived from scores
+    A <- as.matrix(A)
+    A[!is.finite(A)] <- 0
+    A[A < 0] <- 0
+
+    m <- max(A)
+    if (!is.finite(m)) m <- 0
+
+    cost <- m - A
+    cost[!is.finite(cost)] <- m
+    cost[cost < 0] <- 0 # <-- critical hard clamp
+
+    perm <- as.integer(lsap(cost))
+  }
+
   signs <- rep(1, k)
   for (j in seq_len(k)) {
     v <- C[perm[j], j]
@@ -1466,7 +1516,30 @@ came_risk_update <- function(R_window, state, spec) {
   overlap <- matrix(0, K, K)
   for (nm in common) overlap[labels_new[nm], labels_prev[nm]] <- overlap[labels_new[nm], labels_prev[nm]] + 1
 
-  perm <- as.integer(clue::solve_LSAP(-overlap))
+  overlap[!is.finite(overlap)] <- 0
+  overlap[overlap < 0] <- 0
+
+  lsap <- clue::solve_LSAP
+  if ("maximum" %in% names(formals(lsap))) {
+    overlap <- as.matrix(overlap)
+    overlap[!is.finite(overlap)] <- 0
+    overlap[overlap < 0] <- 0
+    perm <- as.integer(lsap(overlap, maximum = TRUE))
+  } else {
+    overlap <- as.matrix(overlap)
+    overlap[!is.finite(overlap)] <- 0
+    overlap[overlap < 0] <- 0
+
+    m <- max(overlap)
+    if (!is.finite(m)) m <- 0
+
+    cost <- m - overlap
+    cost[!is.finite(cost)] <- m
+    cost[cost < 0] <- 0 # <-- critical hard clamp
+
+    perm <- as.integer(lsap(cost))
+  }
+
   map <- rep(NA_integer_, K)
   for (col in seq_len(K)) map[perm[col]] <- col
 
@@ -3010,7 +3083,9 @@ came_optimize_qp <- function(mu_eff, Sigma_H, prev_w, caps, rho_gross, gamma, ta
   Dmat <- matrix(0, 2 * n, 2 * n)
   Ssym <- came_symmetrize(Sigma_H)
   Dmat[1:n, 1:n] <- gamma * Ssym + eps_w * diag(n)
-  diag(Dmat[(n + 1):(2 * n), (n + 1):(2 * n)]) <- eps_d
+
+  idx <- (n + 1):(2 * n)
+  Dmat[cbind(idx, idx)] <- rep(eps_d, n)
 
   dvec <- c(mu, -k_turn)
 
@@ -3246,7 +3321,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   a_t <- a_t[colnames(P_win)]
 
   # ---- risk ----
-  risk_res <- came_risk_update(tail(R_win, L), state, spec)
+  risk_res <- came_run_stage("risk", came_risk_update(tail(R_win, L), state, spec))
   risk_art <- risk_res$risk
   state1 <- risk_res$state_out
 
@@ -3254,7 +3329,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   activity_last <- act$traded_value[nrow(act$traded_value), ]
   names(activity_last) <- colnames(act$traded_value)
 
-  struct_res <- came_structure_update(risk_art$Theta, activity_last, state1, spec)
+  struct_res <- came_run_stage("structure", came_structure_update(risk_art$Theta, activity_last, state1, spec))
   struct_art <- struct_res$structure
   state2 <- struct_res$state_out
 
@@ -3264,14 +3339,21 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   if (!is.finite(disp)) disp <- 0
 
   R_eta <- tail(R_win, min(nrow(R_win), 126L))
+
   Cmat <- tryCatch(cor(R_eta, use = "pairwise.complete.obs"), error = function(e) NULL)
-  if (is.null(Cmat)) {
+
+  # Robust: cor() can return non-matrix in degenerate cases; never diag<- unless matrix
+  if (is.null(Cmat) || !is.matrix(Cmat) || nrow(Cmat) < 2L || ncol(Cmat) < 2L) {
     eta <- 0
   } else {
     Cmat[!is.finite(Cmat)] <- 0
     diag(Cmat) <- 1
-    ev <- tryCatch(eigen(Cmat, symmetric = TRUE, only.values = TRUE)$values, error = function(e) NULL)
-    eta <- if (is.null(ev)) 0 else (max(ev) / length(ev))
+
+    ev <- tryCatch(eigen(Cmat, symmetric = TRUE, only.values = TRUE)$values,
+      error = function(e) NULL
+    )
+
+    eta <- if (is.null(ev) || length(ev) == 0L) 0 else (max(ev) / length(ev))
     if (!is.finite(eta)) eta <- 0
   }
 
@@ -3297,12 +3379,12 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
 
   # ---- signals ----
   P_last <- P_win[nrow(P_win), ]
-  sig_res <- came_signals_update(P_last, tail(R_win, max(spec$signals$mom_horizons)), risk_art, struct_art, state2, spec)
+  sig_res <- came_run_stage("signals", came_signals_update(P_last, tail(R_win, max(spec$signals$mom_horizons)), risk_art, struct_art, state2, spec))
   sig_art <- sig_res$signals
   state3 <- sig_res$state_out
 
   # ---- features ----
-  feat_res <- came_features_build(risk_art, struct_art, sig_art, act, tail(R_win, 63L), m_t, spec)
+  feat_res <- came_run_stage("features", came_features_build(risk_art, struct_art, sig_art, act, tail(R_win, 63L), m_t, spec))
   X_now <- feat_res$X
 
   state4 <- came_history_append(state3, as_of_date, X_now, keep = spec$forecast$history_keep %||% 300L)
@@ -3316,7 +3398,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   node_stab <- node_stab[colnames(P_win)]
   node_stab[!is.finite(node_stab)] <- 1
 
-  fc_res <- came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec)
+  fc_res <- came_run_stage("forecast", came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec))
   fc_art <- fc_res$forecast
   fc_art$diag <- fc_res$diag
   state5 <- fc_res$state_out
@@ -3361,7 +3443,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     }
   } else {
     # portfolio-level optimization with frozen carry handling
-    opt_res <- came_optimize_portfolio(
+    opt_res <- came_run_stage("optimizer", came_optimize_portfolio(
       mu_eff = fc_art$mu_eff,
       Sigma_H = risk_art$Sigma_H,
       prev_w = prev_w,
@@ -3375,7 +3457,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
       eps_hold = eps_hold,
       drop_thr = 1e-6,
       strict = isTRUE(spec$meta$strict)
-    )
+    ))
 
     w_risky <- opt_res$w
     cash_w <- opt_res$cash

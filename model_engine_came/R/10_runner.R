@@ -51,7 +51,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   a_t <- a_t[colnames(P_win)]
 
   # ---- risk ----
-  risk_res <- came_risk_update(tail(R_win, L), state, spec)
+  risk_res <- came_run_stage("risk", came_risk_update(tail(R_win, L), state, spec))
   risk_art <- risk_res$risk
   state1 <- risk_res$state_out
 
@@ -59,7 +59,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   activity_last <- act$traded_value[nrow(act$traded_value), ]
   names(activity_last) <- colnames(act$traded_value)
 
-  struct_res <- came_structure_update(risk_art$Theta, activity_last, state1, spec)
+  struct_res <- came_run_stage("structure", came_structure_update(risk_art$Theta, activity_last, state1, spec))
   struct_art <- struct_res$structure
   state2 <- struct_res$state_out
 
@@ -69,14 +69,28 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   if (!is.finite(disp)) disp <- 0
 
   R_eta <- tail(R_win, min(nrow(R_win), 126L))
-  Cmat <- tryCatch(cor(R_eta, use = "pairwise.complete.obs"), error = function(e) NULL)
-  if (is.null(Cmat)) {
+  R_eta <- as.matrix(R_eta) # force 2D
+
+  Cmat <- suppressWarnings(
+    tryCatch(cor(R_eta, use = "pairwise.complete.obs"),
+      error = function(e) NULL
+    )
+  )
+
+  # Robust dim check: must be 2D and at least 2x2
+  if (is.null(Cmat) || is.null(dim(Cmat)) || length(dim(Cmat)) != 2L ||
+    any(dim(Cmat) < 2L)) {
     eta <- 0
   } else {
+    Cmat <- as.matrix(Cmat) # coerce any odd class to base matrix
     Cmat[!is.finite(Cmat)] <- 0
     diag(Cmat) <- 1
-    ev <- tryCatch(eigen(Cmat, symmetric = TRUE, only.values = TRUE)$values, error = function(e) NULL)
-    eta <- if (is.null(ev)) 0 else (max(ev) / length(ev))
+
+    ev <- tryCatch(eigen(Cmat, symmetric = TRUE, only.values = TRUE)$values,
+      error = function(e) NULL
+    )
+
+    eta <- if (is.null(ev) || length(ev) == 0L) 0 else (max(ev) / length(ev))
     if (!is.finite(eta)) eta <- 0
   }
 
@@ -102,12 +116,12 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
 
   # ---- signals ----
   P_last <- P_win[nrow(P_win), ]
-  sig_res <- came_signals_update(P_last, tail(R_win, max(spec$signals$mom_horizons)), risk_art, struct_art, state2, spec)
+  sig_res <- came_run_stage("signals", came_signals_update(P_last, tail(R_win, max(spec$signals$mom_horizons)), risk_art, struct_art, state2, spec))
   sig_art <- sig_res$signals
   state3 <- sig_res$state_out
 
   # ---- features ----
-  feat_res <- came_features_build(risk_art, struct_art, sig_art, act, tail(R_win, 63L), m_t, spec)
+  feat_res <- came_run_stage("features", came_features_build(risk_art, struct_art, sig_art, act, tail(R_win, 63L), m_t, spec))
   X_now <- feat_res$X
 
   state4 <- came_history_append(state3, as_of_date, X_now, keep = spec$forecast$history_keep %||% 300L)
@@ -121,7 +135,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   node_stab <- node_stab[colnames(P_win)]
   node_stab[!is.finite(node_stab)] <- 1
 
-  fc_res <- came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec)
+  fc_res <- came_run_stage("forecast", came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec))
   fc_art <- fc_res$forecast
   fc_art$diag <- fc_res$diag
   state5 <- fc_res$state_out
@@ -166,7 +180,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     }
   } else {
     # portfolio-level optimization with frozen carry handling
-    opt_res <- came_optimize_portfolio(
+    opt_res <- came_run_stage("optimizer", came_optimize_portfolio(
       mu_eff = fc_art$mu_eff,
       Sigma_H = risk_art$Sigma_H,
       prev_w = prev_w,
@@ -180,7 +194,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
       eps_hold = eps_hold,
       drop_thr = 1e-6,
       strict = isTRUE(spec$meta$strict)
-    )
+    ))
 
     w_risky <- opt_res$w
     cash_w <- opt_res$cash

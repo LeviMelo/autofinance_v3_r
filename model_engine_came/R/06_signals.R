@@ -253,11 +253,11 @@ came_signals_update <- function(P_last, R_window, risk_art, struct_art, state, s
   D <- risk_art$D_series
 
   # align residual series to current symbols
-  common <- intersect(colnames(E), syms)
-  came_assert(length(common) >= 3, "signals_resid_common", "Residual series must cover >=3 symbols in current universe")
+  syms2 <- intersect(syms, colnames(E))
+  came_assert(length(syms2) >= 3, "signals_resid_common", "Residual series must cover >=3 symbols")
 
-  E <- E[, syms, drop = FALSE]
-  D <- D[, syms, drop = FALSE]
+  E <- E[, syms2, drop = FALSE]
+  D <- D[, syms2, drop = FALSE]
 
   R_perp <- E * D
   R_perp[!is.finite(R_perp)] <- 0

@@ -77,7 +77,7 @@ came_run_stage <- function(stage, expr, warnings_acc = NULL) {
   withCallingHandlers(
     tryCatch(expr, error = function(e) {
       if (inherits(e, "came_error")) stop(e)
-      came_stop(paste0(stage, "_error"), conditionMessage(e))
+      came_stop(paste0(stage, "_error"), paste0("[", stage, "] ", conditionMessage(e)))
     }),
     warning = function(w) {
       if (!is.null(warnings_acc) && is.function(warnings_acc)) {
@@ -144,4 +144,31 @@ came_quantile_safe <- function(x, p, default = NA_real_) {
     return(default)
   }
   as.numeric(stats::quantile(x, probs = p, na.rm = TRUE, names = FALSE, type = 7))
+}
+
+came_solve_lsap_max <- function(score_mat) {
+  # Solve linear sum assignment maximizing score_mat.
+  # Compatible with clue versions that require nonnegative entries
+  # and may or may not support solve_LSAP(..., maximum=TRUE).
+
+  came_require("clue")
+
+  S <- as.matrix(score_mat)
+  S[!is.finite(S)] <- 0
+  S[S < 0] <- 0
+
+  lsap <- clue::solve_LSAP
+
+  # Newer clue supports maximum=TRUE
+  if ("maximum" %in% names(formals(lsap))) {
+    return(as.integer(lsap(S, maximum = TRUE)))
+  }
+
+  # Older clue: convert to nonnegative minimization cost
+  m <- max(S)
+  cost <- m - S
+  cost[!is.finite(cost)] <- m
+  cost[cost < 0] <- 0
+
+  as.integer(lsap(cost))
 }

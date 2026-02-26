@@ -132,11 +132,24 @@
 
   lsap <- clue::solve_LSAP
   if ("maximum" %in% names(formals(lsap))) {
+    # A is a score matrix; maximize it
+    A <- as.matrix(A)
+    A[!is.finite(A)] <- 0
+    A[A < 0] <- 0
     perm <- as.integer(lsap(A, maximum = TRUE))
   } else {
-    # convert to nonnegative minimization cost
+    # Older clue: minimize a nonnegative cost matrix derived from scores
+    A <- as.matrix(A)
+    A[!is.finite(A)] <- 0
+    A[A < 0] <- 0
+
     m <- max(A)
+    if (!is.finite(m)) m <- 0
+
     cost <- m - A
+    cost[!is.finite(cost)] <- m
+    cost[cost < 0] <- 0 # <-- critical hard clamp
+
     perm <- as.integer(lsap(cost))
   }
 

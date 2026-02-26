@@ -75,9 +75,12 @@ bt_run_backtest <- function(data_bundle_or_panel, strategy_fn,
         weights_before <- bt_compute_weights(state)
 
         # ── Call strategy ──
+        # ---- No-lookahead enforcement: strategy only sees data up to decision_date
+        data_ctx_strategy <- list(dt = bt_as_of_slice(data_ctx, decision_date))
+
         proposal <- tryCatch(
             strategy_fn(
-                decision_date, data_ctx, state,
+                decision_date, data_ctx_strategy, state,
                 strategy_state, strategy_spec
             ),
             error = function(e) {
