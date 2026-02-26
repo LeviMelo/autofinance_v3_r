@@ -68,6 +68,9 @@
     theta_alpha["xi"] * xi
 
   A <- came_sigmoid(z)
+  if (!is.matrix(A)) {
+    A <- matrix(A, nrow = nrow(z), ncol = ncol(z), dimnames = dimnames(z))
+  }
   diag(A) <- 1
   A[!is.finite(A)] <- 0.5
   came_symmetrize(A)

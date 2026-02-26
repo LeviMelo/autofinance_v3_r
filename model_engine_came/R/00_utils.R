@@ -91,9 +91,17 @@ came_run_stage <- function(stage, expr, warnings_acc = NULL) {
 # ---- numerics ----
 
 came_sigmoid <- function(z) {
-  z <- as.numeric(z)
-  z[!is.finite(z)] <- 0
-  1 / (1 + exp(-z))
+  z0 <- z
+  v <- as.numeric(z0)
+  v[!is.finite(v)] <- 0
+  out <- 1 / (1 + exp(-v))
+
+  # preserve matrix/array shape when input had dimensions
+  if (!is.null(dim(z0))) {
+    dim(out) <- dim(z0)
+    dimnames(out) <- dimnames(z0)
+  }
+  out
 }
 
 came_softmax <- function(z, temperature = 1.0) {
