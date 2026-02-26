@@ -38,6 +38,8 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   R_win <- diff(log(pmax(P_win, 1e-12)))
   R_win[!is.finite(R_win)] <- 0
 
+  state <- came_state_pi(state, colnames(P_win))
+
   act <- adapter$activity(as_of_date, min(63L, nrow(P_win)), colnames(P_win), strict = FALSE)
 
   # Tradability mask a_{i,t}
@@ -121,10 +123,12 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
 
   fc_res <- came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec)
   fc_art <- fc_res$forecast
+  fc_art$diag <- fc_res$diag
   state5 <- fc_res$state_out
 
   # ---- optimizer controls ----
-  ctrl <- came_optimizer_controls(m_t, spec)
+  no_trade <- isTRUE(spec$meta$no_trade %||% FALSE)
+  ctrl <- if (no_trade) list(gamma = NA_real_, tau = NA_real_, rho_gross = 0) else came_optimizer_controls(m_t, spec)
 
   # caps (liquidity-aware)
   tv <- tv_t[colnames(P_win)]
@@ -150,33 +154,47 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   }
 
   # portfolio-level optimization with frozen carry handling
-  opt_res <- came_optimize_portfolio(
-    mu_eff = fc_art$mu_eff,
-    Sigma_H = risk_art$Sigma_H,
-    prev_w = prev_w,
-    caps = cap,
-    a_t = a_t,
-    rho_gross = ctrl$rho_gross,
-    gamma = ctrl$gamma,
-    tau = ctrl$tau,
-    illiq_z = illiq_z,
-    turnover_illiq_scale = spec$optimizer$turnover_cost_illiq_scale %||% 2.0,
-    eps_hold = eps_hold,
-    drop_thr = 1e-6,
-    strict = isTRUE(spec$meta$strict)
-  )
+  if (no_trade) {
+    # No optimizer run; keep portfolio in cash and DO NOT overwrite prev_target in state.
+    w_risky <- setNames(rep(0, length(a_t)), names(a_t))
+    cash_w <- 1.0
+    weights_df <- data.frame(symbol = character(0), weight_target = numeric(0), stringsAsFactors = FALSE)
 
-  w_risky <- opt_res$w
-  cash_w <- opt_res$cash
+    # preserve previous target (prefer explicit prev_target argument)
+    if (!is.null(prev_target) && is.data.frame(prev_target)) {
+      state5$prev_target <- prev_target
+    }
+  } else {
+    # portfolio-level optimization with frozen carry handling
+    opt_res <- came_optimize_portfolio(
+      mu_eff = fc_art$mu_eff,
+      Sigma_H = risk_art$Sigma_H,
+      prev_w = prev_w,
+      caps = cap,
+      a_t = a_t,
+      rho_gross = ctrl$rho_gross,
+      gamma = ctrl$gamma,
+      tau = ctrl$tau,
+      illiq_z = illiq_z,
+      turnover_illiq_scale = spec$optimizer$turnover_cost_illiq_scale %||% 2.0,
+      eps_hold = eps_hold,
+      drop_thr = 1e-6,
+      strict = isTRUE(spec$meta$strict)
+    )
 
-  weights_df <- data.frame(symbol = names(w_risky), weight_target = as.numeric(w_risky), stringsAsFactors = FALSE)
-  weights_df <- weights_df[weights_df$weight_target > 1e-8, , drop = FALSE]
+    w_risky <- opt_res$w
+    cash_w <- opt_res$cash
 
-  state5$prev_target <- weights_df
+    weights_df <- data.frame(symbol = names(w_risky), weight_target = as.numeric(w_risky), stringsAsFactors = FALSE)
+    weights_df <- weights_df[weights_df$weight_target > 1e-8, , drop = FALSE]
+
+    state5$prev_target <- weights_df
+  }
 
   out <- list(
     as_of_date = as.Date(as_of_date),
     universe = names(cap),
+    a_t = a_t,
     m_t = m_t,
     weights = weights_df,
     cash_weight = cash_w,
@@ -186,12 +204,13 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     features = list(n_features = ncol(X_now), groups = feat_res$groups),
     forecast = fc_art,
     optimizer = list(
-      method = opt_res$method,
+      method = if (no_trade) "no_trade" else opt_res$method,
       gamma = ctrl$gamma,
       tau = ctrl$tau,
       rho_gross = ctrl$rho_gross,
       caps = cap,
-      frozen = opt_res$frozen
+      frozen = if (no_trade) character(0) else opt_res$frozen,
+      no_trade = no_trade
     ),
     meta = list(spec_hash = came_hash(spec)),
     state_out = state5

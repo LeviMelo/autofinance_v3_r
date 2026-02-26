@@ -267,7 +267,9 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   A_pi <- spec$gating$A_pi
   b_pi <- spec$gating$b_pi
   came_assert(is.matrix(A_pi) && nrow(A_pi) == C, "forecast_A_pi", "A_pi dims mismatch")
-  mtv <- as.numeric(m_t)
+  mt_order <- c("disp", "eta", "VoV", "dens", "eto", "chi", "liq_med_logv", "liq_med_logntr", "liq_frac_active")
+  mtv <- as.numeric(m_t[mt_order])
+  mtv[is.na(mtv) | !is.finite(mtv)] <- 0
   if (length(mtv) < ncol(A_pi)) mtv <- c(mtv, rep(0, ncol(A_pi) - length(mtv)))
   if (length(mtv) > ncol(A_pi)) mtv <- mtv[seq_len(ncol(A_pi))]
   pi <- came_softmax(A_pi %*% mtv + b_pi, temperature = spec$gating$temperature %||% 1.0)
@@ -279,6 +281,90 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   models <- st$forecast$models
   should_refit <- is.null(models) || (st$forecast$step %% refit_every == 0L)
 
+  # ---- cold start handling ----
+  if (is.null(models) && should_refit && (panel$n %||% 0L) == 0L) {
+    if (!allow_skip) {
+      came_stop("forecast_no_panel", "Insufficient matured history to fit forecast models (cold start).")
+    }
+
+    # Neutral forecasts (mu=0), but we still compute pi/kappa/q and maintain error buckets.
+    comp_mu <- matrix(0, length(syms), C, dimnames = list(syms, paste0("C", seq_len(C))))
+
+    # Keep per-day history so later matured error updates have something to reference
+    if (is.null(st$forecast$hist) || !is.list(st$forecast$hist)) st$forecast$hist <- list()
+    today_date <- as.Date(tail(rownames(R_history), 1))
+    st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(
+      date = today_date,
+      step = st$forecast$step,
+      comp_mu = comp_mu
+    )
+    keep_hist <- as.integer(H + 60L)
+    if (length(st$forecast$hist) > keep_hist) st$forecast$hist <- tail(st$forecast$hist, keep_hist)
+
+    # buckets init
+    if (is.null(st$forecast$error_buckets)) {
+      st$forecast$error_buckets <- lapply(seq_len(C), function(.) rep(1e-4, H))
+      names(st$forecast$error_buckets) <- paste0("C", seq_len(C))
+    }
+
+    comp_sigma <- sapply(st$forecast$error_buckets, function(v) sqrt(stats::median(v, na.rm = TRUE)))
+    comp_sigma[!is.finite(comp_sigma) | comp_sigma <= 0] <- 0.01
+
+    # kappa and q (still computed)
+    kmin <- spec$forecast$kappa_min %||% 0.7
+    kmax <- spec$forecast$kappa_max %||% 1.3
+    kappa <- .came_kappa_matrix(syms, C, X_now, node_stab, struct_diag, kmin, kmax)
+
+    q_raw <- sweep(kappa, 2, pi, "*")
+    q <- q_raw / pmax(rowSums(q_raw), 1e-12)
+
+    mu_hat <- setNames(rep(0, length(syms)), syms)
+
+    sigma_hat <- setNames(rep(0, length(syms)), syms)
+    for (i in seq_along(syms)) {
+      sigma_hat[i] <- sqrt(sum((q[i, ]^2) * (comp_sigma^2)))
+    }
+    sigma_hat[!is.finite(sigma_hat) | sigma_hat <= 0] <- 0.01
+
+    # reliability
+    liq_z <- if ("f_ltv_z" %in% colnames(X_now)) X_now[, "f_ltv_z"] else rep(0, length(syms))
+    illiq_z <- if ("f_illiq_z" %in% colnames(X_now)) X_now[, "f_illiq_z"] else rep(0, length(syms))
+    liq_z[!is.finite(liq_z)] <- 0
+    illiq_z[!is.finite(illiq_z)] <- 0
+
+    eto0 <- struct_diag$eto %||% 0
+    chi0 <- struct_diag$chi %||% 0
+    ns <- node_stab[syms]
+    ns[!is.finite(ns)] <- 1
+
+    a <- spec$reliability$a
+    rho <- setNames(rep(0.8, length(syms)), syms)
+    for (i in seq_along(syms)) {
+      rho[i] <- .came_rho_rel(liq_z[i], illiq_z[i], ns[i], eto0, chi0, a)
+    }
+
+    mu_eff <- rho * mu_hat
+    s_eff <- sigma_hat / sqrt(pmax(rho, spec$reliability$eps %||% 1e-6))
+
+    return(list(
+      forecast = list(
+        mu_hat = mu_hat,
+        mu_eff = mu_eff,
+        sigma_hat = sigma_hat,
+        s_eff = s_eff,
+        pi = pi,
+        kappa = kappa,
+        q = q,
+        comp_mu = comp_mu,
+        comp_sigma = comp_sigma,
+        rho = rho
+      ),
+      state_out = st,
+      diag = list(refit = FALSE, panel_n = 0L, matured_ix = nrow(R_history) - H, cold_start = TRUE)
+    ))
+  }
+
+  # ---- normal refit / reuse ----
   if (should_refit) {
     came_assert(panel$n > 0, "forecast_no_panel", "Insufficient matured history to fit forecast models (cold start).")
     w <- (ew_lambda^panel$age)
@@ -318,7 +404,7 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   # --- store today's component means for future matured error updates
   if (is.null(st$forecast$hist) || !is.list(st$forecast$hist)) st$forecast$hist <- list()
   today_date <- as.Date(tail(rownames(R_history), 1))
-  st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(date = today_date, comp_mu = comp_mu)
+  st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(date = today_date, step = st$forecast$step, comp_mu = comp_mu)
 
   # retain limited buffer
   keep_hist <- as.integer(H + 60L)
@@ -337,26 +423,37 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   matured_ix <- nrow(R_history) - H
   if (matured_ix >= 1 && matured_ix + H <= nrow(R_history)) {
     matured_date <- dates_R[matured_ix]
-    b <- ((matured_ix - 1) %% H) + 1L
 
-    hist_dates <- vapply(st$forecast$hist, function(h) as.character(h$date), character(1))
-    idx_m <- match(as.character(matured_date), hist_dates)
+    # IMPORTANT: bucket index must advance over time; matured_ix is constant when R_history is a rolling fixed window.
+    matured_step <- st$forecast$step - H
+    if (matured_step >= 1L) {
+      b <- ((matured_step - 1L) %% H) + 1L
 
-    if (is.finite(idx_m) && !is.na(idx_m)) {
-      comp_mu_m <- st$forecast$hist[[idx_m]]$comp_mu
-      # realized y^(H) at matured_ix
-      common_assets <- intersect(rownames(comp_mu_m), colnames(R_history))
-      if (length(common_assets) >= 3) {
-        y_m <- rowSums(R_history[(matured_ix + 1):(matured_ix + H), common_assets, drop = FALSE], na.rm = TRUE)
-        y_m[!is.finite(y_m)] <- 0
+      # Prefer matching by step (more robust), fallback to date
+      hist_steps <- vapply(st$forecast$hist, function(h) h$step %||% NA_integer_, integer(1))
+      idx_m <- match(matured_step, hist_steps)
 
-        for (c in seq_len(C)) {
-          pred <- comp_mu_m[common_assets, c]
-          e2 <- (y_m - pred)^2
-          pool_e2 <- stats::median(e2, na.rm = TRUE)
-          if (is.finite(pool_e2)) {
-            key <- paste0("C", c)
-            st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pool_e2
+      if (is.na(idx_m)) {
+        hist_dates <- vapply(st$forecast$hist, function(h) as.character(h$date), character(1))
+        idx_m <- match(as.character(matured_date), hist_dates)
+      }
+
+      if (is.finite(idx_m) && !is.na(idx_m)) {
+        comp_mu_m <- st$forecast$hist[[idx_m]]$comp_mu
+
+        common_assets <- intersect(rownames(comp_mu_m), colnames(R_history))
+        if (length(common_assets) >= 3) {
+          y_m <- rowSums(R_history[(matured_ix + 1):(matured_ix + H), common_assets, drop = FALSE], na.rm = TRUE)
+          y_m[!is.finite(y_m)] <- 0
+
+          for (c in seq_len(C)) {
+            pred <- comp_mu_m[common_assets, c]
+            e2 <- (y_m - pred)^2
+            pool_e2 <- stats::median(e2, na.rm = TRUE)
+            if (is.finite(pool_e2)) {
+              key <- paste0("C", c)
+              st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pool_e2
+            }
           }
         }
       }

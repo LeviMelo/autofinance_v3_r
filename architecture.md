@@ -1691,5 +1691,3 @@ This architecture explicitly adopts:
 This preserves the economic optimization problem while moving brittle combinatorial constraints out of the critical path.
 
 ---
-
-If you want next, I can convert this directly into a **clean GitHub-ready `architecture.md` formatting pass** (same content, but with compact notation tables, symbol glossary, and implementation contracts per module file).

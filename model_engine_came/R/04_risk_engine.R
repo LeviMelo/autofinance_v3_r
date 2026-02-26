@@ -127,9 +127,19 @@
   }
 
   C <- t(B_prev[common, , drop = FALSE]) %*% B_raw[common, , drop = FALSE] # k x k
-  cost <- -abs(C)
+  A <- abs(C)
+  A[!is.finite(A)] <- 0
 
-  perm <- as.integer(clue::solve_LSAP(cost))
+  lsap <- clue::solve_LSAP
+  if ("maximum" %in% names(formals(lsap))) {
+    perm <- as.integer(lsap(A, maximum = TRUE))
+  } else {
+    # convert to nonnegative minimization cost
+    m <- max(A)
+    cost <- m - A
+    perm <- as.integer(lsap(cost))
+  }
+
   signs <- rep(1, k)
   for (j in seq_len(k)) {
     v <- C[perm[j], j]

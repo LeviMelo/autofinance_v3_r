@@ -376,7 +376,18 @@
   overlap <- matrix(0, K, K)
   for (nm in common) overlap[labels_new[nm], labels_prev[nm]] <- overlap[labels_new[nm], labels_prev[nm]] + 1
 
-  perm <- as.integer(clue::solve_LSAP(-overlap))
+  overlap[!is.finite(overlap)] <- 0
+  overlap[overlap < 0] <- 0
+
+  lsap <- clue::solve_LSAP
+  if ("maximum" %in% names(formals(lsap))) {
+    perm <- as.integer(lsap(overlap, maximum = TRUE))
+  } else {
+    m <- max(overlap)
+    cost <- m - overlap
+    perm <- as.integer(lsap(cost))
+  }
+
   map <- rep(NA_integer_, K)
   for (col in seq_len(K)) map[perm[col]] <- col
 

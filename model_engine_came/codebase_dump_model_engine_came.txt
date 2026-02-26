@@ -2652,11 +2652,16 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   st <- state
   st$forecast$step <- as.integer((st$forecast$step %||% 0L) + 1L)
 
+  cold_policy <- spec$forecast$cold_start_policy %||% "error"
+  allow_skip <- (!isTRUE(spec$meta$strict %||% TRUE)) || identical(cold_policy, "skip")
+
   # gating pi_t (architecture §12.4)
   A_pi <- spec$gating$A_pi
   b_pi <- spec$gating$b_pi
   came_assert(is.matrix(A_pi) && nrow(A_pi) == C, "forecast_A_pi", "A_pi dims mismatch")
-  mtv <- as.numeric(m_t)
+  mt_order <- c("disp", "eta", "VoV", "dens", "eto", "chi", "liq_med_logv", "liq_med_logntr", "liq_frac_active")
+  mtv <- as.numeric(m_t[mt_order])
+  mtv[is.na(mtv) | !is.finite(mtv)] <- 0
   if (length(mtv) < ncol(A_pi)) mtv <- c(mtv, rep(0, ncol(A_pi) - length(mtv)))
   if (length(mtv) > ncol(A_pi)) mtv <- mtv[seq_len(ncol(A_pi))]
   pi <- came_softmax(A_pi %*% mtv + b_pi, temperature = spec$gating$temperature %||% 1.0)
@@ -2668,6 +2673,90 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   models <- st$forecast$models
   should_refit <- is.null(models) || (st$forecast$step %% refit_every == 0L)
 
+  # ---- cold start handling ----
+  if (is.null(models) && should_refit && (panel$n %||% 0L) == 0L) {
+    if (!allow_skip) {
+      came_stop("forecast_no_panel", "Insufficient matured history to fit forecast models (cold start).")
+    }
+
+    # Neutral forecasts (mu=0), but we still compute pi/kappa/q and maintain error buckets.
+    comp_mu <- matrix(0, length(syms), C, dimnames = list(syms, paste0("C", seq_len(C))))
+
+    # Keep per-day history so later matured error updates have something to reference
+    if (is.null(st$forecast$hist) || !is.list(st$forecast$hist)) st$forecast$hist <- list()
+    today_date <- as.Date(tail(rownames(R_history), 1))
+    st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(
+      date = today_date,
+      step = st$forecast$step,
+      comp_mu = comp_mu
+    )
+    keep_hist <- as.integer(H + 60L)
+    if (length(st$forecast$hist) > keep_hist) st$forecast$hist <- tail(st$forecast$hist, keep_hist)
+
+    # buckets init
+    if (is.null(st$forecast$error_buckets)) {
+      st$forecast$error_buckets <- lapply(seq_len(C), function(.) rep(1e-4, H))
+      names(st$forecast$error_buckets) <- paste0("C", seq_len(C))
+    }
+
+    comp_sigma <- sapply(st$forecast$error_buckets, function(v) sqrt(stats::median(v, na.rm = TRUE)))
+    comp_sigma[!is.finite(comp_sigma) | comp_sigma <= 0] <- 0.01
+
+    # kappa and q (still computed)
+    kmin <- spec$forecast$kappa_min %||% 0.7
+    kmax <- spec$forecast$kappa_max %||% 1.3
+    kappa <- .came_kappa_matrix(syms, C, X_now, node_stab, struct_diag, kmin, kmax)
+
+    q_raw <- sweep(kappa, 2, pi, "*")
+    q <- q_raw / pmax(rowSums(q_raw), 1e-12)
+
+    mu_hat <- setNames(rep(0, length(syms)), syms)
+
+    sigma_hat <- setNames(rep(0, length(syms)), syms)
+    for (i in seq_along(syms)) {
+      sigma_hat[i] <- sqrt(sum((q[i, ]^2) * (comp_sigma^2)))
+    }
+    sigma_hat[!is.finite(sigma_hat) | sigma_hat <= 0] <- 0.01
+
+    # reliability
+    liq_z <- if ("f_ltv_z" %in% colnames(X_now)) X_now[, "f_ltv_z"] else rep(0, length(syms))
+    illiq_z <- if ("f_illiq_z" %in% colnames(X_now)) X_now[, "f_illiq_z"] else rep(0, length(syms))
+    liq_z[!is.finite(liq_z)] <- 0
+    illiq_z[!is.finite(illiq_z)] <- 0
+
+    eto0 <- struct_diag$eto %||% 0
+    chi0 <- struct_diag$chi %||% 0
+    ns <- node_stab[syms]
+    ns[!is.finite(ns)] <- 1
+
+    a <- spec$reliability$a
+    rho <- setNames(rep(0.8, length(syms)), syms)
+    for (i in seq_along(syms)) {
+      rho[i] <- .came_rho_rel(liq_z[i], illiq_z[i], ns[i], eto0, chi0, a)
+    }
+
+    mu_eff <- rho * mu_hat
+    s_eff <- sigma_hat / sqrt(pmax(rho, spec$reliability$eps %||% 1e-6))
+
+    return(list(
+      forecast = list(
+        mu_hat = mu_hat,
+        mu_eff = mu_eff,
+        sigma_hat = sigma_hat,
+        s_eff = s_eff,
+        pi = pi,
+        kappa = kappa,
+        q = q,
+        comp_mu = comp_mu,
+        comp_sigma = comp_sigma,
+        rho = rho
+      ),
+      state_out = st,
+      diag = list(refit = FALSE, panel_n = 0L, matured_ix = nrow(R_history) - H, cold_start = TRUE)
+    ))
+  }
+
+  # ---- normal refit / reuse ----
   if (should_refit) {
     came_assert(panel$n > 0, "forecast_no_panel", "Insufficient matured history to fit forecast models (cold start).")
     w <- (ew_lambda^panel$age)
@@ -2707,7 +2796,7 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   # --- store today's component means for future matured error updates
   if (is.null(st$forecast$hist) || !is.list(st$forecast$hist)) st$forecast$hist <- list()
   today_date <- as.Date(tail(rownames(R_history), 1))
-  st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(date = today_date, comp_mu = comp_mu)
+  st$forecast$hist[[length(st$forecast$hist) + 1L]] <- list(date = today_date, step = st$forecast$step, comp_mu = comp_mu)
 
   # retain limited buffer
   keep_hist <- as.integer(H + 60L)
@@ -2726,26 +2815,37 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   matured_ix <- nrow(R_history) - H
   if (matured_ix >= 1 && matured_ix + H <= nrow(R_history)) {
     matured_date <- dates_R[matured_ix]
-    b <- ((matured_ix - 1) %% H) + 1L
 
-    hist_dates <- vapply(st$forecast$hist, function(h) as.character(h$date), character(1))
-    idx_m <- match(as.character(matured_date), hist_dates)
+    # IMPORTANT: bucket index must advance over time; matured_ix is constant when R_history is a rolling fixed window.
+    matured_step <- st$forecast$step - H
+    if (matured_step >= 1L) {
+      b <- ((matured_step - 1L) %% H) + 1L
 
-    if (is.finite(idx_m) && !is.na(idx_m)) {
-      comp_mu_m <- st$forecast$hist[[idx_m]]$comp_mu
-      # realized y^(H) at matured_ix
-      common_assets <- intersect(rownames(comp_mu_m), colnames(R_history))
-      if (length(common_assets) >= 3) {
-        y_m <- rowSums(R_history[(matured_ix + 1):(matured_ix + H), common_assets, drop = FALSE], na.rm = TRUE)
-        y_m[!is.finite(y_m)] <- 0
+      # Prefer matching by step (more robust), fallback to date
+      hist_steps <- vapply(st$forecast$hist, function(h) h$step %||% NA_integer_, integer(1))
+      idx_m <- match(matured_step, hist_steps)
 
-        for (c in seq_len(C)) {
-          pred <- comp_mu_m[common_assets, c]
-          e2 <- (y_m - pred)^2
-          pool_e2 <- stats::median(e2, na.rm = TRUE)
-          if (is.finite(pool_e2)) {
-            key <- paste0("C", c)
-            st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pool_e2
+      if (is.na(idx_m)) {
+        hist_dates <- vapply(st$forecast$hist, function(h) as.character(h$date), character(1))
+        idx_m <- match(as.character(matured_date), hist_dates)
+      }
+
+      if (is.finite(idx_m) && !is.na(idx_m)) {
+        comp_mu_m <- st$forecast$hist[[idx_m]]$comp_mu
+
+        common_assets <- intersect(rownames(comp_mu_m), colnames(R_history))
+        if (length(common_assets) >= 3) {
+          y_m <- rowSums(R_history[(matured_ix + 1):(matured_ix + H), common_assets, drop = FALSE], na.rm = TRUE)
+          y_m[!is.finite(y_m)] <- 0
+
+          for (c in seq_len(C)) {
+            pred <- comp_mu_m[common_assets, c]
+            e2 <- (y_m - pred)^2
+            pool_e2 <- stats::median(e2, na.rm = TRUE)
+            if (is.finite(pool_e2)) {
+              key <- paste0("C", c)
+              st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pool_e2
+            }
           }
         }
       }
@@ -3133,6 +3233,8 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   R_win <- diff(log(pmax(P_win, 1e-12)))
   R_win[!is.finite(R_win)] <- 0
 
+  state <- came_state_pi(state, colnames(P_win))
+
   act <- adapter$activity(as_of_date, min(63L, nrow(P_win)), colnames(P_win), strict = FALSE)
 
   # Tradability mask a_{i,t}
@@ -3216,10 +3318,12 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
 
   fc_res <- came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec)
   fc_art <- fc_res$forecast
+  fc_art$diag <- fc_res$diag
   state5 <- fc_res$state_out
 
   # ---- optimizer controls ----
-  ctrl <- came_optimizer_controls(m_t, spec)
+  no_trade <- isTRUE(spec$meta$no_trade %||% FALSE)
+  ctrl <- if (no_trade) list(gamma = NA_real_, tau = NA_real_, rho_gross = 0) else came_optimizer_controls(m_t, spec)
 
   # caps (liquidity-aware)
   tv <- tv_t[colnames(P_win)]
@@ -3245,33 +3349,47 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   }
 
   # portfolio-level optimization with frozen carry handling
-  opt_res <- came_optimize_portfolio(
-    mu_eff = fc_art$mu_eff,
-    Sigma_H = risk_art$Sigma_H,
-    prev_w = prev_w,
-    caps = cap,
-    a_t = a_t,
-    rho_gross = ctrl$rho_gross,
-    gamma = ctrl$gamma,
-    tau = ctrl$tau,
-    illiq_z = illiq_z,
-    turnover_illiq_scale = spec$optimizer$turnover_cost_illiq_scale %||% 2.0,
-    eps_hold = eps_hold,
-    drop_thr = 1e-6,
-    strict = isTRUE(spec$meta$strict)
-  )
+  if (no_trade) {
+    # No optimizer run; keep portfolio in cash and DO NOT overwrite prev_target in state.
+    w_risky <- setNames(rep(0, length(a_t)), names(a_t))
+    cash_w <- 1.0
+    weights_df <- data.frame(symbol = character(0), weight_target = numeric(0), stringsAsFactors = FALSE)
 
-  w_risky <- opt_res$w
-  cash_w <- opt_res$cash
+    # preserve previous target (prefer explicit prev_target argument)
+    if (!is.null(prev_target) && is.data.frame(prev_target)) {
+      state5$prev_target <- prev_target
+    }
+  } else {
+    # portfolio-level optimization with frozen carry handling
+    opt_res <- came_optimize_portfolio(
+      mu_eff = fc_art$mu_eff,
+      Sigma_H = risk_art$Sigma_H,
+      prev_w = prev_w,
+      caps = cap,
+      a_t = a_t,
+      rho_gross = ctrl$rho_gross,
+      gamma = ctrl$gamma,
+      tau = ctrl$tau,
+      illiq_z = illiq_z,
+      turnover_illiq_scale = spec$optimizer$turnover_cost_illiq_scale %||% 2.0,
+      eps_hold = eps_hold,
+      drop_thr = 1e-6,
+      strict = isTRUE(spec$meta$strict)
+    )
 
-  weights_df <- data.frame(symbol = names(w_risky), weight_target = as.numeric(w_risky), stringsAsFactors = FALSE)
-  weights_df <- weights_df[weights_df$weight_target > 1e-8, , drop = FALSE]
+    w_risky <- opt_res$w
+    cash_w <- opt_res$cash
 
-  state5$prev_target <- weights_df
+    weights_df <- data.frame(symbol = names(w_risky), weight_target = as.numeric(w_risky), stringsAsFactors = FALSE)
+    weights_df <- weights_df[weights_df$weight_target > 1e-8, , drop = FALSE]
+
+    state5$prev_target <- weights_df
+  }
 
   out <- list(
     as_of_date = as.Date(as_of_date),
     universe = names(cap),
+    a_t = a_t,
     m_t = m_t,
     weights = weights_df,
     cash_weight = cash_w,
@@ -3281,12 +3399,13 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     features = list(n_features = ncol(X_now), groups = feat_res$groups),
     forecast = fc_art,
     optimizer = list(
-      method = opt_res$method,
+      method = if (no_trade) "no_trade" else opt_res$method,
       gamma = ctrl$gamma,
       tau = ctrl$tau,
       rho_gross = ctrl$rho_gross,
       caps = cap,
-      frozen = opt_res$frozen
+      frozen = if (no_trade) character(0) else opt_res$frozen,
+      no_trade = no_trade
     ),
     meta = list(spec_hash = came_hash(spec)),
     state_out = state5
