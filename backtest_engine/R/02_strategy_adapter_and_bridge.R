@@ -7,7 +7,8 @@
 bt_strategy_equal_weight <- function(decision_date, data_context,
                                      portfolio_state, strategy_state_in,
                                      strategy_spec, runtime_ctx = list()) {
-    # Get tradable symbols as of decision date
+    decision_date <- as.Date(decision_date)
+
     sub <- data_context$dt[refdate == decision_date]
     syms <- unique(sub$symbol)
     syms <- syms[!is.na(syms) & nchar(syms) > 0]
@@ -15,15 +16,12 @@ bt_strategy_equal_weight <- function(decision_date, data_context,
     if (length(syms) == 0) {
         return(list(
             decision_date = decision_date,
-            target_weights = data.frame(
-                symbol = character(0),
-                weight_target = numeric(0)
-            ),
+            target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
             cash_weight = 1.0,
             warnings = "No symbols on decision date",
             diagnostics = list(),
             strategy_state_out = strategy_state_in,
-            meta = list()
+            meta = list(strategy = "equal_weight", status = "WARMUP", ready_to_trade = FALSE, reason = "no_symbols")
         ))
     }
 
@@ -32,15 +30,12 @@ bt_strategy_equal_weight <- function(decision_date, data_context,
 
     list(
         decision_date = decision_date,
-        target_weights = data.frame(
-            symbol = syms, weight_target = w,
-            stringsAsFactors = FALSE
-        ),
+        target_weights = data.frame(symbol = syms, weight_target = w, stringsAsFactors = FALSE),
         cash_weight = 0.0,
         warnings = character(0),
         diagnostics = list(n_symbols = length(syms)),
         strategy_state_out = strategy_state_in,
-        meta = list(strategy = "equal_weight")
+        meta = list(strategy = "equal_weight", status = "OK", ready_to_trade = TRUE, reason = "ok")
     )
 }
 
@@ -50,21 +45,24 @@ bt_strategy_equal_weight <- function(decision_date, data_context,
 bt_strategy_all_cash <- function(decision_date, data_context,
                                  portfolio_state, strategy_state_in,
                                  strategy_spec, runtime_ctx = list()) {
+    decision_date <- as.Date(decision_date)
     list(
         decision_date = decision_date,
-        target_weights = data.frame(
-            symbol = character(0),
-            weight_target = numeric(0)
-        ),
+        target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
         cash_weight = 1.0,
         warnings = character(0),
         diagnostics = list(),
         strategy_state_out = strategy_state_in,
-        meta = list(strategy = "all_cash")
+        meta = list(strategy = "all_cash", status = "OK", ready_to_trade = TRUE, reason = "cash")
     )
 }
 
-# ── Model-engine adapter ─────────────────────────────────────────────────────
+# ── Model-engine adapter (CAME) ─────────────────────────────────────────────
+
+# NOTE:
+# - Backtester owns warmup/cold-start policy enforcement.
+# - This adapter reports readiness via proposal$meta$status and ready_to_trade.
+# - It still runs CAME catch-up internally because the current runner calls strategies only on rebalance dates.
 
 #' @export
 bt_strategy_from_model_engine <- function(decision_date, data_context,
@@ -75,12 +73,10 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
     # ---- initialize / restore CAME state ----
     came_state <- NULL
     last_model_date <- as.Date(NA)
-    prev_target <- NULL
 
     if (!is.null(strategy_state_in) && is.list(strategy_state_in)) {
         if (!is.null(strategy_state_in$came_state)) came_state <- strategy_state_in$came_state
         if (!is.null(strategy_state_in$last_model_date)) last_model_date <- as.Date(strategy_state_in$last_model_date)
-        if (!is.null(strategy_state_in$prev_target)) prev_target <- strategy_state_in$prev_target
     }
     if (is.null(came_state)) came_state <- came_state_init()
 
@@ -94,12 +90,12 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
             cash_weight = 1.0,
             warnings = "No calendar data up to decision_date",
             diagnostics = list(),
-            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date, prev_target = prev_target),
-            meta = list(strategy = "came", failed = TRUE)
+            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+            meta = list(strategy = "came", status = "WARMUP", ready_to_trade = FALSE, reason = "no_calendar")
         ))
     }
 
-    # ---- prevent early failure: only start once CAME has enough lookback ----
+    # ---- CAME minimum warmup requirement (model-specific readiness) ----
     L <- as.integer(strategy_spec$risk$lookback %||% 252L)
     H <- as.integer(strategy_spec$forecast$H %||% 21L)
     mom_h <- strategy_spec$signals$mom_horizons %||% c(21L, 63L, 126L, 252L)
@@ -110,10 +106,10 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
             decision_date = decision_date,
             target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
             cash_weight = 1.0,
-            warnings = sprintf("Not enough warmup days for CAME (have %d need %d)", length(cal), need_days),
+            warnings = sprintf("CAME warmup: have %d need %d", length(cal), need_days),
             diagnostics = list(have_days = length(cal), need_days = need_days),
-            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date, prev_target = prev_target),
-            meta = list(strategy = "came", failed = TRUE)
+            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+            meta = list(strategy = "came", status = "WARMUP", ready_to_trade = FALSE, reason = "insufficient_history")
         ))
     }
 
@@ -127,28 +123,25 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
     }
     run_dates <- run_dates[run_dates <= decision_date]
 
+    # If nothing to do: return current holdings (executed reality)
     if (length(run_dates) == 0) {
-        # nothing to do; just return previous target (or cash)
-        tw <- prev_target
-        if (is.null(tw)) tw <- data.frame(symbol = character(0), weight_target = numeric(0))
-        cw <- 1.0
-        if (is.data.frame(tw) && nrow(tw) > 0) {
-            s <- sum(tw$weight_target, na.rm = TRUE)
-            if (is.finite(s)) cw <- max(0, 1 - s)
-        }
+        w_hold <- bt_compute_weights(portfolio_state)
+        tw <- data.frame(symbol = names(w_hold), weight_target = as.numeric(w_hold), stringsAsFactors = FALSE)
+        tw <- tw[is.finite(tw$weight_target) & tw$weight_target > 0, , drop = FALSE]
+        cw <- max(0, 1 - sum(tw$weight_target, na.rm = TRUE))
+
         return(list(
             decision_date = decision_date,
             target_weights = tw,
             cash_weight = cw,
             warnings = character(0),
-            diagnostics = list(catchup_days = 0L),
-            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date, prev_target = prev_target),
-            meta = list(strategy = "came", reused = TRUE)
+            diagnostics = list(catchup_days = 0L, reused_holdings = TRUE),
+            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+            meta = list(strategy = "came", status = "OK", ready_to_trade = TRUE, reason = "no_new_days")
         ))
     }
 
     # ---- for turnover/frozen-carry correctness, use ACTUAL holdings as prev_target on the trade day ----
-    # decision is made after close; portfolio_state has mark_prices at decision_date in bt_run_backtest
     w_hold <- bt_compute_weights(portfolio_state)
     prev_target_trade <- data.frame(
         symbol = names(w_hold),
@@ -167,14 +160,13 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
         spec_d <- strategy_spec
         if (is.null(spec_d$meta)) spec_d$meta <- list()
 
-        # Ensure backtest never hard-stops on cold start
+        # Backtester should never hard-stop for readiness; keep CAME internally permissive.
         spec_d$meta$strict <- FALSE
         spec_d$forecast$cold_start_policy <- "skip"
 
+        # prevent internal trading on catch-up days (state updates only)
         spec_d$meta$no_trade <- !is_last
 
-        # use prev_target only on the trade day (to reflect real holdings);
-        # Warmup/catch-up days run in no-trade mode and should not inject portfolio constraints.
         pt <- if (is_last) prev_target_trade else NULL
 
         snap <- tryCatch(
@@ -195,8 +187,8 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
                 cash_weight = 1.0,
                 warnings = paste("CAME failed on", as.character(d), ":", conditionMessage(snap)),
                 diagnostics = list(failed_date = as.character(d)),
-                strategy_state_out = list(came_state = came_state, last_model_date = last_model_date, prev_target = prev_target),
-                meta = list(strategy = "came", failed = TRUE)
+                strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+                meta = list(strategy = "came", status = "ERROR", ready_to_trade = FALSE, reason = "came_error")
             ))
         }
 
@@ -205,42 +197,50 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
         n_catch <- n_catch + 1L
     }
 
-    # snap is decision_date output
-    # Optional: do not trade until forecast has a real panel fit
+    # ---- readiness (report only; backtester enforces) ----
     cold <- isTRUE(snap$forecast$diag$cold_start %||% FALSE)
     panel_n <- snap$forecast$diag$panel_n %||% 0L
 
     if (cold || panel_n == 0L) {
-        # keep cash until fitted (recommended for realistic backtests)
-        target_weights <- data.frame(symbol = character(0), weight_target = numeric(0))
-        cash_weight <- 1.0
-        warn <- sprintf("CAME cold-start: panel_n=%d; staying in cash", as.integer(panel_n))
+        status <- "COLD_START"
+        ready <- FALSE
+        reason <- sprintf("forecast_not_fitted(panel_n=%d)", as.integer(panel_n))
     } else {
-        target_weights <- snap$weights
-        cash_weight <- snap$cash_weight
-        warn <- character(0)
+        status <- "OK"
+        ready <- TRUE
+        reason <- "ok"
     }
 
-    # persist prev_target as the EXECUTED target (not the warmup internals)
-    prev_target <- target_weights
+    # Always return model target; backtester decides whether to trade.
+    target_weights <- snap$weights
+    cash_weight <- snap$cash_weight
 
     list(
         decision_date = decision_date,
         target_weights = target_weights,
         cash_weight = cash_weight,
-        warnings = warn,
+        warnings = character(0),
         diagnostics = list(
             catchup_days = n_catch,
             panel_n = panel_n,
             cold_start = cold,
             gating_pi = snap$forecast$pi,
-            m_t = snap$m_t
+            m_t = snap$m_t,
+            base_universe_n = length(runtime_ctx$base_universe %||% character(0))
         ),
         strategy_state_out = list(
             came_state = came_state,
-            last_model_date = last_model_date,
-            prev_target = prev_target
+            last_model_date = last_model_date
         ),
-        meta = list(strategy = "came", spec_hash = snap$meta$spec_hash)
+        meta = list(
+            strategy = "came",
+            status = status,
+            ready_to_trade = ready,
+            reason = reason,
+            spec_hash = snap$meta$spec_hash,
+            contract_version = "came_proposal_v1"
+        ),
+        # Optional: forbid trading non-tradables if you want (keep NULL for now)
+        locked_symbols = NULL
     )
 }

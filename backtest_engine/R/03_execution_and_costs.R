@@ -131,24 +131,89 @@ bt_compute_costs <- function(fills, spec_costs) {
 }
 
 # ── Full execution orchestrator ───────────────────────────────────────────────
+# Supports optional locked_symbols: those symbols must not be traded even if targeted.
 
 #' @export
 bt_execute_rebalance <- function(portfolio_state, proposal, exec_prices,
                                  spec_execution, spec_costs) {
+    fee_rate <- spec_costs$fee_rate %||% 0.0003
+    slip_rate <- spec_costs$slippage_rate %||% 0.0010
+    cost_rate <- fee_rate + slip_rate
+
+    # 1) initial target shares
     target_shares <- bt_compute_target_shares(
         proposal$target_weights, portfolio_state$nav, exec_prices
     )
 
+    # 2) Apply trade locks
+    locked <- proposal$locked_symbols %||% character(0)
+    if (length(locked) > 0) {
+        locked <- unique(as.character(locked))
+        cur <- portfolio_state$positions
+        for (s in locked) {
+            if (s %in% names(cur)) target_shares[s] <- cur[s]
+        }
+    }
+
+    # 3) Build orders and estimate cash impact
     orders <- bt_generate_orders(portfolio_state$positions, target_shares)
+    if (nrow(orders) > 0) {
+        px <- exec_prices[orders$symbol]
+        px[!is.finite(px) | px <= 0] <- NA_real_
+        notional <- orders$shares_delta * px
+        notional[!is.finite(notional)] <- 0
+
+        buy_notional <- sum(pmax(notional, 0), na.rm = TRUE)
+        sell_notional <- sum(pmax(-notional, 0), na.rm = TRUE)
+
+        # Costs apply to absolute traded notional
+        est_cost <- cost_rate * sum(abs(notional), na.rm = TRUE)
+
+        cash_after <- portfolio_state$cash + sell_notional - buy_notional - est_cost
+
+        # 4) If would go negative, scale DOWN buys
+        if (is.finite(cash_after) && cash_after < 0 && buy_notional > 0) {
+            # cash available for buys after accounting for sells and estimated sell costs
+            # conservative: reserve cost_rate on sells too
+            cash_avail <- portfolio_state$cash +
+                sell_notional - cost_rate * sell_notional
+
+            # max buy notional allowed including buy-side costs
+            max_buy <- cash_avail / (1 + cost_rate)
+            max_buy <- max(0, max_buy)
+
+            scale <- max_buy / buy_notional
+            scale <- max(0, min(1, scale))
+
+            # scale only BUY orders (shares_delta > 0)
+            buy_idx <- which(orders$shares_delta > 0)
+            if (length(buy_idx) > 0 && scale < 1) {
+                # adjust target_shares for buy symbols
+                for (i in buy_idx) {
+                    sym <- orders$symbol[i]
+                    # reduce towards current position by scaling delta
+                    cur_pos <- portfolio_state$positions[sym] %||% 0
+                    tgt <- target_shares[sym] %||% 0
+                    delta <- tgt - cur_pos
+                    new_tgt <- cur_pos + floor(delta * scale)
+                    target_shares[sym] <- new_tgt
+                }
+            }
+
+            # rebuild orders after scaling
+            orders <- bt_generate_orders(portfolio_state$positions, target_shares)
+        }
+    }
+
+    # 5) Simulate fills + true costs
     fills <- bt_simulate_fills(orders, exec_prices)
     costs <- bt_compute_costs(fills, spec_costs)
 
-    # Compute cash delta: sells add cash, buys consume cash
     cash_delta <- -sum(fills$notional, na.rm = TRUE) - costs$total_cost
 
     list(
         decision_date  = proposal$decision_date,
-        execution_date = NA, # filled by runner
+        execution_date = NA,
         orders         = orders,
         fills          = fills,
         costs          = costs,

@@ -1,0 +1,5023 @@
+Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_v3_r/model_engine':
+===============================================================================
+  R/00_contracts_and_spec.R
+  R/01_data_adapter.R
+  R/02_risk_engine.R
+  R/03_graph_and_structure.R
+  R/04_signal_engine.R
+  R/05_feature_engine.R
+  R/06_state_and_gating.R
+  R/07_forecast_engine.R
+  R/08_portfolio_engine.R
+  R/09_snapshot_runner.R
+
+
+
+###############################################################################
+### FILE: R/00_contracts_and_spec.R
+###############################################################################
+#' @title Model Engine — Contracts and Spec
+#' @description ModelSpec defaults, validation, artifact contracts, shared helpers.
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+#' @export
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+#' @export
+me_require <- function(pkgs) {
+    for (pkg in pkgs) {
+        if (!requireNamespace(pkg, quietly = TRUE)) {
+            stop(sprintf("Package '%s' is required but not installed.", pkg), call. = FALSE)
+        }
+    }
+}
+
+# ── Π_t Universe mapping operators (architecture §4.2) ──────────────────────
+# Reindex recursive state objects from U_{t-1} to U_t:
+#   - carry values on U_t ∩ U_{t-1}
+#   - initialize new names with configured priors
+#   - drop departed names
+
+#' @export
+me_pi_map_vector <- function(v, new_univ, init_val = 0) {
+    # Map a named numeric vector to new universe
+    if (is.null(v) || length(v) == 0) {
+        out <- setNames(rep(init_val, length(new_univ)), new_univ)
+        return(out)
+    }
+    out <- setNames(rep(init_val, length(new_univ)), new_univ)
+    common <- intersect(names(v), new_univ)
+    if (length(common) > 0) out[common] <- v[common]
+    out
+}
+
+#' @export
+me_pi_map_matrix <- function(M, new_univ, init_diag = 1e-4) {
+    # Map a named symmetric matrix to new universe
+    # Carry intersection, initialize new diagonal entries, zero off-diag for new
+    p_new <- length(new_univ)
+    if (is.null(M) || !is.matrix(M) || p_new == 0) {
+        out <- diag(init_diag, p_new)
+        dimnames(out) <- list(new_univ, new_univ)
+        return(out)
+    }
+    out <- matrix(0, p_new, p_new, dimnames = list(new_univ, new_univ))
+    old_names <- rownames(M)
+    if (is.null(old_names)) old_names <- colnames(M)
+    common <- intersect(old_names, new_univ)
+    if (length(common) > 0) {
+        out[common, common] <- M[common, common, drop = FALSE]
+    }
+    # Initialize diagonal for new names
+    new_names <- setdiff(new_univ, common)
+    if (length(new_names) > 0) {
+        for (nm in new_names) out[nm, nm] <- init_diag
+    }
+    # Ensure symmetry
+    out <- (out + t(out)) / 2
+    out
+}
+
+#' @export
+me_pi_map_list <- function(lst, new_univ, init_fn = function() NULL) {
+    # Map a per-asset named list to new universe
+    if (is.null(lst) || !is.list(lst)) {
+        out <- setNames(lapply(new_univ, function(x) init_fn()), new_univ)
+        return(out)
+    }
+    out <- setNames(vector("list", length(new_univ)), new_univ)
+    common <- intersect(names(lst), new_univ)
+    for (nm in common) out[[nm]] <- lst[[nm]]
+    new_names <- setdiff(new_univ, common)
+    for (nm in new_names) out[[nm]] <- init_fn()
+    out
+}
+
+# ── ModelSpec default ────────────────────────────────────────────────────────
+
+#' @export
+me_spec_default <- function() {
+    # Default legacy gating matrix W (3 experts × 3 state features)
+    W0 <- matrix(
+        0,
+        nrow = 3, ncol = 3,
+        dimnames = list(
+            c("kalman", "tsmom", "cash"),
+            c("disp", "eta", "VoV")
+        )
+    )
+
+    # Architecture §12.4: 5-component gating matrix (A_pi)
+    # Rows = components, Cols = global state features
+    # Initial: identity-like (configurable, not learned)
+    n_state_dim <- 9L # disp, eta, VoV, dens, eto, chi, liq1, liq2, liq3
+    A_pi_default <- matrix(0, nrow = 5, ncol = n_state_dim)
+    b_pi_default <- rep(0, 5)
+
+    list(
+        # ── data section ──
+        data = list(
+            min_coverage_ratio = 0.90,
+            min_median_turnover = 1e5,
+            allowed_types = c("equity", "fii", "etf", "bdr")
+        ),
+
+        # ── risk section (architecture §5) ──
+        risk = list(
+            vol = list(
+                lookback     = 252L,
+                method       = "ewma", # architecture: recursive EWMA
+                lambda_sigma = 0.94 # §5.1 EWMA decay for volatility
+            ),
+            pca = list(
+                k = 5L,
+                lookback = 252L,
+                align_factors = TRUE # §5.3 factor identity alignment
+            ),
+            resid = list(
+                use_glasso = TRUE,
+                lambda     = 0.1,
+                lambda_e   = 0.97 # §5.5 EWMA decay for residual cov target
+            ),
+            factor = list(
+                lambda_f = 0.97 # §5.4 EWMA decay for factor covariance
+            ),
+            hrp = list()
+        ),
+
+        # ── graph section ──
+        graph = list(
+            smoothing_alpha = 0.3,
+            activation_thr  = 0.05,
+            top_k           = 10L,
+            K_min           = 2L,
+            K_max           = 8L
+        ),
+
+        # ── signals section (architecture §7) ──
+        signals = list(
+            kalman = list(
+                lookback  = 252L,
+                q_var     = 1e-4,
+                r_var     = 1e-2,
+                scale     = 1.0,
+                recursive = TRUE # §7.2: per-asset recursive Kalman
+            ),
+            tsmom = list(
+                horizon  = 252L,
+                horizons = c(21L, 63L, 126L, 252L), # §7.1 multiscale
+                scale    = 2.0
+            ),
+            factor = list(
+                horizons = c(21L, 63L) # §7.3 factor trend horizons
+            ),
+            scalarization = list(
+                lambda_omega = 0.95 # §7.4 recursive weight smoothing
+            )
+        ),
+
+        # ── market state section ──
+        market_state = list(
+            dispersion = list(lookback = 63L),
+            eta = list(lookback = 126L),
+            vov = list(
+                lookback     = 63L,
+                vol_lookback = 21L
+            )
+        ),
+
+        # ── gating section (legacy 3-way + architecture 5-component §12.4) ──
+        gating = list(
+            # Legacy 3-way gating (backward compat)
+            W = W0,
+            w0 = c(kalman = 0, tsmom = 0, cash = -1),
+            temperature = 1.0,
+            # Architecture 5-component gating
+            A_pi = A_pi_default,
+            b_pi = b_pi_default,
+            n_components = 5L
+        ),
+
+        # ── forecast section (architecture §12) ──
+        forecast = list(
+            label_horizon = 21L,
+            ridge_lambda = 0.01,
+            confidence_eps = 0.01,
+            uncertainty_scale = 1.0,
+            n_components = 5L, # §12.1
+            kappa_min = 0.5, # §12.5 bounded confidence
+            kappa_max = 1.5,
+            lambda_err = 0.97, # §12.6 error state decay
+            history_snapshots_keep = 252L,
+            refit_every = 1L # daily refit (can be slowed)
+        ),
+
+        # ── portfolio section ──
+        portfolio = list(
+            gamma = 1.0,
+            alpha_scale = 1.0,
+            tilt = list(max_tilt = 2.0),
+            caps = list(max_weight = 0.15),
+            turnover_penalty = 0.0,
+            max_turnover = 0.5
+        ),
+
+        # ── meta section ──
+        meta = list(
+            retain_windows         = FALSE,
+            retain_matrices        = FALSE,
+            mode                   = "production",
+            strict_fallbacks       = FALSE,
+            strict_warnings        = FALSE,
+            strict_architecture    = FALSE,
+            capture_stage_warnings = TRUE
+        )
+    )
+}
+
+# ── Spec access ──────────────────────────────────────────────────────────────
+
+#' @export
+me_get_spec <- function(overrides = NULL) {
+    spec <- me_spec_default()
+    if (!is.null(overrides)) {
+        spec <- utils::modifyList(spec, overrides)
+    }
+    spec
+}
+
+# ── Spec validation ──────────────────────────────────────────────────────────
+
+#' @export
+me_validate_spec <- function(spec) {
+    # ---- top-level structure ----
+    req <- c("data", "risk", "graph", "signals", "market_state", "gating", "forecast", "portfolio", "meta")
+    miss <- setdiff(req, names(spec))
+    if (length(miss) > 0) stop("ModelSpec missing sections: ", paste(miss, collapse = ", "))
+
+    # ---- data section ----
+    d <- spec$data
+    if (!is.null(d$min_coverage_ratio) && (d$min_coverage_ratio < 0 || d$min_coverage_ratio > 1)) {
+        stop("data$min_coverage_ratio must be in [0, 1]")
+    }
+    if (!is.null(d$min_median_turnover) && d$min_median_turnover < 0) {
+        stop("data$min_median_turnover must be >= 0")
+    }
+    allowed_set <- c("equity", "fii", "etf", "bdr")
+    if (!is.null(d$allowed_types) && !all(d$allowed_types %in% allowed_set)) {
+        stop("data$allowed_types contains invalid values. Allowed: ", paste(allowed_set, collapse = ", "))
+    }
+
+    # ---- risk section ----
+    r <- spec$risk
+    for (mod in c("vol", "pca")) {
+        lkb <- r[[mod]]$lookback
+        if (!is.null(lkb) && (!is.finite(lkb) || lkb <= 0)) {
+            stop(sprintf("risk$%s$lookback must be a positive finite number", mod))
+        }
+    }
+    if (!is.null(r$pca$k) && (!is.finite(r$pca$k) || r$pca$k < 1)) {
+        stop("risk$pca$k must be >= 1")
+    }
+    if (!is.null(r$resid$lambda) && (!is.finite(r$resid$lambda) || r$resid$lambda < 0)) {
+        stop("risk$resid$lambda must be finite and >= 0")
+    }
+
+    # ---- graph section ----
+    gr <- spec$graph
+    if (!is.null(gr$smoothing_alpha) && (gr$smoothing_alpha < 0 || gr$smoothing_alpha > 1)) {
+        stop("graph$smoothing_alpha must be in [0, 1]")
+    }
+    if (!is.null(gr$activation_thr) && (!is.finite(gr$activation_thr) || gr$activation_thr < 0)) {
+        stop("graph$activation_thr must be finite and >= 0")
+    }
+    if (!is.null(gr$top_k) && (!is.finite(gr$top_k) || gr$top_k < 1)) {
+        stop("graph$top_k must be >= 1")
+    }
+    if (!is.null(gr$K_min) && (!is.finite(gr$K_min) || gr$K_min < 1)) {
+        stop("graph$K_min must be >= 1")
+    }
+    if (!is.null(gr$K_max) && (!is.finite(gr$K_max) || gr$K_max < 1)) {
+        stop("graph$K_max must be >= 1")
+    }
+    if (!is.null(gr$K_min) && !is.null(gr$K_max) && gr$K_min > gr$K_max) {
+        stop("graph$K_min cannot exceed graph$K_max")
+    }
+
+    # ---- signals section ----
+    s <- spec$signals
+    if (!is.null(s$kalman$lookback) && s$kalman$lookback <= 0) {
+        stop("signals$kalman$lookback must be > 0")
+    }
+    if (!is.null(s$tsmom$horizon) && s$tsmom$horizon <= 0) {
+        stop("signals$tsmom$horizon must be > 0")
+    }
+
+    # ---- market_state section ----
+    ms <- spec$market_state
+    for (feat in c("dispersion", "eta", "vov")) {
+        lkb <- ms[[feat]]$lookback
+        if (!is.null(lkb) && (!is.finite(lkb) || lkb <= 0)) {
+            stop(sprintf("market_state$%s$lookback must be > 0", feat))
+        }
+    }
+
+    # ---- gating section ----
+    g <- spec$gating
+    W <- g$W
+    if (!is.null(W)) {
+        if (!is.matrix(W) || !all(dim(W) == c(3, 3))) {
+            stop("gating$W must be a 3x3 matrix")
+        }
+        exp_row <- c("kalman", "tsmom", "cash")
+        exp_col <- c("disp", "eta", "VoV")
+        if (!is.null(rownames(W)) && !all(rownames(W) == exp_row)) {
+            stop("gating$W rownames must be c('kalman', 'tsmom', 'cash')")
+        }
+        if (!is.null(colnames(W)) && !all(colnames(W) == exp_col)) {
+            stop("gating$W colnames must be c('disp', 'eta', 'VoV')")
+        }
+        if (any(!is.finite(W))) {
+            stop("gating$W must contain only finite values")
+        }
+    }
+    w0 <- g$w0
+    if (!is.null(w0)) {
+        if (length(w0) != 3) stop("gating$w0 must have length 3")
+        if (any(!is.finite(w0))) stop("gating$w0 must contain only finite values")
+    }
+    if (!is.null(g$temperature) && (!is.finite(g$temperature) || g$temperature <= 0)) {
+        stop("gating$temperature must be a positive scalar")
+    }
+
+    # ---- forecast section ----
+    fc <- spec$forecast
+    if (!is.null(fc$label_horizon) && (!is.finite(fc$label_horizon) || fc$label_horizon < 1)) {
+        stop("forecast$label_horizon must be >= 1")
+    }
+    if (!is.null(fc$ridge_lambda) && (!is.finite(fc$ridge_lambda) || fc$ridge_lambda < 0)) {
+        stop("forecast$ridge_lambda must be >= 0")
+    }
+    if (!is.null(fc$confidence_eps) && (!is.finite(fc$confidence_eps) || fc$confidence_eps <= 0)) {
+        stop("forecast$confidence_eps must be > 0")
+    }
+    if (!is.null(fc$uncertainty_scale) && (!is.finite(fc$uncertainty_scale) || fc$uncertainty_scale < 0)) {
+        stop("forecast$uncertainty_scale must be >= 0")
+    }
+
+    # ---- portfolio section ----
+    p <- spec$portfolio
+    if (!is.null(p$caps$max_weight) && (p$caps$max_weight <= 0 || p$caps$max_weight > 1)) {
+        stop("portfolio$caps$max_weight must be in (0, 1]")
+    }
+    if (!is.null(p$tilt$max_tilt) && (!is.finite(p$tilt$max_tilt) || p$tilt$max_tilt < 1)) {
+        stop("portfolio$tilt$max_tilt must be >= 1")
+    }
+    if (!is.null(p$gamma) && !is.finite(p$gamma)) {
+        stop("portfolio$gamma must be finite")
+    }
+    if (!is.null(p$alpha_scale) && !is.finite(p$alpha_scale)) {
+        stop("portfolio$alpha_scale must be finite")
+    }
+    if (!is.null(p$turnover_penalty) && (!is.finite(p$turnover_penalty) || p$turnover_penalty < 0)) {
+        stop("portfolio$turnover_penalty must be >= 0")
+    }
+    if (!is.null(p$max_turnover) && (!is.finite(p$max_turnover) || p$max_turnover < 0 || p$max_turnover > 1)) {
+        stop("portfolio$max_turnover must be in [0, 1]")
+    }
+
+    # ---- meta section ----
+    m <- spec$meta
+    bool_fields <- c(
+        "retain_windows", "retain_matrices",
+        "strict_fallbacks", "strict_warnings",
+        "strict_architecture", "capture_stage_warnings"
+    )
+    for (nm in bool_fields) {
+        if (!is.null(m[[nm]]) && (!is.logical(m[[nm]]) || length(m[[nm]]) != 1L || is.na(m[[nm]]))) {
+            stop(sprintf("meta$%s must be TRUE/FALSE", nm))
+        }
+    }
+    if (!is.null(m$mode) && (!is.character(m$mode) || length(m$mode) != 1L)) {
+        stop("meta$mode must be a length-1 character string")
+    }
+
+    invisible(spec)
+}
+
+# ── Snapshot artifact validation ─────────────────────────────────────────────
+
+#' @export
+me_validate_snapshot_artifact <- function(x) {
+    req <- c(
+        "as_of_date", "tradable_symbols", "target_weights",
+        "cash_weight", "risk", "signals", "market_state",
+        "gating", "portfolio_diag", "meta", "warnings",
+        "model_state_out"
+    )
+    miss <- setdiff(req, names(x))
+    if (length(miss) > 0) stop("Snapshot artifact missing: ", paste(miss, collapse = ", "))
+
+    # Target weights structure
+    tgt <- x$target_weights
+    if (!is.data.frame(tgt)) stop("target_weights must be a data.frame")
+    if (!all(c("symbol", "weight_target") %in% names(tgt))) {
+        stop("target_weights must have columns 'symbol' and 'weight_target'")
+    }
+
+    # Weight budget
+    tot <- sum(tgt$weight_target, na.rm = TRUE) + x$cash_weight
+    if (abs(tot - 1.0) > 1e-4) stop(sprintf("Weights sum to %f, not 1.0", tot))
+
+    # Cash validity
+    if (!is.finite(x$cash_weight) || x$cash_weight < 0 || x$cash_weight > 1) {
+        stop("cash_weight must be in [0, 1]")
+    }
+
+    # Gating consistency — legacy 3-way path
+    g <- x$gating
+    if (length(g) > 0 && !is.null(g$w_kalman)) {
+        gate_sum <- g$w_kalman + g$w_tsmom + g$w_cash
+        if (is.finite(gate_sum) && abs(gate_sum - 1.0) > 1e-6) {
+            stop("Gating softmax weights do not sum to 1")
+        }
+        # Note: gross_exposure vs cash_weight check relaxed because optimizer controls
+        # may legitimately adjust gross_exposure after gating (§12.8).
+    }
+
+    # Gating consistency — architecture 5-component path (if present)
+    if (!is.null(g$pi_t) && is.numeric(g$pi_t)) {
+        if (abs(sum(g$pi_t) - 1.0) > 1e-6) {
+            stop("Architecture gating pi_t does not sum to 1")
+        }
+    }
+
+    # Risk universe alignment (covariance-based, not HRP-based)
+    risk <- x$risk
+    Sigma_ref <- risk$Sigma_risk_H %||% risk$Sigma_total %||% risk$Sigma_risk_1
+
+    if (!is.null(Sigma_ref)) {
+        if (!is.matrix(Sigma_ref)) stop("Risk covariance must be a matrix")
+        if (nrow(Sigma_ref) != ncol(Sigma_ref)) stop("Risk covariance must be square")
+        if (is.null(rownames(Sigma_ref)) || is.null(colnames(Sigma_ref))) {
+            stop("Risk covariance must have rownames and colnames")
+        }
+        if (!identical(rownames(Sigma_ref), colnames(Sigma_ref))) {
+            stop("Risk covariance rownames/colnames must match and be in same order")
+        }
+        if (nrow(tgt) > 0 && !all(tgt$symbol %in% colnames(Sigma_ref))) {
+            stop("Some target symbols are not in risk covariance universe")
+        }
+    }
+
+    # Optional baseline alignment check (transitional; not architecture-defining)
+    if (!is.null(risk$w_baseline) && length(risk$w_baseline) > 0 && !is.null(Sigma_ref)) {
+        if (!all(names(risk$w_baseline) %in% colnames(Sigma_ref))) {
+            stop("risk$w_baseline symbols are not contained in risk covariance universe")
+        }
+    }
+
+    invisible(x)
+}
+
+# ── Model state validation (for recursive carry-forward) ─────────────────────
+# All recursive state fields are optional (NULL is valid for cold start).
+# When present, basic type checks apply.
+
+#' @export
+me_validate_model_state <- function(state) {
+    if (is.null(state)) {
+        return(invisible(NULL))
+    }
+
+    if (!is.list(state)) stop("model_state must be a list or NULL")
+
+    # prev_target validation
+    if (!is.null(state$prev_target)) {
+        pt <- state$prev_target
+        if (!is.data.frame(pt) || !all(c("symbol", "weight_target") %in% names(pt))) {
+            stop("model_state$prev_target must be a data.frame with symbol + weight_target")
+        }
+    }
+
+    # Recursive risk states (all optional, type-checked if present)
+    if (!is.null(state$ewma_vol_state) && !is.numeric(state$ewma_vol_state)) {
+        stop("model_state$ewma_vol_state must be a named numeric vector or NULL")
+    }
+    if (!is.null(state$factor_cov_state) && !is.matrix(state$factor_cov_state)) {
+        stop("model_state$factor_cov_state must be a matrix or NULL")
+    }
+    if (!is.null(state$resid_cov_state) && !is.matrix(state$resid_cov_state)) {
+        stop("model_state$resid_cov_state must be a matrix or NULL")
+    }
+    if (!is.null(state$B_prev) && !is.matrix(state$B_prev)) {
+        stop("model_state$B_prev must be a matrix or NULL")
+    }
+
+    # Graph recursive states
+    if (!is.null(state$edge_stability) && !is.matrix(state$edge_stability)) {
+        stop("model_state$edge_stability must be a matrix or NULL")
+    }
+    if (!is.null(state$node_stability) && !is.numeric(state$node_stability)) {
+        stop("model_state$node_stability must be a named numeric vector or NULL")
+    }
+
+    # Kalman states
+    if (!is.null(state$kalman_states) && !is.list(state$kalman_states)) {
+        stop("model_state$kalman_states must be a list or NULL")
+    }
+
+    # Scalarization w eights
+    if (!is.null(state$scalar_weights) && !is.list(state$scalar_weights)) {
+        stop("model_state$scalar_weights must be a list or NULL")
+    }
+
+    invisible(state)
+}
+
+# ── Spec hash ────────────────────────────────────────────────────────────────
+
+#' @export
+me_hash_spec <- function(spec) {
+    me_require("digest")
+    digest::digest(spec)
+}
+
+
+
+###############################################################################
+### FILE: R/01_data_adapter.R
+###############################################################################
+#' @title Model Engine — Data Adapter
+#' @description No-lookahead data access layer wrapping panel_adj_model.
+
+#' @export
+me_make_data_adapter <- function(data_bundle_or_panel, aux = list()) {
+    me_require("data.table")
+
+    # ── Extract panel ──
+    if (is.list(data_bundle_or_panel) && "panel_adj_model" %in% names(data_bundle_or_panel)) {
+        dt <- data.table::as.data.table(data_bundle_or_panel$panel_adj_model)
+    } else if (is.data.frame(data_bundle_or_panel)) {
+        dt <- data.table::as.data.table(data_bundle_or_panel)
+    } else {
+        stop("Input must be a data.frame or a bundle list containing 'panel_adj_model'")
+    }
+
+    # ── Validate required columns ──
+    # Canonical: traded_value, traded_units, n_trades
+    # Legacy aliases: turnover (= traded_value), qty (= traded_units)
+    req_cols <- c("symbol", "refdate", "open", "close")
+    missing <- setdiff(req_cols, names(dt))
+    if (length(missing) > 0) {
+        stop("Panel missing required columns: ", paste(missing, collapse = ", "))
+    }
+
+    # Ensure activity columns exist (prefer canonical, fallback to legacy)
+    if (!"traded_value" %in% names(dt) && "turnover" %in% names(dt)) {
+        dt[, traded_value := turnover]
+    }
+    if (!"traded_units" %in% names(dt) && "qty" %in% names(dt)) {
+        dt[, traded_units := qty]
+    }
+    # Create legacy aliases if they don't exist
+    if (!"turnover" %in% names(dt) && "traded_value" %in% names(dt)) {
+        dt[, turnover := traded_value]
+    }
+    if (!"qty" %in% names(dt) && "traded_units" %in% names(dt)) {
+        dt[, qty := traded_units]
+    }
+
+    # ── Canonical date type ──
+    if (!inherits(dt$refdate, "Date")) {
+        dt[, refdate := as.Date(refdate)]
+        if (any(is.na(dt$refdate))) {
+            stop("refdate must be coercible to Date")
+        }
+    }
+
+    # ── Set key and dedupe check ──
+    data.table::setkeyv(dt, c("symbol", "refdate"))
+    if (anyDuplicated(dt, by = c("symbol", "refdate")) > 0) {
+        stop("Panel contains duplicate (symbol, refdate) pairs")
+    }
+
+    # ── Default asset_type if missing ──
+    if (!"asset_type" %in% names(dt)) dt[, asset_type := "equity"]
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Build adapter (closure-based interface)
+    # ══════════════════════════════════════════════════════════════════════════
+    adapter <- list()
+
+    # ── Calendar ──
+    adapter$calendar <- function() sort(unique(dt$refdate))
+
+    # ── Panel up to date (strict no-lookahead) ──
+    adapter$panel_upto <- function(as_of_date) dt[refdate <= as_of_date]
+
+    # ── Price matrix ──
+    adapter$price_matrix <- function(as_of_date, lookback, field = "close",
+                                     symbols = NULL, strict = TRUE) {
+        sub <- adapter$panel_upto(as_of_date)
+        if (nrow(sub) == 0) {
+            return(matrix(NA_real_, 0, 0))
+        }
+
+        cal <- sort(unique(sub$refdate))
+        dates <- tail(cal, lookback)
+        sub <- sub[refdate %in% dates]
+        if (!is.null(symbols)) sub <- sub[symbol %in% symbols]
+
+        mat <- data.table::dcast(sub, refdate ~ symbol, value.var = field)
+        if (nrow(mat) == 0) {
+            return(matrix(NA_real_, 0, 0))
+        }
+
+        out <- as.matrix(mat[, -1, with = FALSE])
+        rownames(out) <- as.character(mat$refdate)
+
+        if (strict) {
+            keep <- colSums(!is.na(out)) == nrow(out)
+            out <- out[, keep, drop = FALSE]
+        }
+        if (!is.null(symbols)) {
+            found <- intersect(symbols, colnames(out))
+            out <- out[, found, drop = FALSE]
+        }
+        out
+    }
+
+    # ── Returns matrix ──
+    adapter$returns_matrix <- function(as_of_date, lookback, field = "close",
+                                       method = "log", symbols = NULL,
+                                       strict = TRUE) {
+        pm <- adapter$price_matrix(as_of_date, lookback + 1, field, symbols, strict)
+        if (nrow(pm) < 2) {
+            return(matrix(NA_real_, 0, ncol(pm),
+                dimnames = list(NULL, colnames(pm))
+            ))
+        }
+        if (method == "log") diff(log(pm)) else diff(pm) / pm[-nrow(pm), ]
+    }
+
+    # ── Single-day cross-sectional return ──
+    adapter$return_1d <- function(as_of_date, symbols = NULL) {
+        pm <- adapter$price_matrix(as_of_date, 2, "close", symbols, strict = FALSE)
+        if (nrow(pm) < 2) {
+            v <- rep(NA_real_, max(1, ncol(pm)))
+            if (ncol(pm) > 0) names(v) <- colnames(pm)
+            return(v)
+        }
+        r <- log(pm[2, ] / pm[1, ])
+        r[!is.finite(r)] <- NA_real_
+        r
+    }
+
+    # ── Execution prices ──
+    adapter$execution_price <- function(exec_date, field = "open", symbols = NULL) {
+        sub <- dt[refdate == exec_date]
+        if (!is.null(symbols)) sub <- sub[symbol %in% symbols]
+        res <- sub[[field]]
+        names(res) <- sub$symbol
+        if (!is.null(symbols)) {
+            out <- rep(NA_real_, length(symbols))
+            names(out) <- symbols
+            found <- intersect(symbols, names(res))
+            out[found] <- res[found]
+            return(out)
+        }
+        res
+    }
+
+    # ── Investability snapshot ──
+    adapter$investability_snapshot <- function(as_of_date, spec_data) {
+        sub <- adapter$panel_upto(as_of_date)
+        cal <- sort(unique(sub$refdate))
+
+        lkb <- min(63L, length(cal))
+        if (lkb < 5) {
+            return(character(0))
+        }
+
+        dates <- tail(cal, lkb)
+        sub <- sub[refdate %in% dates]
+
+        min_cov <- spec_data$min_coverage_ratio %||% 0.90
+        min_turnover <- spec_data$min_median_turnover %||% 1e5
+        allowed <- spec_data$allowed_types %||% c("equity")
+
+        # Filter by asset type
+        if (length(allowed) > 0 && "asset_type" %in% names(sub)) {
+            sub <- sub[asset_type %in% allowed]
+        }
+
+        # Use canonical traded_value (with turnover fallback)
+        tv_col <- if ("traded_value" %in% names(sub)) "traded_value" else "turnover"
+        if (!tv_col %in% names(sub)) {
+            return(character(0))
+        }
+
+        agg <- sub[, .(
+            n_obs        = .N,
+            med_turnover = median(get(tv_col), na.rm = TRUE),
+            last_price   = tail(close, 1)
+        ), by = symbol]
+
+        agg <- agg[n_obs >= (lkb * min_cov) &
+            med_turnover >= min_turnover &
+            last_price > 0]
+        agg$symbol
+    }
+
+    adapter
+}
+
+
+
+###############################################################################
+### FILE: R/02_risk_engine.R
+###############################################################################
+#' @title Model Engine — Risk Engine
+#' @description Architecture §5: EWMA vol, standardized returns, PCA with factor alignment,
+#' recursive factor/residual covariance, Glasso precision, covariance recomposition.
+#' Preserves legacy HRP baseline as transitional alias.
+
+# ── §5.1 EWMA volatility update (per-asset recursive) ──────────────────────
+
+#' @export
+me_ewma_vol_update <- function(sigma2_prev, r_t, lambda_sigma = 0.94) {
+    # sigma2_i,t = lambda * sigma2_i,t-1 + (1-lambda) * r_i,t^2
+    # sigma2_prev: named numeric vector of previous variances (NULL for cold start)
+    # r_t: named numeric vector of current returns
+    syms <- names(r_t)
+    r2 <- r_t^2
+    r2[!is.finite(r2)] <- 0
+
+    if (is.null(sigma2_prev) || length(sigma2_prev) == 0) {
+        # Cold start: use current observed variance as initial
+        out <- r2
+        out[out <= 0] <- median(r2[r2 > 0], na.rm = TRUE)
+        out[!is.finite(out)] <- 1e-4
+        names(out) <- syms
+        return(out)
+    }
+
+    # Align previous state to current universe via Π_t
+    sigma2_aligned <- me_pi_map_vector(sigma2_prev, syms, init_val = median(sigma2_prev[sigma2_prev > 0], na.rm = TRUE))
+    sigma2_aligned[!is.finite(sigma2_aligned) | sigma2_aligned <= 0] <- 1e-4
+
+    out <- lambda_sigma * sigma2_aligned + (1 - lambda_sigma) * r2
+    out[!is.finite(out) | out <= 0] <- 1e-4
+    names(out) <- syms
+    out
+}
+
+#' Batch EWMA volatility from a return window (for initialization)
+#' @export
+me_estimate_vol <- function(R_window, spec_risk_vol) {
+    if (is.null(R_window) || nrow(R_window) == 0 || ncol(R_window) == 0) {
+        return(numeric(0))
+    }
+
+    method <- spec_risk_vol$method %||% "ewma"
+    lambda <- spec_risk_vol$lambda_sigma %||% 0.94
+
+    if (method == "ewma") {
+        # Full batch EWMA from window
+        n <- ncol(R_window)
+        Tn <- nrow(R_window)
+        sigma2 <- rep(NA_real_, n)
+        names(sigma2) <- colnames(R_window)
+        for (j in seq_len(n)) {
+            r <- R_window[, j]
+            r[!is.finite(r)] <- 0
+            # Initialize from first 21 days sample variance
+            init_n <- min(21, length(r))
+            s2 <- var(r[1:init_n])
+            if (!is.finite(s2) || s2 <= 0) s2 <- 1e-4
+            for (i in seq_along(r)) {
+                s2 <- lambda * s2 + (1 - lambda) * r[i]^2
+            }
+            sigma2[j] <- s2
+        }
+        vols <- sqrt(sigma2) * sqrt(252)
+    } else {
+        # Legacy: simple sample sd
+        vols <- apply(R_window, 2, sd, na.rm = TRUE) * sqrt(252)
+    }
+
+    vols[!is.finite(vols) | vols <= 0] <- NA_real_
+    vols
+}
+
+# ── §5.2 PCA on standardized returns ─────────────────────────────────────────
+
+#' @export
+me_fit_pca <- function(R_window, spec_pca) {
+    k <- spec_pca$k %||% 5L
+    n <- ncol(R_window)
+    Tn <- nrow(R_window)
+
+    if (n < 3 || Tn < 10) stop("PCA requires >= 3 assets and >= 10 observations")
+    k <- min(k, n - 1, Tn - 1)
+
+    centers <- colMeans(R_window, na.rm = TRUE)
+    R_centered <- scale(R_window, center = centers, scale = FALSE)
+    R_centered[!is.finite(R_centered)] <- 0
+
+    sv <- tryCatch(svd(R_centered, nu = k, nv = k), error = function(e) NULL)
+    if (is.null(sv)) stop("SVD failed in PCA")
+
+    B <- sv$v[, 1:k, drop = FALSE]
+    rownames(B) <- colnames(R_window)
+    colnames(B) <- paste0("PC", seq_len(k))
+
+    F_scores <- R_centered %*% B
+    colnames(F_scores) <- paste0("PC", seq_len(k))
+
+    list(
+        B = B,
+        F = F_scores,
+        centers = centers,
+        k = k,
+        d = sv$d[1:k],
+        n_obs = Tn,
+        n_assets = n
+    )
+}
+
+# ── §5.3 PCA factor identity alignment (signed permutation) ─────────────────
+
+#' @export
+me_align_pca_factors <- function(B_raw, f_raw, B_prev) {
+    # Align current PCA factors to previous basis for temporal consistency.
+    # Uses Hungarian matching on |C| = |B_prev' B_raw| + sign correction.
+    # Returns aligned (B_t, f_t, R_align, alignment_used).
+    k <- ncol(B_raw)
+    if (is.null(B_prev) || ncol(B_prev) != k) {
+        return(list(B = B_raw, f = f_raw, R_align = diag(k), alignment_used = FALSE))
+    }
+
+    # Overlap matrix: C = B_prev' B_raw (k x k)
+    # Use common assets
+    common <- intersect(rownames(B_prev), rownames(B_raw))
+    if (length(common) < max(3, k)) {
+        return(list(B = B_raw, f = f_raw, R_align = diag(k), alignment_used = FALSE))
+    }
+
+    C <- t(B_prev[common, , drop = FALSE]) %*% B_raw[common, , drop = FALSE]
+    absC <- abs(C)
+
+    # Greedy Hungarian-style matching on |C|
+    # Find best permutation mapping: new_col -> prev_col
+    perm <- rep(NA_integer_, k)
+    signs <- rep(1, k)
+    used_rows <- rep(FALSE, k)
+
+    for (iter in seq_len(k)) {
+        best_val <- -1
+        best_i <- 1
+        best_j <- 1
+        for (i in seq_len(k)) {
+            if (used_rows[i]) next
+            for (j in seq_len(k)) {
+                if (!is.na(perm[j])) next
+                if (absC[i, j] > best_val) {
+                    best_val <- absC[i, j]
+                    best_i <- i
+                    best_j <- j
+                }
+            }
+        }
+        perm[best_j] <- best_i
+        signs[best_j] <- sign(C[best_i, best_j])
+        if (signs[best_j] == 0) signs[best_j] <- 1
+        used_rows[best_i] <- TRUE
+    }
+
+    # Build signed permutation matrix R_align
+    R_align <- matrix(0, k, k)
+    for (j in seq_len(k)) {
+        R_align[perm[j], j] <- signs[j]
+    }
+
+    B_aligned <- B_raw %*% R_align
+    rownames(B_aligned) <- rownames(B_raw)
+    colnames(B_aligned) <- colnames(B_raw)
+
+    # f_raw is T×k matrix or single vector
+    if (is.matrix(f_raw)) {
+        f_aligned <- f_raw %*% R_align
+        colnames(f_aligned) <- colnames(B_raw)
+    } else {
+        f_aligned <- as.vector(R_align %*% f_raw)
+        names(f_aligned) <- colnames(B_raw)
+    }
+
+    list(B = B_aligned, f = f_aligned, R_align = R_align, alignment_used = TRUE)
+}
+
+# ── Residuals ─────────────────────────────────────────────────────────────────
+
+#' @export
+me_compute_residuals <- function(R_window, pca_fit) {
+    R_centered <- scale(R_window, center = pca_fit$centers, scale = FALSE)
+    R_centered[!is.finite(R_centered)] <- 0
+    Sys <- pca_fit$F %*% t(pca_fit$B)
+    E <- R_centered - Sys
+    dimnames(E) <- dimnames(R_window)
+    E
+}
+
+# ── §5.4 Factor covariance recursion ─────────────────────────────────────────
+
+#' Recursive EWMA factor covariance update
+#' @export
+me_factor_cov_recursive <- function(Sigma_f_prev, f_t, lambda_f = 0.97) {
+    # Sigma_f,t = lambda_f * Sigma_f,t-1 + (1 - lambda_f) * f_t f_t'
+    k <- length(f_t)
+    f_t <- as.numeric(f_t)
+    f_t[!is.finite(f_t)] <- 0
+
+    ff <- f_t %*% t(f_t)
+
+    if (is.null(Sigma_f_prev) || !is.matrix(Sigma_f_prev) ||
+        nrow(Sigma_f_prev) != k || ncol(Sigma_f_prev) != k) {
+        # Cold start
+        return(list(sigma_f = ff))
+    }
+
+    sigma_f <- lambda_f * Sigma_f_prev + (1 - lambda_f) * ff
+    sigma_f <- (sigma_f + t(sigma_f)) / 2
+    sigma_f[!is.finite(sigma_f)] <- 0
+    list(sigma_f = sigma_f)
+}
+
+#' Batch factor covariance (legacy compat)
+#' @export
+me_factor_cov <- function(F_window, spec_factor_cov = list()) {
+    sigma_f <- cov(F_window, use = "pairwise.complete.obs")
+    sigma_f[!is.finite(sigma_f)] <- 0
+    list(sigma_f = sigma_f)
+}
+
+# ── §5.5 Recursive residual covariance target ────────────────────────────────
+
+#' @export
+me_resid_cov_recursive <- function(S_e_prev, e_t, new_univ, lambda_e = 0.97) {
+    # S_e,t = lambda_e * S_e,t-1 + (1-lambda_e) * e_t e_t'
+    p <- length(e_t)
+    e_t <- as.numeric(e_t)
+    e_t[!is.finite(e_t)] <- 0
+    ee <- e_t %*% t(e_t)
+    dimnames(ee) <- list(new_univ, new_univ)
+
+    if (is.null(S_e_prev) || !is.matrix(S_e_prev)) {
+        return(ee)
+    }
+
+    # Map previous state to current universe
+    S_mapped <- me_pi_map_matrix(S_e_prev, new_univ, init_diag = median(diag(S_e_prev), na.rm = TRUE))
+
+    S_new <- lambda_e * S_mapped + (1 - lambda_e) * ee
+    S_new <- (S_new + t(S_new)) / 2
+    S_new[!is.finite(S_new)] <- 0
+    S_new
+}
+
+# ── Residual precision (Glasso) ──────────────────────────────────────────────
+
+#' @export
+me_fit_residual_cov <- function(E_window, spec_resid, S_e_target = NULL) {
+    use_glasso <- isTRUE(spec_resid$use_glasso)
+    lambda <- spec_resid$lambda %||% 0.1
+
+    # Use recursive target S_e if provided; otherwise batch sample cov
+    if (!is.null(S_e_target) && is.matrix(S_e_target)) {
+        S_eps <- S_e_target
+    } else {
+        S_eps <- cov(E_window, use = "pairwise.complete.obs")
+    }
+    S_eps[!is.finite(S_eps)] <- 0
+    n <- ncol(S_eps)
+
+    precision <- NULL
+    Sigma_eps <- S_eps
+
+    glasso_requested <- use_glasso
+    glasso_used <- FALSE
+    precision_method <- "ridge_inverse"
+    precision_fallback <- FALSE
+    fallback_reason <- NULL
+
+    if (use_glasso && n >= 3) {
+        if (requireNamespace("glasso", quietly = TRUE)) {
+            gl <- tryCatch(
+                glasso::glasso(S_eps, rho = lambda, penalize.diagonal = FALSE),
+                error = function(e) e
+            )
+            if (!inherits(gl, "error") && !is.null(gl)) {
+                Sigma_eps <- gl$w
+                precision <- gl$wi
+                glasso_used <- TRUE
+                precision_method <- "glasso"
+            } else {
+                precision_fallback <- TRUE
+                fallback_reason <- if (inherits(gl, "error")) {
+                    paste("glasso_failed:", gl$message)
+                } else {
+                    "glasso_failed_unknown"
+                }
+            }
+        } else {
+            precision_fallback <- TRUE
+            fallback_reason <- "glasso_package_not_installed"
+        }
+    } else if (use_glasso && n < 3) {
+        precision_fallback <- TRUE
+        fallback_reason <- "glasso_skipped_n_lt_3"
+    }
+
+    if (is.null(precision)) {
+        # Ridge fallback for precision approximation
+        ridge <- lambda * mean(diag(Sigma_eps), na.rm = TRUE)
+        if (!is.finite(ridge) || ridge < 0) ridge <- 1e-6
+        Sigma_eps_r <- Sigma_eps
+        diag(Sigma_eps_r) <- diag(Sigma_eps_r) + ridge
+
+        precision <- tryCatch(
+            solve(Sigma_eps_r),
+            error = function(e) {
+                d <- diag(Sigma_eps_r)
+                d[!is.finite(d) | d <= 0] <- 1
+                diag(1 / d)
+            }
+        )
+
+        if (precision_method != "glasso") {
+            precision_method <- "ridge_inverse"
+        }
+        if (is.null(fallback_reason) && use_glasso) {
+            fallback_reason <- "glasso_not_used_ridge_inverse_applied"
+        }
+    }
+
+    dimnames(Sigma_eps) <- dimnames(S_eps)
+    dimnames(precision) <- dimnames(S_eps)
+
+    list(
+        sigma_eps = Sigma_eps,
+        precision = precision,
+        glasso_requested = glasso_requested,
+        glasso_used = glasso_used,
+        precision_method = precision_method,
+        precision_fallback = isTRUE(precision_fallback) || (!glasso_used && glasso_requested),
+        fallback_reason = fallback_reason
+    )
+}
+
+# ── §5.6 Total covariance recomposition + unstandardization ──────────────────
+
+#' @export
+me_assemble_total_cov <- function(pca_fit, Sigma_f, Sigma_eps, D_t = NULL) {
+    B <- pca_fit$B
+    # Standardized daily covariance: Σ̃ = B Σ_f B' + Σ_e
+    Sigma_std <- B %*% Sigma_f %*% t(B) + Sigma_eps
+    Sigma_std <- (Sigma_std + t(Sigma_std)) / 2
+
+    # Unstandardize: Σ_risk^(1) = D Σ̃ D
+    if (!is.null(D_t) && length(D_t) > 0) {
+        # D_t = diag(σ_1,...,σ_p) — unstandardization
+        d_vec <- D_t[rownames(B)]
+        d_vec[!is.finite(d_vec) | d_vec <= 0] <- 1e-4
+        Sigma_total <- diag(d_vec) %*% Sigma_std %*% diag(d_vec)
+    } else {
+        Sigma_total <- Sigma_std
+    }
+
+    Sigma_total <- (Sigma_total + t(Sigma_total)) / 2
+    dimnames(Sigma_total) <- list(rownames(B), rownames(B))
+    Sigma_total
+}
+
+# ── Covariance sanity (nearPD repair) ─────────────────────────────────────────
+
+#' @export
+me_cov_sanity <- function(Sigma, repair = TRUE) {
+    n <- ncol(Sigma)
+    was_repaired <- FALSE
+    evals <- eigen(Sigma, symmetric = TRUE, only.values = TRUE)$values
+
+    if (any(evals < -1e-10)) {
+        if (repair) {
+            me_require("Matrix")
+            Sigma <- as.matrix(Matrix::nearPD(Sigma, corr = FALSE)$mat)
+            was_repaired <- TRUE
+        } else {
+            stop("Covariance matrix is not PSD")
+        }
+    }
+
+    list(
+        Sigma = Sigma, was_repaired = was_repaired,
+        min_eigenvalue = min(evals), n = n
+    )
+}
+
+# ── HRP allocation (transitional baseline) ───────────────────────────────────
+
+.inv_var_alloc <- function(cov_mat) {
+    v <- diag(cov_mat)
+    v[v <= 0 | !is.finite(v)] <- max(v[v > 0 & is.finite(v)], 1e-8)
+    w <- 1 / v
+    w / sum(w)
+}
+
+.get_cluster_var <- function(cov_mat, c_ix) {
+    cov_slice <- cov_mat[c_ix, c_ix, drop = FALSE]
+    w <- .inv_var_alloc(cov_slice)
+    v <- sum(w * (cov_slice %*% w))
+    if (v <= 0) v <- 1e-8
+    v
+}
+
+.get_rec_bipart <- function(cov_mat, sort_ix) {
+    w <- rep(1, length(sort_ix))
+    names(w) <- colnames(cov_mat)[sort_ix]
+
+    clusters <- list(sort_ix)
+    while (length(clusters) > 0) {
+        c_ix <- clusters[[1]]
+        clusters <- clusters[-1]
+        if (length(c_ix) > 1) {
+            half <- floor(length(c_ix) / 2)
+            c1 <- c_ix[1:half]
+            c2 <- c_ix[(half + 1):length(c_ix)]
+            v1 <- .get_cluster_var(cov_mat, c1)
+            v2 <- .get_cluster_var(cov_mat, c2)
+            alpha <- 1 - v1 / (v1 + v2)
+            w[colnames(cov_mat)[c1]] <- w[colnames(cov_mat)[c1]] * alpha
+            w[colnames(cov_mat)[c2]] <- w[colnames(cov_mat)[c2]] * (1 - alpha)
+            clusters <- append(clusters, list(c1, c2))
+        }
+    }
+    w
+}
+
+#' @export
+me_allocate_hrp <- function(Sigma, spec_hrp = list()) {
+    n <- ncol(Sigma)
+
+    if (!is.matrix(Sigma)) {
+        Sigma <- as.matrix(Sigma)
+    }
+    if (length(dim(Sigma)) != 2L || nrow(Sigma) != ncol(Sigma)) {
+        stop(sprintf(
+            "me_allocate_hrp: Sigma must be square, got %s x %s",
+            NROW(Sigma), NCOL(Sigma)
+        ))
+    }
+    if (is.null(colnames(Sigma)) || is.null(rownames(Sigma))) {
+        stop("me_allocate_hrp: Sigma must have rownames and colnames.")
+    }
+    if (!identical(rownames(Sigma), colnames(Sigma))) {
+        stop("me_allocate_hrp: Sigma rownames/colnames must match and be in same order.")
+    }
+
+    if (is.null(n) || n == 0) {
+        w <- numeric(0)
+        attr(w, "allocator_method") <- "empty"
+        attr(w, "allocator_fallback") <- FALSE
+        return(w)
+    }
+
+    if (n == 1) {
+        w <- 1
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "single_asset"
+        attr(w, "allocator_fallback") <- FALSE
+        return(w)
+    }
+
+    cor_mat <- tryCatch(cov2cor(Sigma), error = function(e) e)
+    if (inherits(cor_mat, "error") || is.null(cor_mat)) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- if (inherits(cor_mat, "error")) {
+            paste("cov2cor_failed:", cor_mat$message)
+        } else {
+            "cov2cor_failed_unknown"
+        }
+        return(w)
+    }
+
+    if (!is.matrix(cor_mat) || nrow(cor_mat) != ncol(cor_mat)) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- sprintf(
+            "cor_mat_not_square:%sx%s", NROW(cor_mat), NCOL(cor_mat)
+        )
+        return(w)
+    }
+
+    if (is.null(rownames(cor_mat)) || is.null(colnames(cor_mat)) ||
+        !identical(rownames(cor_mat), colnames(cor_mat))) {
+        dimnames(cor_mat) <- dimnames(Sigma)
+    }
+
+    cor_mat[!is.finite(cor_mat)] <- 0
+    diag(cor_mat) <- 1
+    cor_mat <- (cor_mat + t(cor_mat)) / 2
+
+    dist_mat <- (1 - cor_mat) / 2
+    dist_mat[!is.finite(dist_mat)] <- 0
+    dist_mat[dist_mat < 0] <- 0
+    dist_mat <- sqrt(dist_mat)
+
+    dist_mat <- as.matrix(dist_mat)
+    if (!is.matrix(dist_mat) || nrow(dist_mat) != ncol(dist_mat)) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- sprintf(
+            "dist_mat_not_square:%sx%s", NROW(dist_mat), NCOL(dist_mat)
+        )
+        return(w)
+    }
+    dimnames(dist_mat) <- dimnames(Sigma)
+    diag(dist_mat) <- 0
+
+    dist_obj <- tryCatch(as.dist(dist_mat), error = function(e) e)
+    if (inherits(dist_obj, "error")) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- paste("as.dist_failed:", dist_obj$message)
+        return(w)
+    }
+
+    hc <- tryCatch(hclust(dist_obj, method = "ward.D2"),
+        error = function(e) e
+    )
+
+    if (inherits(hc, "error")) {
+        w <- .inv_var_alloc(Sigma)
+        names(w) <- colnames(Sigma)
+        attr(w, "allocator_method") <- "inv_var_fallback"
+        attr(w, "allocator_fallback") <- TRUE
+        attr(w, "allocator_reason") <- paste("hclust_failed:", hc$message)
+        return(w)
+    }
+
+    sort_ix <- hc$order
+    w_hrp <- .get_rec_bipart(Sigma, sort_ix)
+    out <- w_hrp[colnames(Sigma)]
+    attr(out, "allocator_method") <- "hrp"
+    attr(out, "allocator_fallback") <- FALSE
+    out
+}
+
+# ── Full risk engine orchestrator (architecture-aligned) ─────────────────────
+
+#' @export
+me_run_risk_engine <- function(R_window, spec_risk, model_state = NULL) {
+    if (is.null(R_window) || nrow(R_window) == 0 || ncol(R_window) == 0) {
+        stop("Risk engine received empty R_window.")
+    }
+
+    n_obs <- nrow(R_window)
+    n_input <- ncol(R_window)
+
+    # Drop assets with too many NAs
+    na_frac <- colMeans(is.na(R_window))
+    keep <- na_frac < 0.5
+    dropped <- colnames(R_window)[!keep]
+    R_clean <- R_window[, keep, drop = FALSE]
+    R_clean[is.na(R_clean)] <- 0
+
+    n_kept <- ncol(R_clean)
+    if (n_kept < 3) stop("Risk engine: fewer than 3 assets after NA filtering.")
+
+    syms <- colnames(R_clean)
+    r_t <- R_clean[nrow(R_clean), ] # Current day return vector
+
+    # Extract recursive states from model_state
+    sigma2_prev <- if (!is.null(model_state)) model_state$ewma_vol_state else NULL
+    Sigma_f_prev <- if (!is.null(model_state)) model_state$factor_cov_state else NULL
+    S_e_prev <- if (!is.null(model_state)) model_state$resid_cov_state else NULL
+    B_prev <- if (!is.null(model_state)) model_state$B_prev else NULL
+
+    lambda_sigma <- spec_risk$vol$lambda_sigma %||% 0.94
+    lambda_f <- spec_risk$factor$lambda_f %||% 0.97
+    lambda_e <- spec_risk$resid$lambda_e %||% 0.97
+    align_factors <- isTRUE(spec_risk$pca$align_factors %||% TRUE)
+
+    # ── 1. EWMA volatility (§5.1) ──
+    use_ewma <- identical(spec_risk$vol$method %||% "ewma", "ewma")
+    standardized_path <- use_ewma # architecture path flag
+
+    if (use_ewma) {
+        # Recursive per-asset EWMA volatility
+        sigma2_t <- me_ewma_vol_update(sigma2_prev, r_t, lambda_sigma)
+        sigma_t <- sqrt(sigma2_t) * sqrt(252) # annualized vol
+        sigma_t[!is.finite(sigma_t) | sigma_t <= 0] <- NA_real_
+
+        # Standardized returns: r̃ = D^{-1} r
+        D_t_daily <- sqrt(sigma2_t) # daily scale
+        D_t_daily[!is.finite(D_t_daily) | D_t_daily <= 0] <- 1e-4
+
+        # Build standardized return window for PCA
+        R_std <- R_clean
+        for (j in seq_len(n_kept)) {
+            R_std[, j] <- R_clean[, j] / D_t_daily[j]
+        }
+        R_std[!is.finite(R_std)] <- 0
+    } else {
+        # Legacy: batch vol estimation
+        sigma_t <- me_estimate_vol(R_clean, spec_risk$vol)
+        sigma2_t <- (sigma_t / sqrt(252))^2
+        sigma2_t[!is.finite(sigma2_t)] <- 1e-4
+        R_std <- R_clean
+        D_t_daily <- NULL
+    }
+
+    # ── 2. PCA on standardized returns (§5.2) ──
+    pca_fit <- me_fit_pca(R_std, spec_risk$pca)
+
+    # ── 3. Factor identity alignment (§5.3) ──
+    factor_alignment_used <- FALSE
+    if (align_factors && !is.null(B_prev)) {
+        align_result <- me_align_pca_factors(pca_fit$B, pca_fit$F, B_prev)
+        pca_fit$B <- align_result$B
+        pca_fit$F <- align_result$f
+        factor_alignment_used <- align_result$alignment_used
+    }
+
+    # Current-day factor return (last row of factor scores)
+    f_t <- pca_fit$F[nrow(pca_fit$F), ]
+
+    # ── 4. Residuals on standardized returns (§5.5) ──
+    E <- me_compute_residuals(R_std, pca_fit)
+    e_t <- E[nrow(E), ] # Current-day standardized residual
+
+    # ── 5. Recursive factor covariance (§5.4) ──
+    recursive_factor_cov_used <- FALSE
+    if (!is.null(Sigma_f_prev) && is.matrix(Sigma_f_prev)) {
+        fac_cov <- me_factor_cov_recursive(Sigma_f_prev, f_t, lambda_f)
+        recursive_factor_cov_used <- TRUE
+    } else {
+        fac_cov <- me_factor_cov(pca_fit$F, spec_risk$factor)
+    }
+    Sigma_f <- fac_cov$sigma_f
+
+    # ── 6. Recursive residual target + Glasso (§5.5) ──
+    recursive_resid_target_used <- FALSE
+    if (!is.null(S_e_prev) && is.matrix(S_e_prev)) {
+        S_e_t <- me_resid_cov_recursive(S_e_prev, e_t, syms, lambda_e)
+        recursive_resid_target_used <- TRUE
+    } else {
+        S_e_t <- NULL # Will use batch in me_fit_residual_cov
+    }
+
+    resid_cov <- me_fit_residual_cov(E, spec_risk$resid, S_e_target = S_e_t)
+    Sigma_eps <- resid_cov$sigma_eps
+    Theta_eps <- resid_cov$precision
+
+    # ── 7. Recompose + unstandardize (§5.6) ──
+    if (standardized_path && !is.null(D_t_daily)) {
+        Sigma_total <- me_assemble_total_cov(pca_fit, Sigma_f, Sigma_eps, D_t_daily)
+    } else {
+        Sigma_total <- me_assemble_total_cov(pca_fit, Sigma_f, Sigma_eps)
+    }
+
+    # ── 8. PSD repair ──
+    sanity <- me_cov_sanity(Sigma_total, repair = TRUE)
+    Sigma_total <- sanity$Sigma
+
+    # ── 9. Baseline allocator (legacy HRP; transitional) ──
+    w_hrp <- me_allocate_hrp(Sigma_total, spec_risk$hrp)
+    w_baseline <- w_hrp
+
+    # ── 10. Risk covariance objects (§5.7) ──
+    H <- spec_risk$horizon$H %||% 1L
+    H <- as.integer(H)
+    if (!is.finite(H) || H < 1L) H <- 1L
+
+    Sigma_risk_1 <- Sigma_total
+    Sigma_risk_H <- H * Sigma_risk_1
+
+    pca_var_explained <- tryCatch(
+        {
+            denom <- sum(svd(scale(R_std, scale = FALSE))$d^2)
+            if (!is.finite(denom) || denom <= 0) NA_real_ else sum(pca_fit$d^2) / denom
+        },
+        error = function(e) NA_real_
+    )
+
+    # ── Output: data + recursive state updates ──
+    list(
+        sigma_t = sigma_t,
+        B_t = pca_fit$B,
+        F_t = pca_fit$F,
+        E_t = E,
+        Sigma_f = Sigma_f,
+        Sigma_eps = Sigma_eps,
+        Theta_eps = Theta_eps,
+
+        # Architecture-facing risk covariance
+        Sigma_total = Sigma_total,
+        Sigma_risk_1 = Sigma_risk_1,
+        Sigma_risk_H = Sigma_risk_H,
+
+        # Transitional baseline
+        w_baseline = w_baseline,
+        baseline_method = attr(w_hrp, "allocator_method") %||% "unknown",
+        baseline_is_legacy = TRUE,
+        w_hrp = w_hrp, # legacy alias
+
+        # Recursive state updates (for model_state_out)
+        risk_state_out = list(
+            ewma_vol_state = sigma2_t,
+            factor_cov_state = Sigma_f,
+            resid_cov_state = if (!is.null(S_e_t)) S_e_t else resid_cov$sigma_eps,
+            B_prev = pca_fit$B
+        ),
+        diag = list(
+            n_obs_input = n_obs,
+            n_assets_input = n_input,
+            n_assets_kept = n_kept,
+            n_assets_dropped = length(dropped),
+            dropped_assets = dropped,
+            frac_assets_dropped = length(dropped) / n_input,
+            pca_k = pca_fit$k,
+            pca_var_explained = pca_var_explained,
+            was_repaired = sanity$was_repaired,
+            min_eigenvalue = sanity$min_eigenvalue,
+            residual_precision_method = resid_cov$precision_method %||% "unknown",
+            residual_precision_fallback = isTRUE(resid_cov$precision_fallback),
+            residual_precision_fallback_reason = resid_cov$fallback_reason %||% NA_character_,
+            glasso_requested = isTRUE(resid_cov$glasso_requested),
+            glasso_used = isTRUE(resid_cov$glasso_used),
+            allocator_method = attr(w_hrp, "allocator_method") %||% "unknown",
+            allocator_fallback = isTRUE(attr(w_hrp, "allocator_fallback")),
+            allocator_fallback_reason = attr(w_hrp, "allocator_reason") %||% NA_character_,
+            horizon_H = H,
+            horizon_covariance_method = if (H > 1L) "scaled_daily_covariance" else "daily_covariance",
+            # Architecture diagnostics
+            standardized_path_used = standardized_path,
+            factor_alignment_used = factor_alignment_used,
+            recursive_factor_cov_used = recursive_factor_cov_used,
+            recursive_resid_target_used = recursive_resid_target_used
+        )
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/03_graph_and_structure.R
+###############################################################################
+#' @title Model Engine — Graph and Structure
+#' @description Partial correlations, adaptive smoothing, persistence-aware graph mask,
+#' graph operators, spectral clustering, graph diagnostics.
+#' Implements architecture.md §§5-6 (partial corr → graph), §9 (operators), §10 (clustering).
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §5-6: Partial correlation → graph construction
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_partial_corr_from_precision <- function(Theta_eps) {
+    # P_ij = -Theta_ij / sqrt(Theta_ii * Theta_jj)
+    n <- ncol(Theta_eps)
+    d <- sqrt(diag(Theta_eps))
+    d[d <= 0 | !is.finite(d)] <- 1e-8
+    P <- -Theta_eps / outer(d, d)
+    diag(P) <- 0
+    P <- (P + t(P)) / 2
+    dimnames(P) <- dimnames(Theta_eps)
+    P
+}
+
+# ── §6.2 Structural shock ──────────────────────────────────────────────────
+
+#' @export
+me_structural_shock <- function(P_new, P_prev) {
+    # χ_t = ||P_t - P_{t-1}||_F / sqrt(p*(p-1))
+    if (is.null(P_prev)) {
+        return(0)
+    }
+    p <- ncol(P_new)
+    if (p < 2) {
+        return(0)
+    }
+    common <- intersect(colnames(P_new), colnames(P_prev))
+    if (length(common) < 2) {
+        return(0)
+    }
+    diff_mat <- P_new[common, common] - P_prev[common, common]
+    norm_F <- sqrt(sum(diff_mat^2, na.rm = TRUE))
+    denom <- sqrt(length(common) * (length(common) - 1))
+    if (denom <= 0) {
+        return(0)
+    }
+    chi <- norm_F / denom
+    if (!is.finite(chi)) 0 else chi
+}
+
+# ── §6.2 Edge stability state ──────────────────────────────────────────────
+
+#' @export
+me_edge_stability_update <- function(edge_stab_prev, P_new, P_bar_prev,
+                                     new_univ, lambda_s = 0.95) {
+    # s^edge_{ij,t} = lambda_s * s^edge_{ij,t-1} + (1-lambda_s) * 1[sign match]
+    p <- length(new_univ)
+    if (is.null(edge_stab_prev) || is.null(P_bar_prev) || p < 2) {
+        out <- matrix(0.5, p, p, dimnames = list(new_univ, new_univ))
+        diag(out) <- 1
+        return(out)
+    }
+
+    # Map previous stability to current universe
+    s_prev <- me_pi_map_matrix(edge_stab_prev, new_univ, init_diag = 0.5)
+    common <- intersect(colnames(P_new), colnames(P_bar_prev))
+    common <- intersect(common, new_univ)
+
+    out <- s_prev
+    if (length(common) >= 2) {
+        sign_match <- sign(P_new[common, common]) == sign(P_bar_prev[common, common])
+        sign_match[!is.finite(sign_match)] <- TRUE
+        diag(sign_match) <- TRUE
+        out[common, common] <- lambda_s * s_prev[common, common] +
+            (1 - lambda_s) * as.numeric(sign_match)
+    }
+    diag(out) <- 1
+    out <- (out + t(out)) / 2
+    out
+}
+
+# ── §6.2 Adaptive smoothing of partial correlations ──────────────────────────
+
+#' @export
+me_smooth_partial_corr <- function(P_new, P_prev, alpha = 0.3,
+                                   edge_stability = NULL, chi_t = 0,
+                                   spec_graph = list()) {
+    if (is.null(P_prev)) {
+        return(P_new)
+    }
+
+    if (!is.matrix(P_new) || !is.matrix(P_prev) ||
+        nrow(P_new) != ncol(P_new) || nrow(P_prev) != ncol(P_prev) ||
+        is.null(rownames(P_new)) || is.null(colnames(P_new)) ||
+        is.null(rownames(P_prev)) || is.null(colnames(P_prev))) {
+        return(P_new)
+    }
+
+    syms_new <- colnames(P_new)
+    syms_prev <- colnames(P_prev)
+    common <- intersect(syms_new, syms_prev)
+    if (length(common) < 2) {
+        return(P_new)
+    }
+
+    use_adaptive <- isTRUE(spec_graph$adaptive_smoothing %||% TRUE)
+
+    if (use_adaptive && !is.null(edge_stability)) {
+        # §6.2 Architecture adaptive smoothing scaffold
+        # α_{ij,t} = σ(θ_α' z) where z = [1, s^edge, χ, ξ]
+        # Reduced-covariate version: α = σ(θ0 + θ1*s_edge + θ2*χ)
+        theta0 <- spec_graph$smooth_theta0 %||% 0 # intercept → base alpha
+        theta1 <- spec_graph$smooth_theta1 %||% 1.0 # edge stability: higher → more smoothing
+        theta2 <- spec_graph$smooth_theta2 %||% -0.5 # shock: higher → less smoothing (more responsive)
+
+        P_bar <- P_new
+        for (i in seq_len(nrow(P_new))) {
+            for (j in seq_len(ncol(P_new))) {
+                if (i == j) next
+                si <- syms_new[i]
+                sj <- syms_new[j]
+                if (!(si %in% common && sj %in% common)) next
+
+                s_ij <- if (!is.null(edge_stability) && si %in% rownames(edge_stability) &&
+                    sj %in% colnames(edge_stability)) {
+                    edge_stability[si, sj]
+                } else {
+                    0.5
+                }
+
+                xi_ij <- abs(P_new[i, j] - P_prev[si, sj])
+                z <- theta0 + theta1 * s_ij + theta2 * chi_t
+                alpha_ij <- 1 / (1 + exp(-z)) # sigmoid → (0,1), high = more smoothing
+                P_bar[i, j] <- alpha_ij * P_prev[si, sj] + (1 - alpha_ij) * P_new[i, j]
+            }
+        }
+        P_bar <- (P_bar + t(P_bar)) / 2
+        diag(P_bar) <- 0
+        return(P_bar)
+    }
+
+    # Static smoothing fallback
+    if (identical(syms_new, syms_prev) && identical(rownames(P_new), syms_new) &&
+        identical(rownames(P_prev), syms_prev)) {
+        P_bar <- (1 - alpha) * P_prev + alpha * P_new
+        P_bar <- (P_bar + t(P_bar)) / 2
+        diag(P_bar) <- 0
+        return(P_bar)
+    }
+
+    P_bar <- P_new
+    P_bar[common, common] <- (1 - alpha) * P_prev[common, common, drop = FALSE] +
+        alpha * P_new[common, common, drop = FALSE]
+    P_bar <- (P_bar + t(P_bar)) / 2
+    diag(P_bar) <- 0
+    P_bar
+}
+
+# ── §6.3 Persistence-aware graph mask with hysteresis ────────────────────────
+
+#' @export
+me_build_graph_mask <- function(P_bar, spec_graph = list(), prev_M = NULL) {
+    activation_thr <- spec_graph$activation_thr %||% 0.05
+    top_k <- as.integer(spec_graph$top_k %||% 10L)
+    top_k <- max(1L, top_k)
+    hysteresis_ratio <- spec_graph$hysteresis_ratio %||% 0.6 # off threshold = ratio * on threshold
+
+    n <- ncol(P_bar)
+    syms <- colnames(P_bar)
+
+    W_abs_full <- abs(P_bar)
+    diag(W_abs_full) <- 0
+
+    M_dir <- matrix(FALSE, n, n, dimnames = list(syms, syms))
+
+    for (i in seq_len(n)) {
+        scores <- W_abs_full[i, ]
+        scores[i] <- 0
+
+        # §6.3.2 Hysteresis: lower threshold for existing edges
+        thr_vec <- rep(activation_thr, n)
+        if (!is.null(prev_M) && is.matrix(prev_M)) {
+            common_mask <- intersect(syms, colnames(prev_M))
+            if (length(common_mask) > 0 && syms[i] %in% rownames(prev_M)) {
+                for (j_nm in common_mask) {
+                    if (isTRUE(prev_M[syms[i], j_nm])) {
+                        j_idx <- which(syms == j_nm)
+                        if (length(j_idx) == 1) {
+                            thr_vec[j_idx] <- activation_thr * hysteresis_ratio
+                        }
+                    }
+                }
+            }
+        }
+
+        eligible <- which(is.finite(scores) & (scores > thr_vec))
+        if (length(eligible) == 0) next
+
+        if (length(eligible) > top_k) {
+            ord <- eligible[order(scores[eligible], decreasing = TRUE)]
+            keep <- ord[seq_len(top_k)]
+        } else {
+            keep <- eligible
+        }
+        M_dir[i, keep] <- TRUE
+    }
+
+    # Symmetry by union
+    M <- M_dir | t(M_dir)
+    diag(M) <- FALSE
+
+    W_signed <- P_bar * M
+    W_signed <- (W_signed + t(W_signed)) / 2
+    diag(W_signed) <- 0
+
+    W_abs <- abs(W_signed)
+    W_abs <- (W_abs + t(W_abs)) / 2
+    diag(W_abs) <- 0
+
+    dimnames(M) <- list(syms, syms)
+    dimnames(W_signed) <- list(syms, syms)
+    dimnames(W_abs) <- list(syms, syms)
+
+    list(
+        M = M,
+        W = W_abs,
+        W_abs = W_abs,
+        W_signed = W_signed,
+        n_edges = sum(M) / 2,
+        density = if (n > 1) sum(M) / (n * (n - 1)) else 0
+    )
+}
+
+# ── §6.6 Graph diagnostics ──────────────────────────────────────────────────
+
+#' @export
+me_graph_diagnostics <- function(M, prev_M = NULL, density_target = NULL) {
+    n <- ncol(M)
+    syms <- colnames(M)
+
+    # Density
+    dens <- if (n > 1) sum(M) / (n * (n - 1)) else 0
+
+    # Edge turnover
+    eto <- 0
+    if (!is.null(prev_M) && is.matrix(prev_M)) {
+        common <- intersect(colnames(M), colnames(prev_M))
+        if (length(common) >= 2) {
+            prev_edges <- sum(prev_M[common, common]) / 2
+            if (prev_edges > 0) {
+                overlap <- sum(M[common, common] & prev_M[common, common]) / 2
+                eto <- 1 - overlap / prev_edges
+            }
+        }
+    }
+
+    # Node stability
+    node_stab <- setNames(rep(1, n), syms)
+    if (!is.null(prev_M) && is.matrix(prev_M)) {
+        for (i in seq_len(n)) {
+            nm <- syms[i]
+            if (nm %in% rownames(prev_M)) {
+                common_j <- intersect(syms, colnames(prev_M))
+                if (length(common_j) > 0) {
+                    prev_deg <- sum(prev_M[nm, common_j])
+                    if (prev_deg > 0) {
+                        changed <- sum(abs(as.numeric(M[nm, common_j]) -
+                            as.numeric(prev_M[nm, common_j])))
+                        node_stab[nm] <- 1 - changed / max(1, prev_deg)
+                    }
+                }
+            }
+        }
+    }
+
+    # Density deviation
+    dens_dev <- if (!is.null(density_target)) dens - density_target else 0
+
+    list(
+        density = dens,
+        edge_turnover = eto,
+        node_stability = node_stab,
+        density_deviation = dens_dev
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §9: Graph operators
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @keywords internal
+.me_named_graph_mv <- function(M, s) {
+    out <- as.vector(M %*% s)
+    nm <- rownames(M)
+    if (is.null(nm) && !is.null(names(s))) nm <- names(s)
+    names(out) <- nm
+    out
+}
+
+#' @export
+me_graph_operators <- function(W, W_signed = NULL) {
+    n <- ncol(W)
+    syms <- colnames(W)
+
+    # Unsigned row-normalized adjacency (§6.5)
+    deg <- rowSums(W)
+    deg[deg <= 0 | !is.finite(deg)] <- 1e-12
+    A <- W / deg
+
+    # Signed adjacency normalized by absolute row-sum of unsigned (§6.5)
+    A_signed <- NULL
+    if (!is.null(W_signed)) {
+        A_signed <- W_signed / deg # Normalize by unsigned degree (architecture §6.5)
+        dimnames(A_signed) <- list(syms, syms)
+    }
+
+    D <- diag(deg)
+    L <- D - W
+
+    d_inv_sqrt <- 1 / sqrt(deg)
+    d_inv_sqrt[!is.finite(d_inv_sqrt)] <- 0
+    D_inv_sqrt <- diag(d_inv_sqrt)
+    L_norm <- D_inv_sqrt %*% L %*% D_inv_sqrt
+    L_norm <- (L_norm + t(L_norm)) / 2
+
+    dimnames(A) <- list(syms, syms)
+    dimnames(L) <- list(syms, syms)
+    dimnames(L_norm) <- list(syms, syms)
+    dimnames(D) <- list(syms, syms)
+    names(deg) <- syms
+
+    list(A = A, A_signed = A_signed, L = L, L_norm = L_norm, D = D, deg = deg)
+}
+
+#' §9.1 Peer-context transform: G_peer[s] = A * s (UNSIGNED A)
+#' @export
+me_graph_peer <- function(A, s) {
+    .me_named_graph_mv(A, s)
+}
+
+#' §9.2 Relative/dislocation transform: G_rel[s] = s - A * s (UNSIGNED A)
+#' @export
+me_graph_relative <- function(A, s) {
+    peer <- .me_named_graph_mv(A, s)
+    s_aligned <- s[names(peer)]
+    s_aligned[!is.finite(s_aligned)] <- 0
+    out <- s_aligned - peer
+    names(out) <- names(peer)
+    out
+}
+
+#' §9.3 Signed-neighborhood transform: G_sgn[s] = A_signed * s
+#' @export
+me_graph_signed <- function(A_signed, s) {
+    .me_named_graph_mv(A_signed, s)
+}
+
+#' §9.4 Tension/local incompatibility: G_ten[s] = L * s
+#' @export
+me_graph_tension <- function(L, s) {
+    .me_named_graph_mv(L, s)
+}
+
+#' §9.5 Graph-regularized shrinkage: G_shr[s] = (I + lambda * L_norm)^{-1} * s
+#' @export
+me_graph_shrinkage <- function(L_norm, s, lambda_g = 0.1) {
+    n <- length(s)
+    M <- diag(n) + lambda_g * L_norm
+    out <- tryCatch(as.vector(solve(M, s)),
+        error = function(e) as.vector(s)
+    )
+    nm <- rownames(L_norm)
+    if (is.null(nm)) nm <- names(s)
+    names(out) <- nm
+    out
+}
+
+#' §9.6 One-step mixed propagation: G_mix[s] = ((1-nu)*I + nu*A) * s
+#' @export
+me_graph_mixed <- function(A, s, nu = 0.5) {
+    n <- length(s)
+    M <- (1 - nu) * diag(n) + nu * A
+    out <- as.vector(M %*% s)
+    nm <- rownames(A)
+    if (is.null(nm)) nm <- names(s)
+    names(out) <- nm
+    out
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §10: Spectral clustering with label persistence
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_spectral_clustering <- function(L_norm, K_min = 2L, K_max = 8L) {
+    n <- ncol(L_norm)
+    if (n < K_min) {
+        labels <- rep(1L, n)
+        names(labels) <- colnames(L_norm)
+        return(list(labels = labels, K = 1L, method = "trivial"))
+    }
+
+    eig <- tryCatch(
+        eigen(L_norm, symmetric = TRUE),
+        error = function(e) NULL
+    )
+
+    if (is.null(eig)) {
+        labels <- rep(1L, n)
+        names(labels) <- colnames(L_norm)
+        return(list(labels = labels, K = 1L, method = "eigen_failed"))
+    }
+
+    ord <- order(eig$values)
+    evals <- eig$values[ord]
+    evecs <- eig$vectors[, ord]
+
+    K_cand <- min(K_max, n - 1)
+    if (K_cand < K_min) K_cand <- K_min
+
+    gaps <- diff(evals[1:min(K_cand + 1, n)])
+    if (length(gaps) >= K_min) {
+        K <- which.max(gaps[K_min:length(gaps)]) + K_min - 1
+        K <- max(K_min, min(K, K_max))
+    } else {
+        K <- K_min
+    }
+
+    V <- evecs[, 1:K, drop = FALSE]
+    row_norms <- sqrt(rowSums(V^2))
+    row_norms[row_norms < 1e-10] <- 1
+    V_norm <- V / row_norms
+
+    km <- tryCatch(
+        kmeans(V_norm, centers = K, nstart = 10, iter.max = 100),
+        error = function(e) NULL
+    )
+
+    if (is.null(km)) {
+        labels <- rep(1L, n)
+        names(labels) <- colnames(L_norm)
+        return(list(labels = labels, K = 1L, method = "kmeans_failed"))
+    }
+
+    labels <- km$cluster
+    names(labels) <- colnames(L_norm)
+
+    list(
+        labels = labels, K = K, method = "spectral",
+        eigengap = gaps, within_ss = km$tot.withinss
+    )
+}
+
+#' §10.2 Cluster label persistence via Hungarian matching
+#' @export
+me_persist_cluster_labels <- function(labels_new, labels_prev) {
+    if (is.null(labels_prev)) {
+        return(labels_new)
+    }
+
+    common <- intersect(names(labels_new), names(labels_prev))
+    if (length(common) < 2) {
+        return(labels_new)
+    }
+
+    K_new <- max(labels_new[common])
+    K_prev <- max(labels_prev[common])
+    K <- max(K_new, K_prev)
+
+    overlap <- matrix(0, K, K)
+    for (i in common) {
+        c_new <- labels_new[i]
+        c_prev <- labels_prev[i]
+        if (c_new <= K && c_prev <= K) {
+            overlap[c_new, c_prev] <- overlap[c_new, c_prev] + 1
+        }
+    }
+
+    mapping <- rep(NA_integer_, K)
+    used <- rep(FALSE, K)
+    for (iter in seq_len(K)) {
+        best_val <- -1
+        best_i <- 1
+        best_j <- 1
+        for (i in seq_len(K)) {
+            if (!is.na(mapping[i])) next
+            for (j in seq_len(K)) {
+                if (used[j]) next
+                if (overlap[i, j] > best_val) {
+                    best_val <- overlap[i, j]
+                    best_i <- i
+                    best_j <- j
+                }
+            }
+        }
+        mapping[best_i] <- best_j
+        used[best_j] <- TRUE
+    }
+
+    out <- labels_new
+    for (i in seq_along(out)) {
+        old <- out[i]
+        if (old <= K && !is.na(mapping[old])) {
+            out[i] <- mapping[old]
+        }
+    }
+    out
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §10.3 Cluster transforms of signals
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_cluster_center <- function(s, labels) {
+    out <- s
+    for (k in unique(labels)) {
+        idx <- names(labels)[labels == k]
+        idx <- intersect(idx, names(s))
+        if (length(idx) > 0) {
+            out[idx] <- s[idx] - mean(s[idx], na.rm = TRUE)
+        }
+    }
+    out
+}
+
+#' @export
+me_cluster_z <- function(s, labels, eps = 1e-8) {
+    out <- s
+    for (k in unique(labels)) {
+        idx <- names(labels)[labels == k]
+        idx <- intersect(idx, names(s))
+        if (length(idx) > 1) {
+            mu <- mean(s[idx], na.rm = TRUE)
+            sigma <- sd(s[idx], na.rm = TRUE)
+            if (!is.finite(sigma) || sigma < eps) sigma <- eps
+            out[idx] <- (s[idx] - mu) / sigma
+        } else if (length(idx) == 1) {
+            out[idx] <- 0
+        }
+    }
+    out
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Full graph pipeline orchestrator (architecture-aligned)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_run_graph_pipeline <- function(risk_artifact, spec_graph = list(),
+                                  prev_P_bar = NULL, prev_labels = NULL,
+                                  model_state = NULL) {
+    Theta <- risk_artifact$Theta_eps
+
+    if (is.null(Theta) || ncol(Theta) < 3) {
+        syms <- NULL
+        if (!is.null(Theta) && is.matrix(Theta)) syms <- colnames(Theta)
+        if (is.null(syms) || length(syms) == 0) {
+            Sigma_ref <- risk_artifact$Sigma_risk_1 %||% risk_artifact$Sigma_total
+            if (!is.null(Sigma_ref) && is.matrix(Sigma_ref)) syms <- colnames(Sigma_ref)
+        }
+        if ((is.null(syms) || length(syms) == 0) && !is.null(risk_artifact$w_baseline)) {
+            syms <- names(risk_artifact$w_baseline)
+        }
+        if ((is.null(syms) || length(syms) == 0) && !is.null(risk_artifact$w_hrp)) {
+            syms <- names(risk_artifact$w_hrp)
+        }
+
+        syms <- syms %||% character(0)
+        n <- length(syms)
+
+        return(list(
+            P = NULL, P_bar = NULL, mask = NULL, operators = NULL,
+            clustering = list(labels = setNames(rep(1L, n), syms), K = if (n > 0) 1L else 0L),
+            diag = list(skipped = TRUE, reason = "no_precision_matrix"),
+            graph_state_out = list()
+        ))
+    }
+
+    new_univ <- colnames(Theta)
+
+    # Extract recursive states
+    edge_stab_prev <- if (!is.null(model_state)) model_state$edge_stability else NULL
+    prev_M <- if (!is.null(model_state)) model_state$prev_M else NULL
+
+    # 1. Partial correlations
+    P <- me_partial_corr_from_precision(Theta)
+
+    # 2. Structural shock (§6.2)
+    chi_t <- me_structural_shock(P, prev_P_bar)
+
+    # 3. Edge stability update (§6.2)
+    edge_stab <- me_edge_stability_update(
+        edge_stab_prev, P, prev_P_bar, new_univ,
+        lambda_s = spec_graph$lambda_s %||% 0.95
+    )
+
+    # 4. Adaptive smooth with previous (§6.2)
+    alpha <- spec_graph$smoothing_alpha %||% 0.3
+    P_bar <- me_smooth_partial_corr(P, prev_P_bar, alpha,
+        edge_stability = edge_stab,
+        chi_t = chi_t,
+        spec_graph = spec_graph
+    )
+
+    # 5. Build graph mask (with hysteresis)
+    mask_result <- me_build_graph_mask(P_bar, spec_graph, prev_M = prev_M)
+
+    # 6. Graph operators
+    ops <- me_graph_operators(mask_result$W_abs %||% mask_result$W, mask_result$W_signed)
+
+    # 7. Graph diagnostics (§6.6)
+    graph_diag <- me_graph_diagnostics(
+        mask_result$M, prev_M,
+        density_target = spec_graph$density_target
+    )
+
+    # 8. Spectral clustering
+    K_min <- spec_graph$K_min %||% 2L
+    K_max <- spec_graph$K_max %||% 8L
+    clust <- me_spectral_clustering(ops$L_norm, K_min, K_max)
+
+    # 9. Label persistence
+    clust$labels <- me_persist_cluster_labels(clust$labels, prev_labels)
+
+    list(
+        P = P,
+        P_bar = P_bar,
+        mask = mask_result,
+        operators = ops,
+        clustering = clust,
+        diag = list(
+            n_edges = mask_result$n_edges,
+            density = mask_result$density,
+            K_clusters = clust$K,
+            cluster_method = clust$method,
+            chi_t = chi_t,
+            edge_turnover = graph_diag$edge_turnover,
+            density_deviation = graph_diag$density_deviation
+        ),
+        # Recursive state outputs
+        graph_state_out = list(
+            edge_stability = edge_stab,
+            node_stability = graph_diag$node_stability,
+            prev_M = mask_result$M,
+            chi_t = chi_t
+        )
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/04_signal_engine.R
+###############################################################################
+#' @title Model Engine — Signal Engine
+#' @description Architecture §7-8: Kalman (recursive per-asset), multiscale TSMOM (raw/residual),
+#' factor trends, signal scalarization with recursive weights.
+
+.tanh_scale <- function(x, scale = 1.0) tanh(x / scale)
+
+# ── §7.2 Recursive Kalman filter update (per-asset) ──────────────────────────
+
+#' @export
+me_kalman_step <- function(x_hat_prev, P_prev, y_new, Q, R) {
+    # Single-step local-level Kalman filter
+    # State: x_t = x_{t-1} + w, w ~ N(0, Q)
+    # Obs:   y_t = x_t + v,   v ~ N(0, R)
+    # Returns: x_hat, P, slope estimate, innovation, innovation_var_ratio
+
+    # Predict
+    x_pred <- x_hat_prev
+    P_pred <- P_prev + Q
+
+    # Update
+    innov <- y_new - x_pred
+    S <- P_pred + R # Innovation variance
+    K_gain <- P_pred / S # Kalman gain
+
+    x_hat <- x_pred + K_gain * innov
+    P_new <- (1 - K_gain) * P_pred
+
+    # Innovation-based diagnostics
+    innov_var_ratio <- if (S > 0) innov^2 / S else 0
+
+    list(
+        x_hat = x_hat,
+        P = P_new,
+        slope = innov * K_gain, # Simple slope proxy
+        slope_var = P_new, # Uncertainty in state
+        innovation = innov,
+        innov_var_ratio = innov_var_ratio
+    )
+}
+
+#' @export
+me_signal_kalman <- function(prices_window, sigma_t, spec_kalman,
+                             kalman_states = NULL) {
+    n_assets <- ncol(prices_window)
+    syms <- colnames(prices_window)
+    scale <- spec_kalman$scale %||% 1.0
+    Q <- spec_kalman$q_var %||% 1e-4
+    R <- spec_kalman$r_var %||% 1e-2
+    use_recursive <- isTRUE(spec_kalman$recursive %||% TRUE)
+
+    kalman_out <- setNames(rep(0, n_assets), syms)
+    kalman_slope <- setNames(rep(0, n_assets), syms)
+    kalman_uncertainty <- setNames(rep(0, n_assets), syms)
+    kalman_innovation <- setNames(rep(0, n_assets), syms)
+    kalman_innov_ratio <- setNames(rep(0, n_assets), syms)
+    states_out <- list()
+
+    for (j in seq_len(n_assets)) {
+        sym <- syms[j]
+        p_series <- prices_window[, j]
+        valid <- which(is.finite(p_series) & p_series > 0)
+        if (length(valid) < 5) {
+            states_out[[sym]] <- list(x_hat = 0, P = R)
+            next
+        }
+        y <- log(p_series[valid])
+
+        if (use_recursive && !is.null(kalman_states) && !is.null(kalman_states[[sym]])) {
+            # Recursive: single-step update from previous state
+            ks <- kalman_states[[sym]]
+            y_last <- y[length(y)]
+            step <- me_kalman_step(ks$x_hat, ks$P, y_last, Q, R)
+
+            raw <- y_last - step$x_hat
+            vol_j <- sigma_t[sym]
+            if (!is.finite(vol_j) || vol_j <= 0) vol_j <- 0.01
+            kalman_out[sym] <- .tanh_scale(raw / (vol_j / sqrt(252) + 1e-8), scale)
+            kalman_slope[sym] <- step$slope
+            kalman_uncertainty[sym] <- step$slope_var
+            kalman_innovation[sym] <- step$innovation
+            kalman_innov_ratio[sym] <- step$innov_var_ratio
+            states_out[[sym]] <- list(x_hat = step$x_hat, P = step$P)
+        } else {
+            # Batch initialization: run full Kalman from scratch
+            x_hat <- y[1]
+            P <- R
+            for (i in 2:length(y)) {
+                step <- me_kalman_step(x_hat, P, y[i], Q, R)
+                x_hat <- step$x_hat
+                P <- step$P
+            }
+            raw <- y[length(y)] - x_hat
+            vol_j <- sigma_t[sym]
+            if (!is.finite(vol_j) || vol_j <= 0) vol_j <- 0.01
+            kalman_out[sym] <- .tanh_scale(raw / (vol_j / sqrt(252) + 1e-8), scale)
+            kalman_slope[sym] <- step$slope
+            kalman_uncertainty[sym] <- step$slope_var
+            kalman_innovation[sym] <- step$innovation
+            kalman_innov_ratio[sym] <- step$innov_var_ratio
+            states_out[[sym]] <- list(x_hat = x_hat, P = P)
+        }
+    }
+
+    list(
+        signal = kalman_out,
+        slope = kalman_slope,
+        uncertainty = kalman_uncertainty,
+        innovation = kalman_innovation,
+        innov_var_ratio = kalman_innov_ratio,
+        kalman_states_out = states_out
+    )
+}
+
+# ── §7.1 TSMOM (multiscale, raw + residual) ─────────────────────────────────
+
+.tsmom_single <- function(R_col, sigma, horizon, scale) {
+    n <- length(R_col)
+    if (n < horizon || horizon < 1) {
+        return(0)
+    }
+    cum <- sum(R_col[(n - horizon + 1):n], na.rm = TRUE)
+    denom <- if (is.finite(sigma) && sigma > 0) sigma / sqrt(252) * sqrt(horizon) else 1
+    .tanh_scale(cum / (denom + 1e-8), scale)
+}
+
+#' Single-horizon TSMOM (legacy compat)
+#' @export
+me_signal_tsmom <- function(R_window, sigma_t, spec_tsmom) {
+    horizon <- min(spec_tsmom$horizon %||% 252L, nrow(R_window))
+    horizon <- max(1L, horizon)
+    scale <- spec_tsmom$scale %||% 2.0
+    n_assets <- ncol(R_window)
+    syms <- colnames(R_window)
+
+    out <- setNames(rep(0, n_assets), syms)
+    for (j in seq_len(n_assets)) {
+        out[j] <- .tsmom_single(R_window[, j], sigma_t[j], horizon, scale)
+    }
+    out
+}
+
+#' §7.1 Multiscale TSMOM: returns n_assets × n_horizons matrix
+#' @export
+me_signal_tsmom_multiscale <- function(R_window, sigma_t, horizons = c(21, 63, 126, 252),
+                                       scale = 2.0) {
+    n_assets <- ncol(R_window)
+    Tn <- nrow(R_window)
+    syms <- colnames(R_window)
+
+    hor <- pmin(horizons, Tn)
+    hor <- hor[hor >= 1]
+    if (length(hor) == 0) hor <- min(21, Tn)
+
+    result <- matrix(0, n_assets, length(hor),
+        dimnames = list(syms, paste0("tsmom_h", hor))
+    )
+
+    for (j in seq_len(n_assets)) {
+        for (h_idx in seq_along(hor)) {
+            result[j, h_idx] <- .tsmom_single(
+                R_window[, j], sigma_t[j],
+                hor[h_idx], scale
+            )
+        }
+    }
+    result
+}
+
+#' §7.1 Residual TSMOM multiscale: on r^⊥ = D_t e_t
+#' @export
+me_signal_tsmom_residual_multiscale <- function(E_window, D_t_daily,
+                                                horizons = c(21, 63, 126, 252),
+                                                scale = 2.0) {
+    # E_window: standardized residuals; D_t_daily: daily vol per asset
+    n_assets <- ncol(E_window)
+    Tn <- nrow(E_window)
+    syms <- colnames(E_window)
+
+    # Unstandardize residuals: r^⊥ = D * e
+    R_resid <- E_window
+    if (!is.null(D_t_daily)) {
+        d_vec <- D_t_daily[syms]
+        d_vec[!is.finite(d_vec) | d_vec <= 0] <- 1e-4
+        for (j in seq_len(n_assets)) R_resid[, j] <- E_window[, j] * d_vec[j]
+    }
+
+    # Vol of residual returns (for normalization)
+    sigma_resid <- apply(R_resid, 2, sd, na.rm = TRUE) * sqrt(252)
+    sigma_resid[!is.finite(sigma_resid) | sigma_resid <= 0] <- 1e-4
+
+    me_signal_tsmom_multiscale(R_resid, sigma_resid, horizons, scale)
+}
+
+# ── §7.3 Factor trend signals ───────────────────────────────────────────────
+
+#' @export
+me_signal_factor_trend <- function(F_window, spec_factor = list()) {
+    horizons <- spec_factor$horizons %||% c(21L, 63L)
+    k <- ncol(F_window)
+    Tn <- nrow(F_window)
+
+    factor_sigs <- matrix(0, k, length(horizons),
+        dimnames = list(colnames(F_window), paste0("h", horizons))
+    )
+
+    for (c_idx in seq_len(k)) {
+        f_series <- F_window[, c_idx]
+        f_sd <- sd(f_series, na.rm = TRUE)
+        if (!is.finite(f_sd) || f_sd <= 0) f_sd <- 1
+
+        for (h_idx in seq_along(horizons)) {
+            h <- min(horizons[h_idx], Tn)
+            if (h < 1) next
+            cum <- sum(f_series[(Tn - h + 1):Tn], na.rm = TRUE)
+            factor_sigs[c_idx, h_idx] <- .tanh_scale(cum / (f_sd * sqrt(h) + 1e-8), 2.0)
+        }
+    }
+
+    factor_sigs
+}
+
+# ── §7.4 Signal scalarization with recursive weights ─────────────────────────
+
+#' @export
+me_scalarize_signals <- function(signal_list, R_window, sigma_t, omega_prev = NULL,
+                                 spec_scalar = list()) {
+    # signal_list: named list of named numeric vectors (signal name → per-asset values)
+    # Returns: scalarized per-asset signals + updated weights
+
+    n_assets <- ncol(R_window)
+    syms <- colnames(R_window)
+    lambda_omega <- spec_scalar$lambda_omega %||% 0.95
+    ridge_lambda <- spec_scalar$ridge_lambda %||% 0.01
+
+    # Build signal matrix: n_assets × n_signals
+    sig_names <- names(signal_list)
+    n_sig <- length(sig_names)
+    S_mat <- matrix(0, n_assets, n_sig, dimnames = list(syms, sig_names))
+    for (s_idx in seq_along(sig_names)) {
+        sv <- signal_list[[s_idx]]
+        sv_aligned <- sv[syms]
+        sv_aligned[!is.finite(sv_aligned)] <- 0
+        S_mat[, s_idx] <- sv_aligned
+    }
+
+    # Compute cross-sectional ridge regression for scalarization weights
+    # Target: next-period XS rank of returns (simple proxy)
+    y_target <- R_window[nrow(R_window), ]
+    y_target <- y_target[syms]
+    y_target[!is.finite(y_target)] <- 0
+    y_target <- rank(y_target) / (n_assets + 1) - 0.5 # XS rank centered
+
+    # Ridge fit: omega = (S'S + lambda I)^{-1} S' y
+    StS <- t(S_mat) %*% S_mat + ridge_lambda * diag(n_sig)
+    Sty <- t(S_mat) %*% y_target
+    omega_new <- tryCatch(
+        as.vector(solve(StS, Sty)),
+        error = function(e) rep(1 / n_sig, n_sig)
+    )
+    names(omega_new) <- sig_names
+
+    # Recursive smoothing with previous weights
+    if (!is.null(omega_prev) && length(omega_prev) == n_sig) {
+        omega_prev_aligned <- omega_prev[sig_names]
+        if (all(is.finite(omega_prev_aligned))) {
+            omega_new <- lambda_omega * omega_prev_aligned + (1 - lambda_omega) * omega_new
+        }
+    }
+
+    # Compute scalarized signal per asset
+    s_scalar <- as.vector(S_mat %*% omega_new)
+    names(s_scalar) <- syms
+
+    list(
+        s_scalar = s_scalar,
+        omega = omega_new,
+        S_mat = S_mat
+    )
+}
+
+# ── Full signal engine orchestrator ──────────────────────────────────────────
+
+#' @export
+me_run_signal_engine <- function(prices_window, R_window, risk_artifact,
+                                 spec_signals, model_state = NULL) {
+    sigma_t <- risk_artifact$sigma_t
+    syms <- colnames(R_window)
+    n_assets <- length(syms)
+
+    # Extract recursive states
+    kalman_states <- if (!is.null(model_state)) model_state$kalman_states else NULL
+    scalar_weights <- if (!is.null(model_state)) model_state$scalar_weights else NULL
+
+    # ── 1. Kalman (§7.2) ──
+    kal <- me_signal_kalman(prices_window, sigma_t, spec_signals$kalman,
+        kalman_states = kalman_states
+    )
+    s_kal <- kal$signal
+
+    # ── 2. TSMOM single-horizon (legacy compat) ──
+    s_mom <- me_signal_tsmom(R_window, sigma_t, spec_signals$tsmom)
+
+    # ── 3. Multiscale TSMOM raw (§7.1) ──
+    tsmom_horizons <- spec_signals$tsmom$horizons %||% c(21, 63, 126, 252)
+    tsmom_multi <- me_signal_tsmom_multiscale(
+        R_window, sigma_t,
+        horizons = tsmom_horizons,
+        scale = spec_signals$tsmom$scale %||% 2.0
+    )
+
+    # ── 4. Residual TSMOM multiscale (§7.1) ──
+    D_t_daily <- NULL
+    ewma_state <- if (!is.null(model_state)) model_state$ewma_vol_state else NULL
+    if (!is.null(ewma_state)) {
+        D_t_daily <- sqrt(me_pi_map_vector(ewma_state, syms, init_val = 1e-4))
+    }
+    resid_tsmom_multi <- NULL
+    if (!is.null(risk_artifact$E_t) && ncol(risk_artifact$E_t) >= 3) {
+        resid_tsmom_multi <- me_signal_tsmom_residual_multiscale(
+            risk_artifact$E_t, D_t_daily,
+            horizons = tsmom_horizons,
+            scale = spec_signals$tsmom$scale %||% 2.0
+        )
+    }
+
+    # ── 5. Factor trend (§7.3) ──
+    s_fac <- rep(0, n_assets)
+    names(s_fac) <- syms
+    factor_trends <- NULL
+    if (!is.null(risk_artifact$F_t) && !is.null(risk_artifact$B_t)) {
+        spec_factor <- spec_signals$factor %||% list()
+        factor_trends <- me_signal_factor_trend(risk_artifact$F_t, spec_factor)
+        # Project factor trends back to asset space: B × latest factor trend vector
+        f_trend_latest <- factor_trends[, 1, drop = TRUE] # shortest horizon
+        f_proj <- as.vector(risk_artifact$B_t %*% f_trend_latest)
+        names(f_proj) <- rownames(risk_artifact$B_t)
+        s_fac <- f_proj[syms]
+        s_fac[!is.finite(s_fac)] <- 0
+    }
+
+    # ── 6. Signal scalarization (§7.4) ──
+    signal_list <- list(mom = s_mom, kal = s_kal, fac = s_fac)
+    spec_scalar <- spec_signals$scalarization %||% list()
+    scalar_result <- me_scalarize_signals(
+        signal_list, R_window, sigma_t,
+        omega_prev = if (!is.null(scalar_weights)) scalar_weights$omega_combined else NULL,
+        spec_scalar = spec_scalar
+    )
+
+    list(
+        s_mom = s_mom,
+        s_kal = s_kal,
+        s_fac = s_fac,
+        s_scalar = scalar_result$s_scalar,
+
+        # Multiscale features (for feature engine)
+        tsmom_multi = tsmom_multi,
+        resid_tsmom_multi = resid_tsmom_multi,
+        factor_trends = factor_trends,
+
+        # Richer Kalman outputs
+        kalman_slope = kal$slope,
+        kalman_uncertainty = kal$uncertainty,
+        kalman_innovation = kal$innovation,
+        kalman_innov_ratio = kal$innov_var_ratio,
+
+        # Recursive state outputs
+        signal_state_out = list(
+            kalman_states = kal$kalman_states_out,
+            scalar_weights = list(omega_combined = scalar_result$omega)
+        )
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/05_feature_engine.R
+###############################################################################
+#' @title Model Engine — Feature Engine
+#' @description Feature assembly: temporal, structural, graph (unsigned/signed), PCA-graph,
+#' liquidity (expanded), signal×liquidity interaction, state context.
+#' Implements architecture.md §11: complete feature vector construction.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.1 Temporal signal features (from signal engine outputs)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_temporal <- function(signal_artifact) {
+    syms <- names(signal_artifact$s_mom)
+    n <- length(syms)
+
+    feats <- data.frame(
+        f_mom = signal_artifact$s_mom[syms],
+        f_kal = signal_artifact$s_kal[syms],
+        f_fac = signal_artifact$s_fac[syms],
+        row.names = syms,
+        stringsAsFactors = FALSE
+    )
+
+    # Richer Kalman outputs (§7.2)
+    if (!is.null(signal_artifact$kalman_slope)) {
+        feats$f_kal_slope <- signal_artifact$kalman_slope[syms]
+        feats$f_kal_slope[!is.finite(feats$f_kal_slope)] <- 0
+    }
+    if (!is.null(signal_artifact$kalman_uncertainty)) {
+        feats$f_kal_uncert <- signal_artifact$kalman_uncertainty[syms]
+        feats$f_kal_uncert[!is.finite(feats$f_kal_uncert)] <- 0
+    }
+    if (!is.null(signal_artifact$kalman_innov_ratio)) {
+        feats$f_kal_innov_ratio <- signal_artifact$kalman_innov_ratio[syms]
+        feats$f_kal_innov_ratio[!is.finite(feats$f_kal_innov_ratio)] <- 0
+    }
+
+    # Multiscale TSMOM raw (§7.1)
+    if (!is.null(signal_artifact$tsmom_multi) && is.matrix(signal_artifact$tsmom_multi)) {
+        tm <- signal_artifact$tsmom_multi
+        for (col_nm in colnames(tm)) {
+            feats[[paste0("f_", col_nm)]] <- tm[syms, col_nm]
+        }
+    }
+
+    # Multiscale TSMOM residual (§7.1)
+    if (!is.null(signal_artifact$resid_tsmom_multi) && is.matrix(signal_artifact$resid_tsmom_multi)) {
+        rtm <- signal_artifact$resid_tsmom_multi
+        for (col_nm in colnames(rtm)) {
+            feats[[paste0("f_resid_", col_nm)]] <- rtm[syms, col_nm]
+        }
+    }
+
+    # Scalarized composite (§7.4)
+    if (!is.null(signal_artifact$s_scalar)) {
+        feats$f_scalar <- signal_artifact$s_scalar[syms]
+        feats$f_scalar[!is.finite(feats$f_scalar)] <- 0
+    }
+
+    feats[!is.finite(as.matrix(feats))] <- 0
+    feats
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.2 Structural features (factor exposure, vol rank, idio)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_structural <- function(risk_artifact) {
+    B <- risk_artifact$B_t
+    syms <- rownames(B)
+    n <- length(syms)
+
+    # Average absolute factor exposure
+    f_factor_exposure <- rowMeans(abs(B), na.rm = TRUE)
+    names(f_factor_exposure) <- syms
+
+    # Idiosyncratic fraction: var(e_i) / var(r_i)
+    Sigma_eps <- risk_artifact$Sigma_eps
+    Sigma_total <- risk_artifact$Sigma_risk_1 %||% risk_artifact$Sigma_total
+    idio_var <- diag(Sigma_eps)
+    total_var <- diag(Sigma_total)
+    f_idio_frac <- ifelse(total_var > 0, idio_var / total_var, 0.5)
+    f_idio_frac[!is.finite(f_idio_frac)] <- 0.5
+    names(f_idio_frac) <- syms
+
+    # Vol cross-sectional rank
+    vols <- risk_artifact$sigma_t[syms]
+    vols[!is.finite(vols)] <- median(vols, na.rm = TRUE)
+    f_vol_rank <- rank(vols) / (n + 1)
+    names(f_vol_rank) <- syms
+
+    data.frame(
+        f_factor_exposure = f_factor_exposure[syms],
+        f_vol_rank = f_vol_rank[syms],
+        f_idio_frac = f_idio_frac[syms],
+        row.names = syms,
+        stringsAsFactors = FALSE
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.3 Graph features — fixed semantics: unsigned A for peer/relative
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_graph <- function(signal_artifact, graph_artifact) {
+    syms <- names(signal_artifact$s_mom)
+    n <- length(syms)
+
+    # Default zeros if graph was skipped
+    defaults <- data.frame(
+        f_graph_peer = rep(0, n),
+        f_graph_relative = rep(0, n),
+        f_graph_tension = rep(0, n),
+        f_cluster_z = rep(0, n),
+        f_centrality = rep(0, n),
+        row.names = syms,
+        stringsAsFactors = FALSE
+    )
+
+    if (is.null(graph_artifact$operators) || is.null(graph_artifact$mask)) {
+        return(defaults)
+    }
+
+    ops <- graph_artifact$operators
+    A <- ops$A # §9.1: UNSIGNED row-normalized adjacency
+    A_signed <- ops$A_signed # §9.3: SIGNED adjacency
+    L <- ops$L
+    L_norm <- ops$L_norm
+    deg <- ops$deg
+
+    s_mom <- signal_artifact$s_mom
+    labels <- graph_artifact$clustering$labels
+
+    feats <- defaults
+
+    # §9.1 Peer context (UNSIGNED A)
+    feats$f_graph_peer <- me_graph_peer(A, s_mom[syms])
+    # §9.2 Relative dislocation (UNSIGNED A)
+    feats$f_graph_relative <- me_graph_relative(A, s_mom[syms])
+    # §9.4 Tension
+    feats$f_graph_tension <- me_graph_tension(L, s_mom[syms])
+    # §10.3 Cluster z
+    feats$f_cluster_z <- me_cluster_z(s_mom[syms], labels)
+    # Centrality (degree)
+    feats$f_centrality <- deg[syms] / max(deg, 1e-8)
+    feats$f_centrality[!is.finite(feats$f_centrality)] <- 0
+
+    # §9.3 SIGNED graph transform (own channel)
+    if (!is.null(A_signed)) {
+        feats$f_graph_signed <- me_graph_signed(A_signed, s_mom[syms])
+    }
+
+    # §9.5 Graph shrinkage features
+    feats$f_graph_shr_mom <- me_graph_shrinkage(L_norm, s_mom[syms], lambda_g = 0.1)
+    if (!is.null(signal_artifact$s_kal)) {
+        feats$f_graph_shr_kal <- me_graph_shrinkage(L_norm, signal_artifact$s_kal[syms], lambda_g = 0.1)
+    }
+
+    # §9.6 Mixed propagation
+    feats$f_graph_mixed_mom <- me_graph_mixed(A, s_mom[syms], nu = 0.5)
+
+    feats[!is.finite(as.matrix(feats))] <- 0
+    feats
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.4 PCA-graph interaction features
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_pca_graph <- function(risk_artifact, graph_artifact) {
+    B <- risk_artifact$B_t
+    syms <- rownames(B)
+    n <- length(syms)
+    k <- ncol(B)
+    labels <- graph_artifact$clustering$labels
+
+    # φ_cf1: factor-graph alignment = b_i' ḡ (average factor loading of neighbors)
+    # φ_cf2: cluster-relative factor exposure dislocation
+    phi_cf1 <- rep(0, n)
+    phi_cf2 <- rep(0, n)
+    names(phi_cf1) <- syms
+    names(phi_cf2) <- syms
+
+    if (!is.null(graph_artifact$operators)) {
+        A <- graph_artifact$operators$A
+        for (i in seq_len(n)) {
+            s <- syms[i]
+            b_i <- B[s, ]
+            # Average neighbor factor loading: ḡ_i = A_i × B
+            g_i <- as.vector(A[s, , drop = TRUE] %*% B[syms, ])
+            phi_cf1[s] <- sum(b_i * g_i)
+
+            # Cluster-relative: b_i - b̄_{c(i)}
+            ci <- labels[s]
+            cluster_mates <- names(labels)[labels == ci]
+            cluster_mates <- intersect(cluster_mates, syms)
+            if (length(cluster_mates) > 1) {
+                b_bar <- colMeans(B[cluster_mates, , drop = FALSE])
+                dislo <- b_i - b_bar
+                phi_cf2[s] <- sum(dislo * g_i) # dislocation × neighbor context
+            }
+        }
+    }
+
+    data.frame(
+        f_pca_graph_align = phi_cf1,
+        f_pca_graph_dislo = phi_cf2,
+        row.names = syms,
+        stringsAsFactors = FALSE
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.5 Liquidity features (expanded)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_liquidity <- function(prices_window, volume_window, risk_artifact,
+                                  extra_volume = NULL) {
+    syms <- colnames(prices_window)
+    n <- length(syms)
+    Tn <- nrow(prices_window)
+    vols <- risk_artifact$sigma_t
+
+    feats <- data.frame(row.names = syms, stringsAsFactors = FALSE)
+
+    # Basic liquidity: log(avg turnover * price)
+    if (!is.null(volume_window) && ncol(volume_window) > 0) {
+        avg_vol <- colMeans(volume_window, na.rm = TRUE)
+        avg_vol[!is.finite(avg_vol) | avg_vol <= 0] <- 1
+        last_price <- prices_window[Tn, ]
+        last_price[!is.finite(last_price) | last_price <= 0] <- 1
+        traded_value <- avg_vol * last_price
+        feats$f_liquidity <- log1p(traded_value)
+        feats$f_liquidity[!is.finite(feats$f_liquidity)] <- 0
+
+        # Traded units / n_trades (if available)
+        feats$f_traded_value <- .tanh_scale(log1p(traded_value), 15)
+        feats$f_traded_units <- .tanh_scale(log1p(avg_vol), 15)
+
+        # Amihud-like illiquidity: mean(|r| / volume)
+        R_abs <- abs(diff(log(pmax(prices_window, 1e-8))))
+        vol_tail <- volume_window[-1, , drop = FALSE]
+        vol_tail[vol_tail <= 0 | !is.finite(vol_tail)] <- 1
+        amihud_daily <- R_abs / vol_tail
+        amihud_daily[!is.finite(amihud_daily)] <- 0
+        f_illiq <- colMeans(amihud_daily, na.rm = TRUE)
+        f_illiq[!is.finite(f_illiq)] <- 0
+        feats$f_illiq <- .tanh_scale(f_illiq * 1e6, 2.0)
+
+        # Rolling standardized liquidity (7-day window)
+        if (Tn >= 7) {
+            recent_vol <- colMeans(volume_window[max(1, Tn - 6):Tn, , drop = FALSE], na.rm = TRUE)
+            feats$f_liq_zscore <- (recent_vol - avg_vol) / pmax(apply(volume_window, 2, sd, na.rm = TRUE), 1)
+            feats$f_liq_zscore[!is.finite(feats$f_liq_zscore)] <- 0
+        } else {
+            feats$f_liq_zscore <- 0
+        }
+
+        # Average trade size proxy (if n_trades available)
+        if (!is.null(extra_volume) && !is.null(extra_volume$n_trades)) {
+            n_trades <- extra_volume$n_trades[syms]
+            n_trades[!is.finite(n_trades) | n_trades <= 0] <- 1
+            feats$f_avg_trade_size <- .tanh_scale(log1p(avg_vol / n_trades), 10)
+            feats$f_n_trades <- .tanh_scale(log1p(n_trades), 10)
+        }
+    } else {
+        feats$f_liquidity <- rep(0, n)
+        feats$f_traded_value <- rep(0, n)
+        feats$f_traded_units <- rep(0, n)
+        feats$f_illiq <- rep(0, n)
+        feats$f_liq_zscore <- rep(0, n)
+    }
+
+    feats[!is.finite(as.matrix(feats))] <- 0
+    feats
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.6 Signal × Liquidity interaction features
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_signal_liquidity <- function(signal_artifact, liq_feats) {
+    syms <- names(signal_artifact$s_mom)
+    n <- length(syms)
+
+    feats <- data.frame(row.names = syms, stringsAsFactors = FALSE)
+
+    liq_score <- if (!is.null(liq_feats$f_liq_zscore)) {
+        liq_feats$f_liq_zscore
+    } else if (!is.null(liq_feats$f_liquidity)) {
+        liq_feats$f_liquidity
+    } else {
+        setNames(rep(0, n), syms)
+    }
+
+    feats$f_mom_x_liq <- abs(signal_artifact$s_mom[syms]) * liq_score
+    feats$f_kal_x_liq <- abs(signal_artifact$s_kal[syms]) * liq_score
+
+    feats[!is.finite(as.matrix(feats))] <- 0
+    feats
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §11.7 State context features (global + graph diagnostics)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_features_state <- function(market_state, graph_artifact = NULL) {
+    # market_state can be a named vector or a list
+    if (is.numeric(market_state)) {
+        disp <- market_state["disp"] %||% 0
+        eta <- market_state["eta"] %||% 0
+        vov <- market_state["VoV"] %||% 0
+    } else {
+        disp <- market_state$dispersion %||% market_state$disp %||% 0
+        eta <- market_state$eta %||% 0
+        vov <- market_state$VoV %||% market_state$vov %||% 0
+    }
+
+    feats <- data.frame(
+        f_state_disp = as.numeric(disp),
+        f_state_eta = as.numeric(eta),
+        f_state_VoV = as.numeric(vov),
+        stringsAsFactors = FALSE
+    )
+
+    # §11.7: Graph diagnostics in state context
+    if (!is.null(graph_artifact$diag)) {
+        gd <- graph_artifact$diag
+        feats$f_state_density <- gd$density %||% 0
+        feats$f_state_eto <- gd$edge_turnover %||% 0
+        feats$f_state_chi <- gd$chi_t %||% 0
+    }
+
+    feats
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Full feature assembly (architecture §11)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_assemble_features <- function(signal_artifact, risk_artifact, graph_artifact,
+                                 market_state, prices_window, volume_window = NULL,
+                                 extra_volume = NULL) {
+    syms <- names(signal_artifact$s_mom)
+    n <- length(syms)
+
+    # §11.1 Temporal
+    f_temporal <- me_features_temporal(signal_artifact)
+    # §11.2 Structural
+    f_struct <- me_features_structural(risk_artifact)
+    # §11.3 Graph (unsigned peer/relative, signed own channel)
+    f_graph <- me_features_graph(signal_artifact, graph_artifact)
+    # §11.4 PCA-graph interaction
+    f_pca_graph <- me_features_pca_graph(risk_artifact, graph_artifact)
+    # §11.5 Liquidity (expanded)
+    f_liq <- me_features_liquidity(prices_window, volume_window, risk_artifact,
+        extra_volume = extra_volume
+    )
+    # §11.6 Signal × Liquidity interactions
+    f_sig_liq <- me_features_signal_liquidity(signal_artifact, f_liq)
+    # §11.7 State context (with graph diag)
+    f_state_raw <- me_features_state(market_state, graph_artifact)
+
+    # Align structural/graph/pca_graph to syms
+    f_struct <- f_struct[syms, , drop = FALSE]
+    f_graph <- f_graph[syms, , drop = FALSE]
+    f_pca_graph <- f_pca_graph[syms, , drop = FALSE]
+
+    # State features: broadcast scalar to all assets
+    n_state_cols <- ncol(f_state_raw)
+    f_state <- as.data.frame(
+        matrix(rep(as.numeric(f_state_raw[1, ]), each = n),
+            nrow = n, ncol = n_state_cols,
+            dimnames = list(syms, names(f_state_raw))
+        )
+    )
+
+    # Combine all
+    X <- cbind(f_temporal, f_struct, f_graph, f_pca_graph, f_liq, f_sig_liq, f_state)
+    X[!is.finite(as.matrix(X))] <- 0
+
+    # Feature group metadata
+    groups <- list(
+        temporal = names(f_temporal),
+        structural = names(f_struct),
+        graph = names(f_graph),
+        pca_graph = names(f_pca_graph),
+        liquidity = names(f_liq),
+        signal_liquidity = names(f_sig_liq),
+        state = names(f_state)
+    )
+
+    list(X = X, groups = groups, n_features = ncol(X))
+}
+
+
+
+###############################################################################
+### FILE: R/06_state_and_gating.R
+###############################################################################
+#' @title Model Engine — State and Gating
+#' @description Architecture §11.5, §12.4: Market state builder, 5-component softmax gating,
+#' optimizer control maps. Preserves legacy 3-way gating as backward compat.
+
+# ── Cross-sectional dispersion ────────────────────────────────────────────────
+
+#' @export
+me_state_dispersion <- function(R_window, spec_disp = list()) {
+    lookback <- spec_disp$lookback %||% 63L
+    Tn <- nrow(R_window)
+    n <- ncol(R_window)
+    if (Tn < 2 || n < 2) {
+        return(0)
+    }
+    use <- max(1, Tn - lookback + 1):Tn
+    cs_sd <- apply(R_window[use, , drop = FALSE], 1, sd, na.rm = TRUE)
+    mean(cs_sd, na.rm = TRUE)
+}
+
+#' @export
+me_state_eta <- function(R_window, spec_eta = list()) {
+    lookback <- spec_eta$lookback %||% 126L
+    Tn <- nrow(R_window)
+    n <- ncol(R_window)
+    if (Tn < 2 || n < 2) {
+        return(0)
+    }
+    use <- max(1, Tn - lookback + 1):Tn
+    R_sub <- R_window[use, , drop = FALSE]
+    avg_ret <- colMeans(R_sub, na.rm = TRUE)
+    pos_frac <- mean(avg_ret > 0, na.rm = TRUE)
+    2 * pos_frac - 1
+}
+
+#' @export
+me_state_vov <- function(R_window, spec_vov = list()) {
+    lookback <- spec_vov$lookback %||% 63L
+    vol_lookback <- spec_vov$vol_lookback %||% 21L
+    Tn <- nrow(R_window)
+    n <- ncol(R_window)
+    if (Tn < 2 || n < 2) {
+        return(0)
+    }
+    use <- max(1, Tn - lookback + 1):Tn
+    R_sub <- R_window[use, , drop = FALSE]
+    Tn_sub <- nrow(R_sub)
+    if (Tn_sub < vol_lookback + 2) {
+        return(0)
+    }
+    rolling_vol <- sapply(seq(vol_lookback + 1, Tn_sub), function(i) {
+        mean(apply(R_sub[(i - vol_lookback):(i - 1), , drop = FALSE], 2, sd, na.rm = TRUE), na.rm = TRUE)
+    })
+    if (length(rolling_vol) < 2) {
+        return(0)
+    }
+    sd(rolling_vol, na.rm = TRUE)
+}
+
+# ── Global state vector m_t (§11.5, extended) ────────────────────────────────
+
+#' @export
+me_build_market_state_vector <- function(R_window, spec_ms, graph_diag = NULL,
+                                         liquidity_state = NULL) {
+    disp <- me_state_dispersion(R_window, spec_ms$dispersion %||% list())
+    eta <- me_state_eta(R_window, spec_ms$eta %||% list())
+    vov <- me_state_vov(R_window, spec_ms$vov %||% list())
+
+    m_t <- c(disp = disp, eta = eta, VoV = vov)
+
+    # Graph diagnostics in m_t
+    if (!is.null(graph_diag)) {
+        m_t <- c(m_t,
+            dens = graph_diag$density %||% 0,
+            eto = graph_diag$edge_turnover %||% 0,
+            chi = graph_diag$chi_t %||% 0
+        )
+    } else {
+        m_t <- c(m_t, dens = 0, eto = 0, chi = 0)
+    }
+
+    # Global liquidity state
+    if (!is.null(liquidity_state)) {
+        m_t <- c(m_t,
+            liq_avg = liquidity_state$avg %||% 0,
+            liq_disp = liquidity_state$dispersion %||% 0,
+            liq_trend = liquidity_state$trend %||% 0
+        )
+    } else {
+        m_t <- c(m_t, liq_avg = 0, liq_disp = 0, liq_trend = 0)
+    }
+
+    m_t[!is.finite(m_t)] <- 0
+    m_t
+}
+
+# ── Legacy 3-way softmax gating (backward compat) ────────────────────────────
+
+#' @export
+me_softmax_gating <- function(state_vec, spec_gating) {
+    expert_names <- c("kalman", "tsmom", "cash")
+    state_names <- c("disp", "eta", "VoV")
+
+    W <- spec_gating$W
+    if (is.null(W) || !is.matrix(W)) {
+        W <- matrix(0,
+            nrow = 3, ncol = 3,
+            dimnames = list(expert_names, state_names)
+        )
+    }
+
+    w0 <- spec_gating$w0
+    if (is.null(w0)) {
+        w0 <- c(kalman = 0, tsmom = 0, cash = -1)
+    }
+    # Ensure w0 is named
+    if (is.null(names(w0))) names(w0) <- expert_names
+
+    temperature <- spec_gating$temperature %||% 1.0
+
+    sx <- state_vec[state_names]
+    sx[!is.finite(sx)] <- 0
+
+    logits <- as.vector(W %*% sx) + w0
+    logits <- logits / temperature
+    names(logits) <- expert_names
+    logits <- logits - max(logits)
+    e <- exp(logits)
+    probs <- e / sum(e)
+    probs[!is.finite(probs)] <- 1 / 3
+    names(probs) <- expert_names
+
+    list(
+        w_kalman = as.numeric(probs["kalman"]),
+        w_tsmom = as.numeric(probs["tsmom"]),
+        w_cash = as.numeric(probs["cash"]),
+        gross_exposure = as.numeric(1 - probs["cash"]),
+        state_vec = state_vec,
+        logits_raw = as.numeric(logits)
+    )
+}
+
+# ── Architecture 5-component softmax gating (§12.4) ──────────────────────────
+
+#' @export
+me_softmax_gating_5c <- function(m_t, spec_gating) {
+    A_pi <- spec_gating$A_pi
+    b_pi <- spec_gating$b_pi
+    n_comp <- spec_gating$n_components %||% 5L
+    temperature <- spec_gating$temperature %||% 1.0
+
+    if (is.null(A_pi) || is.null(b_pi)) {
+        pi_t <- setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp)))
+        return(list(pi_t = pi_t, method = "uniform_default"))
+    }
+
+    # Pad/trim m_t
+    n_state <- ncol(A_pi)
+    if (length(m_t) < n_state) {
+        m_t <- c(m_t, rep(0, n_state - length(m_t)))
+    } else if (length(m_t) > n_state) {
+        m_t <- m_t[seq_len(n_state)]
+    }
+
+    pi_t <- me_forecast_softmax_weights(m_t, A_pi, b_pi, temperature)
+
+    list(pi_t = pi_t, m_t = m_t, method = "architecture_5c_softmax")
+}
+
+# ── Optimizer control maps (§12.8) ───────────────────────────────────────────
+
+#' @export
+me_optimizer_controls <- function(m_t, spec_portfolio) {
+    # γ_t = exp(θ_γ' m_t), τ_t = exp(θ_τ' m_t), ρ_gross = σ(θ_gross' m_t)
+    # Initial: configurable static values (not learned)
+
+    gamma_base <- spec_portfolio$gamma %||% 1.0
+    tau_base <- spec_portfolio$turnover_penalty %||% 0.0
+    gross_base <- 1 - (spec_portfolio$cash_target %||% 0.15)
+
+    # Simple state-adaptive scaling
+    vov <- m_t["VoV"] %||% 0
+    disp <- m_t["disp"] %||% 0
+
+    gamma_t <- gamma_base * exp(0.5 * vov) # higher VoV → more risk aversion
+    tau_t <- tau_base * (1 + 0.2 * disp) # higher dispersion → more turnover penalty
+    rho_gross <- gross_base / (1 + exp(-2 * m_t["eta"])) # bullish → more exposure
+
+    gamma_t <- max(0.1, min(10, gamma_t))
+    tau_t <- max(0, min(0.1, tau_t))
+    rho_gross <- max(0.3, min(0.95, rho_gross))
+
+    if (!is.finite(gamma_t)) gamma_t <- gamma_base
+    if (!is.finite(tau_t)) tau_t <- tau_base
+    if (!is.finite(rho_gross)) rho_gross <- gross_base
+
+    list(
+        gamma_t = gamma_t,
+        tau_t = tau_t,
+        rho_gross = rho_gross
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/07_forecast_engine.R
+###############################################################################
+#' @title Model Engine — Forecast Engine
+#' @description Architecture §12: 5-component asset-date panel forecast with global softmax
+#' mixture, bounded confidence multipliers, stagger-bucket error states, asset reliability.
+#' Preserves legacy fallback path explicitly flagged.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.0 Training panel construction (causal)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' Build causal training panel: {(X_{i,s}, y^(H)_{i,s}) : s <= t-H}
+#' @export
+me_build_training_panel <- function(feature_history, R_history, horizon = 21L,
+                                    current_date_idx = NULL) {
+    # feature_history: list of snapshots, each with $X (data.frame/matrix n×p) and $date
+    # R_history: matrix of returns (T × n_assets, with rownames = dates)
+    # Returns: list(X = matrix, y = vector, asset = char, date = char)
+
+    if (is.null(feature_history) || length(feature_history) < horizon + 1) {
+        return(list(X = NULL, y = NULL, n_obs = 0, n_features = 0))
+    }
+
+    all_X <- list()
+    all_y <- c()
+    all_asset <- c()
+    all_date <- c()
+
+    n_snaps <- length(feature_history)
+    # Only use snapshots where labels have matured: up to t - H
+    usable_end <- n_snaps - horizon
+
+    if (usable_end < 1) {
+        return(list(X = NULL, y = NULL, n_obs = 0, n_features = 0))
+    }
+
+    for (s in seq_len(usable_end)) {
+        snap <- feature_history[[s]]
+        if (is.null(snap$X)) next
+
+        X_s <- as.matrix(snap$X)
+        snap_syms <- rownames(X_s)
+        if (is.null(snap_syms) || length(snap_syms) == 0) next
+
+        # Forward returns as labels (H-day cumulative)
+        # Need returns from s+1 to s+H
+        date_s <- snap$date_idx %||% s
+        label_start <- date_s + 1
+        label_end <- date_s + horizon
+
+        if (label_end > nrow(R_history)) next
+
+        for (sym in snap_syms) {
+            if (!(sym %in% colnames(R_history))) next
+            r_forward <- R_history[label_start:label_end, sym]
+            if (any(!is.finite(r_forward))) next
+            y_label <- sum(r_forward) # H-day cumulative return
+
+            all_X[[length(all_X) + 1]] <- X_s[sym, , drop = TRUE]
+            all_y <- c(all_y, y_label)
+            all_asset <- c(all_asset, sym)
+            all_date <- c(all_date, snap$date %||% as.character(s))
+        }
+    }
+
+    if (length(all_y) < 10) {
+        return(list(X = NULL, y = NULL, n_obs = 0, n_features = 0))
+    }
+
+    X_panel <- do.call(rbind, all_X)
+    X_panel[!is.finite(X_panel)] <- 0
+
+    list(
+        X = X_panel,
+        y = all_y,
+        asset = all_asset,
+        date = all_date,
+        n_obs = length(all_y),
+        n_features = ncol(X_panel)
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.1 Component feature selectors
+# ══════════════════════════════════════════════════════════════════════════════
+
+.component_feature_selector <- function(feature_names, component_id) {
+    # Select features relevant to each architecture component
+    switch(as.character(component_id),
+        "1" = {
+            # C1: temporal continuation (raw/resid TSMOM, Kalman, factor, scalar, liquidity interactions)
+            grep("^f_(mom|kal|fac|tsmom|resid_tsmom|scalar|kal_slope|kal_uncert|kal_innov|mom_x_liq|kal_x_liq)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "2" = {
+            # C2: structural continuation (graph peer, shrinkage, mixed, signed)
+            grep("^f_(graph_peer|graph_shr|graph_mixed|graph_signed|cluster_z)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "3" = {
+            # C3: neighborhood mean-reversion (relative, tension, cluster)
+            grep("^f_(graph_relative|graph_tension|cluster_z|centrality)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "4" = {
+            # C4: PCA-graph dislocation (pca_graph features, factor exposure, structural)
+            grep("^f_(pca_graph|factor_exposure|idio_frac|vol_rank)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        "5" = {
+            # C5: liquidity-conditioned correction (liquidity, illiq, liq interactions)
+            grep("^f_(liquidity|traded|illiq|liq_zscore|avg_trade|n_trades|mom_x_liq|kal_x_liq)",
+                feature_names,
+                value = TRUE
+            )
+        },
+        feature_names # fallback: all features
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.2 Per-component ridge regression
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_train_component_model <- function(X, y, feature_cols, lambda = 0.01) {
+    # Ridge regression for a single component
+    if (is.null(X) || length(y) < 10 || length(feature_cols) == 0) {
+        return(list(beta = NULL, intercept = 0, n_obs = 0, n_features = 0, fitted = FALSE))
+    }
+
+    # Select columns
+    avail_cols <- intersect(feature_cols, colnames(X))
+    if (length(avail_cols) < 1) {
+        return(list(beta = NULL, intercept = 0, n_obs = 0, n_features = 0, fitted = FALSE))
+    }
+
+    Xc <- X[, avail_cols, drop = FALSE]
+    Xc[!is.finite(Xc)] <- 0
+
+    # Standardize X columns
+    x_means <- colMeans(Xc)
+    x_sds <- apply(Xc, 2, sd)
+    x_sds[x_sds <= 0 | !is.finite(x_sds)] <- 1
+    Xc <- scale(Xc, center = x_means, scale = x_sds)
+    Xc[!is.finite(Xc)] <- 0
+
+    y_mean <- mean(y, na.rm = TRUE)
+    yc <- y - y_mean
+
+    p <- ncol(Xc)
+    XtX <- t(Xc) %*% Xc + lambda * diag(p)
+    Xty <- t(Xc) %*% yc
+
+    beta_std <- tryCatch(
+        as.vector(solve(XtX, Xty)),
+        error = function(e) rep(0, p)
+    )
+
+    # Unstandardize
+    beta <- beta_std / x_sds
+    intercept <- y_mean - sum(beta * x_means)
+    names(beta) <- avail_cols
+
+    list(
+        beta = beta,
+        intercept = intercept,
+        x_means = x_means,
+        x_sds = x_sds,
+        y_mean = y_mean,
+        feature_cols = avail_cols,
+        n_obs = nrow(Xc),
+        n_features = p,
+        fitted = TRUE
+    )
+}
+
+#' @export
+me_predict_component <- function(X_new, model) {
+    # Predict from trained component model
+    if (is.null(model) || !isTRUE(model$fitted) || is.null(model$beta)) {
+        return(rep(0, nrow(X_new)))
+    }
+
+    avail <- intersect(model$feature_cols, colnames(X_new))
+    if (length(avail) == 0) {
+        return(rep(0, nrow(X_new)))
+    }
+
+    Xc <- X_new[, avail, drop = FALSE]
+    Xc[!is.finite(Xc)] <- 0
+
+    pred <- as.vector(Xc %*% model$beta[avail]) + model$intercept
+    pred[!is.finite(pred)] <- 0
+    pred
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.4 Global softmax mixture weights π_t
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_forecast_softmax_weights <- function(m_t, A_pi, b_pi, temperature = 1.0) {
+    # π_t = softmax((A_pi %*% m_t + b_pi) / temperature)
+    n_comp <- nrow(A_pi)
+    z <- as.vector(A_pi %*% m_t + b_pi) / temperature
+    z <- z - max(z) # numerical stability
+    e <- exp(z)
+    pi_t <- e / sum(e)
+    pi_t[!is.finite(pi_t)] <- 1 / n_comp
+    names(pi_t) <- paste0("C", seq_len(n_comp))
+    pi_t
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.5 Bounded confidence multipliers κ_{i,c,t}
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_bounded_kappa <- function(X_i, kappa_min = 0.5, kappa_max = 1.5) {
+    # κ_{i,c,t} = kappa_min + (kappa_max - kappa_min) * σ(||x_i||_2 - threshold)
+    # Simple: scale by feature magnitude
+    x_norm <- sqrt(sum(X_i^2, na.rm = TRUE))
+    # Sigmoid centered at median feature norm
+    raw <- 1 / (1 + exp(-(x_norm - 1)))
+    kappa <- kappa_min + (kappa_max - kappa_min) * raw
+    if (!is.finite(kappa)) kappa <- 1.0
+    kappa
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.6 Stagger-bucket component error states
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_update_error_states <- function(error_states_prev, predictions, actuals, horizon,
+                                   lambda_err = 0.97) {
+    # H stagger buckets per component
+    # Only update bucket (t mod H) when labels mature
+    n_comp <- length(predictions)
+
+    if (is.null(error_states_prev)) {
+        # Initialize: one variance per component
+        error_states_prev <- lapply(seq_len(n_comp), function(c) {
+            list(
+                sigma2 = rep(0.01, horizon), # H buckets
+                n_updates = rep(0L, horizon)
+            )
+        })
+        names(error_states_prev) <- names(predictions)
+    }
+
+    bucket <- ((error_states_prev[[1]]$n_updates[1] %||% 0) %% horizon) + 1
+
+    out <- error_states_prev
+    for (c in seq_len(n_comp)) {
+        nm <- names(predictions)[c]
+        if (is.null(nm)) nm <- paste0("C", c)
+        if (!is.null(actuals) && !is.null(actuals[[nm]])) {
+            err <- (predictions[[nm]] - actuals[[nm]])^2
+            err <- mean(err, na.rm = TRUE)
+            if (is.finite(err)) {
+                if (is.null(out[[nm]])) {
+                    out[[nm]] <- list(sigma2 = rep(0.01, horizon), n_updates = rep(0L, horizon))
+                }
+                out[[nm]]$sigma2[bucket] <- lambda_err * out[[nm]]$sigma2[bucket] +
+                    (1 - lambda_err) * err
+                out[[nm]]$n_updates[bucket] <- out[[nm]]$n_updates[bucket] + 1L
+            }
+        }
+    }
+    out
+}
+
+#' @export
+me_component_uncertainty <- function(error_states, horizon) {
+    # σ̂^(H) per component = sqrt(mean across H buckets)
+    if (is.null(error_states)) {
+        return(NULL)
+    }
+    sapply(error_states, function(es) {
+        if (is.null(es) || is.null(es$sigma2)) {
+            return(0.01)
+        }
+        sqrt(mean(es$sigma2, na.rm = TRUE))
+    })
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12.7 Reliability score ρ_rel and effective forecast
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_reliability_score <- function(X_i, liquidity_features = NULL,
+                                 node_stability = NULL) {
+    # ρ_rel = σ(θ_rel' z_rel)
+    # z_rel = [liquidity_z, node_stability, data_coverage]
+    # Simple deterministic version
+    z_sum <- 0
+    n_features <- 0
+
+    if (!is.null(liquidity_features)) {
+        liq <- liquidity_features$f_liquidity %||% 0
+        z_sum <- z_sum + liq
+        n_features <- n_features + 1
+    }
+    if (!is.null(node_stability)) {
+        z_sum <- z_sum + node_stability
+        n_features <- n_features + 1
+    }
+
+    if (n_features == 0) {
+        return(0.8)
+    } # default
+    z_mean <- z_sum / n_features
+    rho <- 1 / (1 + exp(-z_mean)) # (0,1)
+    rho <- max(0.1, min(1.0, rho))
+    rho
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §12 Full forecast engine orchestrator
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_run_forecast_engine <- function(feature_artifact, risk_artifact, graph_artifact,
+                                   signal_artifact, market_state_vec,
+                                   spec_forecast, spec_gating,
+                                   feature_history = NULL, R_history = NULL,
+                                   model_state = NULL) {
+    syms <- rownames(feature_artifact$X)
+    n_assets <- length(syms)
+    X_now <- as.matrix(feature_artifact$X)
+    feature_names <- colnames(X_now)
+
+    n_comp <- spec_forecast$n_components %||% 5L
+    horizon <- spec_forecast$label_horizon %||% 21L
+    ridge_lambda <- spec_forecast$ridge_lambda %||% 0.01
+    kappa_min <- spec_forecast$kappa_min %||% 0.5
+    kappa_max <- spec_forecast$kappa_max %||% 1.5
+    lambda_err <- spec_forecast$lambda_err %||% 0.97
+    refit_every <- spec_forecast$refit_every %||% 1L
+
+    # Extract previous model state
+    comp_models_prev <- if (!is.null(model_state)) model_state$component_model_fits else NULL
+    error_states_prev <- if (!is.null(model_state)) model_state$component_error_states else NULL
+    forecast_step <- if (!is.null(model_state)) (model_state$forecast_step %||% 0L) + 1L else 1L
+
+    # Flag: architecture vs fallback
+    use_arch_path <- !is.null(feature_history) && length(feature_history) >= horizon + 10 &&
+        !is.null(R_history) && nrow(R_history) >= horizon + 10
+
+    if (!use_arch_path) {
+        # ── FALLBACK: Legacy confidence-scaled forecast ──
+        # FALLBACK:forecast_legacy_path
+        s_mom <- signal_artifact$s_mom[syms]
+        s_kal <- signal_artifact$s_kal[syms]
+
+        mu_hat <- (s_mom + s_kal) / 2
+        mu_hat[!is.finite(mu_hat)] <- 0
+
+        conf_scale <- spec_forecast$confidence_eps %||% 0.01
+        unc <- rep(spec_forecast$uncertainty_scale %||% 1.0, n_assets)
+        names(unc) <- syms
+
+        mu_eff <- mu_hat * 0.8 # conservative reliability scaling
+        s_eff <- unc / sqrt(0.8)
+
+        return(list(
+            mu_hat = mu_hat,
+            mu_eff = mu_eff,
+            sigma_hat = unc,
+            s_eff = s_eff,
+            confidence = rep(0.6, n_assets),
+            pi_t = setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp))),
+            component_mu = NULL,
+            rho_rel = rep(0.8, n_assets),
+            diag = list(
+                method = "FALLBACK:forecast_legacy_path",
+                reason = if (is.null(feature_history) || length(feature_history) < horizon + 10) {
+                    "insufficient_feature_history"
+                } else {
+                    "insufficient_R_history"
+                },
+                n_history = length(feature_history),
+                forecast_step = forecast_step
+            ),
+            forecast_state_out = list(
+                forecast_step = forecast_step
+            )
+        ))
+    }
+
+    # ── ARCHITECTURE PATH: 5-component asset-date panel ──
+
+    # 1. Build training panel (causal)
+    panel <- me_build_training_panel(feature_history, R_history, horizon)
+
+    if (panel$n_obs < 20) {
+        # Not enough data yet → fallback
+        mu_hat <- rep(0, n_assets)
+        names(mu_hat) <- syms
+        return(list(
+            mu_hat = mu_hat,
+            mu_eff = mu_hat,
+            sigma_hat = rep(1, n_assets),
+            s_eff = rep(1, n_assets),
+            confidence = rep(0.5, n_assets),
+            pi_t = setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp))),
+            component_mu = NULL,
+            rho_rel = rep(0.5, n_assets),
+            diag = list(
+                method = "FALLBACK:insufficient_panel", n_obs = panel$n_obs,
+                forecast_step = forecast_step
+            ),
+            forecast_state_out = list(forecast_step = forecast_step)
+        ))
+    }
+
+    # 2. Train (or reuse) component models
+    should_refit <- is.null(comp_models_prev) || (forecast_step %% refit_every == 0)
+
+    comp_models <- if (should_refit) {
+        lapply(seq_len(n_comp), function(c) {
+            feat_cols <- .component_feature_selector(colnames(panel$X), c)
+            me_train_component_model(panel$X, panel$y, feat_cols, ridge_lambda)
+        })
+    } else {
+        comp_models_prev
+    }
+    names(comp_models) <- paste0("C", seq_len(n_comp))
+
+    # 3. Generate component forecasts μ^(c)_{i,t}
+    component_mu <- matrix(0, n_assets, n_comp,
+        dimnames = list(syms, paste0("C", seq_len(n_comp)))
+    )
+    for (c in seq_len(n_comp)) {
+        component_mu[, c] <- me_predict_component(X_now, comp_models[[c]])
+    }
+
+    # 4. Global softmax mixture weights π_t (§12.4)
+    A_pi <- spec_gating$A_pi
+    b_pi <- spec_gating$b_pi
+    if (is.null(A_pi) || is.null(market_state_vec)) {
+        pi_t <- setNames(rep(1 / n_comp, n_comp), paste0("C", seq_len(n_comp)))
+    } else {
+        m_t <- market_state_vec
+        # Pad or trim m_t to match A_pi columns
+        if (length(m_t) < ncol(A_pi)) {
+            m_t <- c(m_t, rep(0, ncol(A_pi) - length(m_t)))
+        } else if (length(m_t) > ncol(A_pi)) {
+            m_t <- m_t[seq_len(ncol(A_pi))]
+        }
+        pi_t <- me_forecast_softmax_weights(m_t, A_pi, b_pi,
+            temperature = spec_gating$temperature %||% 1.0
+        )
+    }
+
+    # 5. Bounded κ_{i,c,t} and normalized q_{i,c,t} (§12.5)
+    kappa <- matrix(1, n_assets, n_comp, dimnames = list(syms, paste0("C", seq_len(n_comp))))
+    for (i in seq_len(n_assets)) {
+        kappa[i, ] <- me_bounded_kappa(X_now[i, ], kappa_min, kappa_max)
+    }
+
+    # q_{i,c} = π_c × κ_{i,c} / Σ_c(π_c × κ_{i,c})
+    q <- sweep(kappa, 2, pi_t, "*")
+    q_sums <- rowSums(q)
+    q_sums[q_sums <= 0] <- 1
+    q <- q / q_sums
+
+    # 6. Final μ̂^(H)
+    mu_hat <- rowSums(q * component_mu)
+    names(mu_hat) <- syms
+
+    # 7. Component uncertainty (§12.6)
+    comp_sigma <- me_component_uncertainty(error_states_prev, horizon)
+    if (is.null(comp_sigma) || length(comp_sigma) != n_comp) {
+        comp_sigma <- rep(0.01, n_comp)
+    }
+
+    # Asset-level forecast uncertainty: weighted by π
+    sigma_hat <- rep(0, n_assets)
+    for (i in seq_len(n_assets)) {
+        sigma_hat[i] <- sqrt(sum(q[i, ]^2 * comp_sigma^2))
+    }
+    sigma_hat[sigma_hat <= 0 | !is.finite(sigma_hat)] <- 0.01
+    names(sigma_hat) <- syms
+
+    # 8. Reliability ρ_rel (§12.7)
+    liq_feats <- feature_artifact$X[, grep("^f_liquidity$", names(feature_artifact$X)), drop = FALSE]
+    node_stab <- if (!is.null(graph_artifact$graph_state_out)) {
+        graph_artifact$graph_state_out$node_stability
+    } else {
+        NULL
+    }
+
+    rho_rel <- rep(0.8, n_assets)
+    names(rho_rel) <- syms
+    for (i in seq_len(n_assets)) {
+        ns <- if (!is.null(node_stab) && syms[i] %in% names(node_stab)) {
+            node_stab[syms[i]]
+        } else {
+            NULL
+        }
+        lf <- if (ncol(liq_feats) > 0) list(f_liquidity = liq_feats[i, 1]) else NULL
+        rho_rel[i] <- me_reliability_score(X_now[i, ], lf, ns)
+    }
+
+    # μ_eff = ρ × μ̂,  s_eff = σ̂ / √ρ
+    mu_eff <- rho_rel * mu_hat
+    s_eff <- sigma_hat / sqrt(pmax(rho_rel, 0.1))
+    names(mu_eff) <- syms
+    names(s_eff) <- syms
+
+    # 9. Confidence score (for legacy compat)
+    confidence <- rho_rel * (1 - sigma_hat / (abs(mu_hat) + sigma_hat + 1e-8))
+    confidence[!is.finite(confidence)] <- 0.5
+    confidence <- pmin(pmax(confidence, 0), 1)
+    names(confidence) <- syms
+
+    list(
+        mu_hat = mu_hat,
+        mu_eff = mu_eff,
+        sigma_hat = sigma_hat,
+        s_eff = s_eff,
+        confidence = confidence,
+        pi_t = pi_t,
+        component_mu = component_mu,
+        kappa = kappa,
+        q = q,
+        rho_rel = rho_rel,
+        diag = list(
+            method = "architecture_5comp_panel",
+            n_training_obs = panel$n_obs,
+            n_features = panel$n_features,
+            component_fitted = sapply(comp_models, function(m) isTRUE(m$fitted)),
+            component_n_features = sapply(comp_models, function(m) m$n_features %||% 0),
+            pi_t = pi_t,
+            mean_kappa = colMeans(kappa),
+            mean_rho_rel = mean(rho_rel),
+            refit_this_step = should_refit,
+            forecast_step = forecast_step,
+            comp_sigma = comp_sigma
+        ),
+        # Recursive state outputs
+        forecast_state_out = list(
+            component_model_fits = comp_models,
+            component_error_states = error_states_prev, # will be updated when labels mature
+            forecast_step = forecast_step
+        )
+    )
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Legacy forecast helpers (backward compat, explicitly flagged)
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_forecast_to_alpha <- function(mu, confidence, sigma, spec_forecast) {
+    # LEGACY COMPAT: convert forecast to alpha vector
+    # In architecture path, portfolio should use mu_eff directly
+    alpha_scale <- spec_forecast$alpha_scale %||% 1.0
+    alpha <- mu * confidence * alpha_scale
+    alpha[!is.finite(alpha)] <- 0
+    alpha
+}
+
+#' @export
+me_forecast_confidence <- function(X, y_hat, sigma_hat, spec_forecast) {
+    # LEGACY COMPAT: simple confidence from prediction uncertainty
+    eps <- spec_forecast$confidence_eps %||% 0.01
+    u_scale <- spec_forecast$uncertainty_scale %||% 1.0
+    conf <- 1 / (1 + u_scale * sigma_hat)
+    conf[!is.finite(conf)] <- eps
+    conf <- pmin(pmax(conf, eps), 1)
+    conf
+}
+
+
+
+###############################################################################
+### FILE: R/08_portfolio_engine.R
+###############################################################################
+#' @title Model Engine — Portfolio Engine (QP Optimizer)
+#' @description Quadratic optimization, post-shaping, repair, and constraint enforcement.
+#' Implements architecture.md §13-14: continuous optimizer + post-shaping.
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §13 Pre-shaping: forecast → alpha vector
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_forecast_to_alpha <- function(combined_forecast, confidence, spec_portfolio) {
+    # α_i = f_hat_i × κ_agreement_i × scale
+    alpha_scale <- spec_portfolio$alpha_scale %||% 1.0
+    syms <- names(combined_forecast)
+
+    agree <- confidence$agreement
+    agree_aligned <- setNames(rep(1, length(syms)), syms)
+    common <- intersect(syms, names(agree))
+    agree_aligned[common] <- agree[common]
+
+    alpha <- combined_forecast * agree_aligned * alpha_scale
+    alpha[!is.finite(alpha)] <- 0
+    alpha
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §14 QP Optimizer: min w^T Σ w - γ α^T w  s.t. constraints
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @keywords internal
+.me_project_capped_simplex <- function(w, target_sum, cap, max_iter = 100L, tol = 1e-10) {
+    nm <- names(w) # preserve names BEFORE numeric coercion
+    w <- unname(as.numeric(w)) # strip names intentionally, restore later
+
+    if (length(w) == 0) {
+        out <- numeric(0)
+        names(out) <- nm
+        return(out)
+    }
+
+    w[!is.finite(w)] <- 0
+    w <- pmax(w, 0)
+
+    target_sum <- max(0, target_sum)
+    target_sum <- min(target_sum, length(w) * cap)
+
+    if (target_sum == 0) {
+        out <- rep(0, length(w))
+        names(out) <- nm
+        return(out)
+    }
+
+    if (sum(w) <= 0) {
+        out <- rep(0, length(w))
+        remaining <- target_sum
+        for (i in seq_along(out)) {
+            add <- min(cap, remaining)
+            out[i] <- add
+            remaining <- remaining - add
+            if (remaining <= tol) break
+        }
+        names(out) <- nm
+        return(out)
+    }
+
+    # Start by scaling to target sum
+    w <- w * (target_sum / sum(w))
+
+    for (iter in seq_len(max_iter)) {
+        over <- which(w > cap + tol)
+        if (length(over) == 0) break
+
+        excess <- sum(w[over] - cap)
+        w[over] <- cap
+
+        under <- which(w < cap - tol)
+        if (length(under) == 0 || excess <= tol) break
+
+        base <- w[under]
+        base[!is.finite(base)] <- 0
+
+        if (sum(base) > tol) {
+            w[under] <- w[under] + excess * (base / sum(base))
+        } else {
+            headroom <- cap - w[under]
+            if (sum(headroom) <= tol) break
+            w[under] <- w[under] + excess * (headroom / sum(headroom))
+        }
+
+        w <- pmax(w, 0)
+    }
+
+    # Final correction
+    s <- sum(w)
+    if (s > 0 && abs(s - target_sum) > 1e-8) {
+        headroom <- pmax(cap - w, 0)
+        if (s < target_sum && sum(headroom) > tol) {
+            add <- (target_sum - s) * headroom / sum(headroom)
+            w <- w + add
+        } else if (s > target_sum) {
+            reducible <- pmax(w, 0)
+            if (sum(reducible) > tol) {
+                sub <- (s - target_sum) * reducible / sum(reducible)
+                w <- pmax(w - sub, 0)
+            }
+        }
+    }
+
+    names(w) <- nm
+    w
+}
+
+#' @export
+me_qp_optimize <- function(Sigma, alpha, w_baseline, gross_exposure,
+                           spec_portfolio, prev_target = NULL) {
+    n <- length(alpha)
+    syms <- names(alpha)
+
+    gamma <- spec_portfolio$gamma %||% 1.0
+    max_weight <- spec_portfolio$caps$max_weight %||% 0.15
+    turnover_penalty <- spec_portfolio$turnover_penalty %||% 0.0
+
+    if (n == 0) {
+        return(list(w = setNames(numeric(0), character(0)), method = "empty", converged = TRUE))
+    }
+
+    # Feasibility: sum(w)=gross_exposure with w_i <= max_weight
+    gross_req <- gross_exposure
+    gross_cap_max <- n * max_weight
+    gross_use <- min(gross_req, gross_cap_max)
+    if (!is.finite(gross_use) || gross_use < 0) gross_use <- 0
+
+    has_qp <- requireNamespace("quadprog", quietly = TRUE)
+
+    if (has_qp && n >= 2) {
+        Dmat <- Sigma
+        Dmat <- (Dmat + t(Dmat)) / 2
+
+        dvec <- gamma * alpha
+
+        # Quadratic turnover proxy around previous target:
+        # +(lambda/2)||w - w_prev||^2 => D += lambda I ; d += lambda w_prev
+        if (turnover_penalty > 0 && !is.null(prev_target)) {
+            if (is.data.frame(prev_target)) {
+                w_prev <- setNames(prev_target$weight_target, prev_target$symbol)
+            } else {
+                w_prev <- prev_target
+            }
+            w_prev_aligned <- setNames(rep(0, n), syms)
+            common_prev <- intersect(syms, names(w_prev))
+            w_prev_aligned[common_prev] <- w_prev[common_prev]
+
+            diag(Dmat) <- diag(Dmat) + turnover_penalty
+            dvec <- dvec + turnover_penalty * w_prev_aligned
+        } else if (turnover_penalty > 0) {
+            # Mild ridge only if no prev target is available
+            diag(Dmat) <- diag(Dmat) + turnover_penalty
+        }
+
+        # Ensure positive definite enough for solve.QP
+        eigvals <- tryCatch(eigen(Dmat, symmetric = TRUE, only.values = TRUE)$values,
+            error = function(e) NULL
+        )
+        if (!is.null(eigvals)) {
+            min_eig <- min(eigvals, na.rm = TRUE)
+            if (is.finite(min_eig) && min_eig < 1e-8) {
+                diag(Dmat) <- diag(Dmat) + abs(min_eig) + 1e-6
+            }
+        } else {
+            diag(Dmat) <- diag(Dmat) + 1e-6
+        }
+
+        # solve.QP uses Amat^T w >= bvec
+        # Equality: sum(w) = gross_use  (meq = 1)
+        Amat <- cbind(
+            rep(1, n), # equality
+            diag(n), # w_i >= 0
+            -diag(n) # w_i <= max_weight
+        )
+        bvec <- c(
+            gross_use,
+            rep(0, n),
+            rep(-max_weight, n)
+        )
+
+        sol <- tryCatch(
+            quadprog::solve.QP(Dmat, dvec, Amat, bvec, meq = 1),
+            error = function(e) NULL
+        )
+
+        if (!is.null(sol)) {
+            w_opt <- sol$solution
+            w_opt[!is.finite(w_opt)] <- 0
+            w_opt[w_opt < 0] <- 0
+            names(w_opt) <- syms
+
+            # Final robust capped projection (see helper below)
+            w_opt <- .me_project_capped_simplex(w_opt, target_sum = gross_use, cap = max_weight)
+
+            return(list(
+                w = w_opt,
+                method = "qp",
+                obj_value = sol$value,
+                converged = TRUE,
+                gross_requested = gross_req,
+                gross_used = gross_use
+            ))
+        }
+    }
+
+    # Fallback
+    w_opt <- .tilt_allocation(
+        alpha, w_baseline, gross_use, max_weight, spec_portfolio
+    )
+
+    list(
+        w = w_opt, method = "tilt_fallback", obj_value = NA, converged = FALSE,
+        gross_requested = gross_req, gross_used = gross_use
+    )
+}
+
+#' Tilt-based fallback (score-to-tilt on baseline)
+.tilt_allocation <- function(alpha, w_baseline, gross_exposure, max_weight,
+                             spec_portfolio) {
+    syms <- names(alpha)
+    max_tilt <- spec_portfolio$tilt$max_tilt %||% 2.0
+
+    # Cross-sectional z-score of alpha
+    a <- alpha[is.finite(alpha)]
+    if (length(a) < 2) {
+        w <- w_baseline * (gross_exposure / max(sum(w_baseline), 1e-12))
+        return(w)
+    }
+    mu <- mean(a)
+    sigma <- max(sd(a), 1e-8)
+    z <- (alpha - mu) / sigma
+    z[!is.finite(z)] <- 0
+
+    tilt <- exp(log(max_tilt) * z)
+    tilt <- pmin(pmax(tilt, 1 / max_tilt), max_tilt)
+
+    w <- w_baseline * tilt
+
+    w[w < 0] <- 0
+    w <- .me_project_capped_simplex(w, target_sum = gross_exposure, cap = max_weight)
+    names(w) <- syms
+    w
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §14.2 Post-shaping repair
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_post_shape <- function(w, tradable_symbols, max_weight = 0.15,
+                          min_weight = 1e-6, gross_exposure = 1.0) {
+    if (length(w) == 0) {
+        return(w)
+    }
+
+    # 1. Zero out non-tradable
+    non_tradable <- setdiff(names(w), tradable_symbols)
+    if (length(non_tradable) > 0) w[non_tradable] <- 0
+
+    # 2. Zero out dust
+    w[!is.finite(w)] <- 0
+    w[w < min_weight] <- 0
+    w[w < 0] <- 0
+
+    # 3. Project to capped simplex exactly
+    w <- .me_project_capped_simplex(w, target_sum = gross_exposure, cap = max_weight)
+
+    w
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# §14.3 Turnover ceiling
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_apply_turnover_ceiling <- function(w_new, w_prev, max_turnover = 0.5) {
+    if (is.null(w_prev) || length(w_prev) == 0) {
+        return(w_new)
+    }
+
+    syms <- union(names(w_new), names(w_prev))
+    wn <- setNames(rep(0, length(syms)), syms)
+    wp <- setNames(rep(0, length(syms)), syms)
+    wn[names(w_new)] <- w_new
+    wp[names(w_prev)] <- w_prev
+
+    turnover <- sum(abs(wn - wp)) / 2
+    if (turnover <= max_turnover) {
+        return(w_new)
+    }
+
+    # Shrink toward previous
+    lambda <- max_turnover / turnover
+    w_blend <- (1 - lambda) * wp + lambda * wn
+    w_blend[w_blend < 0] <- 0
+    s <- sum(w_blend)
+    if (s > 0) w_blend <- w_blend * (sum(w_new) / s)
+    w_blend[names(w_new)]
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Full portfolio engine orchestrator
+# ══════════════════════════════════════════════════════════════════════════════
+
+#' @export
+me_build_portfolio_target <- function(risk_artifact, signal_artifact,
+                                      state_gating_artifact, spec_portfolio,
+                                      forecast_artifact = NULL,
+                                      graph_artifact = NULL,
+                                      prev_target = NULL,
+                                      optimizer_controls = NULL,
+                                      liquidity_features = NULL) {
+    gating <- state_gating_artifact$gating
+    gross_exposure <- gating$gross_exposure
+    w_cash <- gating$w_cash
+
+    # Optimizer controls override spec defaults if provided (§12.8)
+    if (!is.null(optimizer_controls)) {
+        gamma_t <- optimizer_controls$gamma_t %||% (spec_portfolio$gamma %||% 1.0)
+        tau_t <- optimizer_controls$tau_t %||% (spec_portfolio$turnover_penalty %||% 0.0)
+        rho_gross <- optimizer_controls$rho_gross
+        if (!is.null(rho_gross) && is.finite(rho_gross)) {
+            gross_exposure <- rho_gross
+            w_cash <- 1 - rho_gross
+        }
+    } else {
+        gamma_t <- spec_portfolio$gamma %||% 1.0
+        tau_t <- spec_portfolio$turnover_penalty %||% 0.0
+    }
+
+    max_weight <- spec_portfolio$caps$max_weight %||% 0.15
+
+    Sigma <- risk_artifact$Sigma_risk_H %||% risk_artifact$Sigma_total %||% risk_artifact$Sigma_risk_1
+    if (is.null(Sigma)) {
+        stop("me_build_portfolio_target: risk artifact missing covariance matrix (Sigma_risk_H / Sigma_total / Sigma_risk_1).")
+    }
+    if (!is.matrix(Sigma) || nrow(Sigma) != ncol(Sigma)) {
+        stop("me_build_portfolio_target: risk covariance must be square matrix.")
+    }
+    if (is.null(rownames(Sigma)) || is.null(colnames(Sigma)) || !identical(rownames(Sigma), colnames(Sigma))) {
+        stop("me_build_portfolio_target: risk covariance must have matching row/col names in same order.")
+    }
+
+    risk_univ <- colnames(Sigma)
+    n_risk <- length(risk_univ)
+
+    if (n_risk == 0) {
+        tgt_df <- data.frame(
+            symbol = character(0), weight_target = numeric(0),
+            stringsAsFactors = FALSE
+        )
+        return(list(
+            target_weights = tgt_df, cash_weight = 1.0,
+            diag = list(n_risk = 0, method = "empty")
+        ))
+    }
+
+    # Transitional baseline
+    w_baseline <- risk_artifact$w_baseline %||% risk_artifact$w_hrp
+    if (is.null(w_baseline) || length(w_baseline) == 0) {
+        w_baseline <- setNames(rep(1 / n_risk, n_risk), risk_univ)
+    } else {
+        wb <- setNames(rep(0, n_risk), risk_univ)
+        common_wb <- intersect(risk_univ, names(w_baseline))
+        wb[common_wb] <- w_baseline[common_wb]
+        if (sum(wb) <= 0) {
+            wb[] <- 1 / n_risk
+        } else {
+            wb <- wb / sum(wb)
+        }
+        w_baseline <- wb
+    }
+
+    # §11.9 Liquidity-aware caps (if liquidity features available)
+    cap_vec <- setNames(rep(max_weight, n_risk), risk_univ)
+    if (!is.null(liquidity_features) && !is.null(liquidity_features$f_liquidity)) {
+        liq <- liquidity_features$f_liquidity[risk_univ]
+        liq[!is.finite(liq)] <- 0
+        # h_w(ℓ) = max_weight × (0.5 + 0.5 × σ(ℓ - median))
+        liq_med <- median(liq, na.rm = TRUE)
+        liq_scale <- 1 / (1 + exp(-(liq - liq_med)))
+        cap_vec <- max_weight * (0.5 + 0.5 * liq_scale)
+        cap_vec <- pmin(pmax(cap_vec, 0.02), max_weight)
+        names(cap_vec) <- risk_univ
+    }
+
+    # ── Choose optimization path ──
+    method <- "tilt"
+
+    # ARCHITECTURE PATH: use mu_eff directly as alpha
+    use_arch_alpha <- !is.null(forecast_artifact) &&
+        !is.null(forecast_artifact$mu_eff) &&
+        length(forecast_artifact$mu_eff) > 0
+
+    if (use_arch_alpha) {
+        # §13: Portfolio consumes μ_eff directly (no me_forecast_to_alpha re-scaling)
+        alpha <- forecast_artifact$mu_eff
+        alpha_aligned <- setNames(rep(0, n_risk), risk_univ)
+        common_alpha <- intersect(names(alpha), risk_univ)
+        alpha_aligned[common_alpha] <- alpha[common_alpha]
+
+        # Use dynamic optimizer controls
+        spec_qp <- spec_portfolio
+        spec_qp$gamma <- gamma_t
+        spec_qp$turnover_penalty <- tau_t
+        spec_qp$caps$max_weight <- max_weight # Use base max; per-asset caps in post-shaping
+
+        opt <- me_qp_optimize(
+            Sigma, alpha_aligned, w_baseline, gross_exposure,
+            spec_qp, prev_target
+        )
+        w_target <- opt$w
+        method <- paste0("arch_", opt$method)
+    } else if (!is.null(forecast_artifact) && length(forecast_artifact$combined_forecast %||% NULL) > 0) {
+        # LEGACY PATH: use forecast_to_alpha
+        # FALLBACK:portfolio_legacy_alpha_path
+        alpha <- me_forecast_to_alpha(
+            forecast_artifact$combined_forecast,
+            forecast_artifact$confidence,
+            spec_portfolio
+        )
+        alpha_aligned <- setNames(rep(0, n_risk), risk_univ)
+        alpha_aligned[intersect(names(alpha), risk_univ)] <-
+            alpha[intersect(names(alpha), risk_univ)]
+
+        opt <- me_qp_optimize(
+            Sigma, alpha_aligned, w_baseline, gross_exposure,
+            spec_portfolio, prev_target
+        )
+        w_target <- opt$w
+        method <- opt$method
+    } else {
+        # Signal-based tilt path (simplest fallback)
+        # FALLBACK:portfolio_tilt_only
+        combined <- .combine_expert_scores(signal_artifact, gating, spec_portfolio)
+        alpha_aligned <- setNames(rep(0, n_risk), risk_univ)
+        alpha_aligned[intersect(names(combined), risk_univ)] <-
+            combined[intersect(names(combined), risk_univ)]
+
+        w_target <- .tilt_allocation(
+            alpha_aligned, w_baseline, gross_exposure,
+            max_weight, spec_portfolio
+        )
+        method <- "FALLBACK:tilt_signal"
+    }
+
+    # Post-shaping (with per-asset caps if available)
+    effective_cap <- max(cap_vec)
+    w_target <- me_post_shape(w_target, risk_univ, effective_cap,
+        min_weight = 1e-6, gross_exposure
+    )
+
+    # Turnover ceiling
+    if (!is.null(prev_target) && is.data.frame(prev_target)) {
+        w_prev <- setNames(prev_target$weight_target, prev_target$symbol)
+        max_to <- spec_portfolio$max_turnover %||% 0.5
+        w_target <- me_apply_turnover_ceiling(w_target, w_prev, max_to)
+    }
+
+    # Contract: portfolio weights must be a named vector
+    if (is.null(names(w_target))) {
+        stop("me_build_portfolio_target: w_target lost names (NULL).")
+    }
+    if (length(names(w_target)) != length(w_target)) {
+        stop(sprintf(
+            "me_build_portfolio_target: names(w_target) length (%d) != length(w_target) (%d).",
+            length(names(w_target)), length(w_target)
+        ))
+    }
+    if (any(!nzchar(names(w_target)))) {
+        stop("me_build_portfolio_target: w_target contains empty symbol names.")
+    }
+
+    tgt_df <- data.frame(
+        symbol = names(w_target),
+        weight_target = unname(w_target),
+        stringsAsFactors = FALSE
+    )
+    tgt_df <- tgt_df[tgt_df$weight_target > 1e-8, , drop = FALSE]
+    rownames(tgt_df) <- NULL
+
+    actual_risky <- sum(tgt_df$weight_target)
+    actual_cash <- 1 - actual_risky
+
+    list(
+        target_weights = tgt_df,
+        cash_weight = actual_cash,
+        diag = list(
+            n_risk = n_risk, n_active = nrow(tgt_df),
+            gross_exposure = actual_risky,
+            method = method,
+            max_weight_used = max_weight,
+            gamma_used = gamma_t,
+            tau_used = tau_t,
+            liquidity_caps_used = !is.null(liquidity_features),
+            baseline_method = risk_artifact$baseline_method %||% "unknown"
+        )
+    )
+}
+
+# ── Helper: combine expert scores for tilt path ──
+
+.combine_expert_scores <- function(signal_artifact, gating, spec_portfolio) {
+    w_kal <- gating$w_kalman
+    w_tsm <- gating$w_tsmom
+    kalman <- signal_artifact$kalman %||% signal_artifact$s_kal
+    tsmom <- signal_artifact$tsmom %||% signal_artifact$s_mom
+    syms <- unique(c(names(kalman), names(tsmom)))
+    if (length(syms) == 0) {
+        return(setNames(numeric(0), character(0)))
+    }
+    k <- setNames(rep(0, length(syms)), syms)
+    t <- setNames(rep(0, length(syms)), syms)
+    k[names(kalman)] <- kalman
+    t[names(tsmom)] <- tsmom
+    active <- w_kal + w_tsm
+    if (active <= 0) {
+        return(setNames(rep(0, length(syms)), syms))
+    }
+    combined <- (w_kal * k + w_tsm * t) / active
+    combined[!is.finite(combined)] <- 0
+    combined
+}
+
+
+
+###############################################################################
+### FILE: R/09_snapshot_runner.R
+###############################################################################
+#' @title Model Engine — Snapshot Runner
+#' @description Full one-date pipeline orchestrator integrating all modules.
+#' architecture.md §16: end-to-end update flow.
+
+.slice_mat <- function(mat, n) {
+    if (is.null(mat) || nrow(mat) == 0) {
+        return(mat)
+    }
+    tail(mat, min(n, nrow(mat)))
+}
+
+.me_append_feature_snapshot_history <- function(model_state, as_of_date,
+                                                feature_artifact, risk_univ,
+                                                spec_forecast = list(),
+                                                date_idx = NULL) {
+    fh <- NULL
+    if (!is.null(model_state) && is.list(model_state$feature_history)) {
+        fh <- model_state$feature_history
+    }
+    if (is.null(fh) || !is.list(fh)) fh <- list()
+
+    fh$schema <- "asset_feature_snapshots_v2"
+    if (is.null(fh$snapshots) || !is.list(fh$snapshots)) {
+        fh$snapshots <- list()
+    }
+
+    # Build aligned asset x feature matrix snapshot
+    X <- feature_artifact$X
+    if (is.null(X)) {
+        X <- matrix(0,
+            nrow = length(risk_univ), ncol = 0,
+            dimnames = list(risk_univ, character(0))
+        )
+    } else {
+        if (!is.matrix(X)) X <- as.matrix(X)
+        if (is.null(rownames(X))) {
+            stop("feature_artifact$X must have rownames (symbols) for feature history accumulation")
+        }
+        feat_names <- colnames(X)
+        if (is.null(feat_names)) {
+            feat_names <- paste0("f", seq_len(ncol(X)))
+            colnames(X) <- feat_names
+        }
+
+        X_aligned <- matrix(0,
+            nrow = length(risk_univ), ncol = ncol(X),
+            dimnames = list(risk_univ, colnames(X))
+        )
+        common_syms <- intersect(risk_univ, rownames(X))
+        if (length(common_syms) > 0 && ncol(X) > 0) {
+            X_aligned[common_syms, ] <- X[common_syms, , drop = FALSE]
+        }
+        X <- X_aligned
+    }
+
+    # Include date index for training panel builder
+    snap_idx <- length(fh$snapshots) + 1L
+    fh$snapshots[[snap_idx]] <- list(
+        as_of_date = as.Date(as_of_date),
+        date = as.character(as_of_date),
+        date_idx = date_idx %||% snap_idx,
+        X = X
+    )
+
+    # De-duplicate by date (keep latest for same date)
+    snap_dates <- vapply(
+        fh$snapshots,
+        function(s) as.character(s$as_of_date %||% NA),
+        character(1)
+    )
+    if (anyDuplicated(snap_dates)) {
+        keep_idx <- !duplicated(snap_dates, fromLast = TRUE)
+        fh$snapshots <- fh$snapshots[keep_idx]
+    }
+
+    # Retention cap
+    keep_n <- as.integer(spec_forecast$history_snapshots_keep %||% 252L)
+    if (!is.finite(keep_n) || keep_n < 2L) keep_n <- 252L
+    if (length(fh$snapshots) > keep_n) {
+        fh$snapshots <- tail(fh$snapshots, keep_n)
+    }
+
+    fh$n_snapshots <- length(fh$snapshots)
+    fh$last_as_of_date <- as.Date(as_of_date)
+
+    fh
+}
+
+#' @export
+me_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL,
+                            prev_target = NULL, model_state = NULL,
+                            aux = list()) {
+    spec <- me_get_spec(spec)
+    me_validate_spec(spec)
+    me_validate_model_state(model_state)
+
+    if (is.null(prev_target) && !is.null(model_state) && !is.null(model_state$prev_target)) {
+        prev_target <- model_state$prev_target
+    }
+
+    warns <- character(0)
+    runtime_warns <- character(0)
+    fallbacks <- list()
+    architecture_violations <- character(0)
+
+    .w <- function(msg) {
+        warns <<- unique(c(warns, as.character(msg)))
+    }
+
+    .rw <- function(stage, msg) {
+        full <- sprintf("[%s][WARN] %s", stage, as.character(msg))
+        runtime_warns <<- unique(c(runtime_warns, full))
+        warns <<- unique(c(warns, full))
+        if (isTRUE(spec$meta$strict_warnings)) {
+            stop(sprintf("Strict warning mode: %s", full), call. = FALSE)
+        }
+    }
+
+    .fb <- function(stage, code, message, severity = "warn") {
+        entry <- list(
+            stage = as.character(stage),
+            code = as.character(code),
+            message = as.character(message),
+            severity = as.character(severity)
+        )
+        fallbacks[[length(fallbacks) + 1L]] <<- entry
+        .w(sprintf("[%s][FALLBACK:%s] %s", stage, code, message))
+        if (isTRUE(spec$meta$strict_fallbacks)) {
+            stop(sprintf("Strict fallback mode triggered at stage '%s' (%s)", stage, code), call. = FALSE)
+        }
+    }
+
+    .archv <- function(message) {
+        architecture_violations <<- unique(c(architecture_violations, as.character(message)))
+        .w(sprintf("[ARCH] %s", message))
+        if (isTRUE(spec$meta$strict_architecture)) {
+            stop(sprintf("Strict architecture mode: %s", message), call. = FALSE)
+        }
+    }
+
+    .run_stage <- function(stage_name, expr) {
+        withCallingHandlers(
+            tryCatch(
+                expr,
+                error = function(e) {
+                    .w(sprintf("[%s][ERROR] %s", stage_name, conditionMessage(e)))
+                    NULL
+                }
+            ),
+            warning = function(w) {
+                if (isTRUE(spec$meta$capture_stage_warnings %||% TRUE)) {
+                    .rw(stage_name, conditionMessage(w))
+                    invokeRestart("muffleWarning")
+                }
+            }
+        )
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 0: Data adapter + calendar + investability/admissibility
+    # ══════════════════════════════════════════════════════════════════════════
+
+    adapter <- .run_stage("data_adapter", me_make_data_adapter(data_bundle_or_panel, aux))
+    if (is.null(adapter)) stop("Failed to create data adapter")
+
+    cal <- .run_stage("calendar", adapter$calendar())
+    if (is.null(cal) || length(cal) == 0) stop("Empty calendar")
+
+    orig_date <- as_of_date
+    if (!as_of_date %in% cal) {
+        as_of_date <- max(cal[cal <= as_of_date])
+        if (length(as_of_date) == 0 || is.na(as_of_date)) {
+            stop("No calendar dates at or before as_of_date")
+        }
+        .w(sprintf("Snapped as_of_date from %s to %s", orig_date, as_of_date))
+    }
+
+    syms_investable <- .run_stage("investability", adapter$investability_snapshot(as_of_date, spec$data))
+    if (is.null(syms_investable)) syms_investable <- character(0)
+
+    eps_hold <- 1e-8
+    syms_prev_hold <- character(0)
+    if (!is.null(prev_target) && is.data.frame(prev_target) &&
+        all(c("symbol", "weight_target") %in% names(prev_target))) {
+        syms_prev_hold <- prev_target$symbol[is.finite(prev_target$weight_target) & (prev_target$weight_target > eps_hold)]
+        syms_prev_hold <- unique(as.character(syms_prev_hold))
+    }
+    syms <- unique(c(as.character(syms_investable), syms_prev_hold))
+    if (length(setdiff(syms_prev_hold, syms_investable)) > 0) {
+        .w(sprintf(
+            "Admissible universe extended with %d previous holdings outside investability snapshot",
+            length(setdiff(syms_prev_hold, syms_investable))
+        ))
+    }
+
+    .empty_result <- function() {
+        architecture_flags <- list(
+            glasso_residual_precision_configured = isTRUE(spec$risk$resid$use_glasso),
+            glasso_residual_precision_used = FALSE,
+            standardized_path_used = FALSE,
+            factor_alignment_used = FALSE,
+            recursive_factor_cov_used = FALSE,
+            recursive_resid_target_used = FALSE,
+            forecast_stage_executed = FALSE,
+            forecast_method = "none",
+            legacy_hrp_alias_present = FALSE
+        )
+
+        res <- list(
+            as_of_date = as_of_date, tradable_symbols = character(0),
+            target_weights = data.frame(
+                symbol = character(0),
+                weight_target = numeric(0)
+            ),
+            cash_weight = 1.0,
+            risk = list(), signals = list(), market_state = list(),
+            gating = list(), graph = list(), features = list(),
+            forecast = list(), portfolio_diag = list(),
+            meta = list(
+                spec_hash = me_hash_spec(spec),
+                fallbacks = fallbacks,
+                runtime_warnings = runtime_warns,
+                architecture_flags = architecture_flags,
+                architecture_violations = architecture_violations
+            ),
+            model_state_out = list(
+                prev_P_bar = if (!is.null(model_state)) model_state$prev_P_bar else NULL,
+                prev_labels = if (!is.null(model_state)) model_state$prev_labels else NULL,
+                prev_target = data.frame(
+                    symbol = character(0),
+                    weight_target = numeric(0),
+                    stringsAsFactors = FALSE
+                ),
+                feature_history = if (!is.null(model_state) && is.list(model_state$feature_history)) {
+                    model_state$feature_history
+                } else {
+                    NULL
+                },
+                # Carry forward all recursive states on empty
+                ewma_vol_state = if (!is.null(model_state)) model_state$ewma_vol_state else NULL,
+                factor_cov_state = if (!is.null(model_state)) model_state$factor_cov_state else NULL,
+                resid_cov_state = if (!is.null(model_state)) model_state$resid_cov_state else NULL,
+                B_prev = if (!is.null(model_state)) model_state$B_prev else NULL,
+                edge_stability = if (!is.null(model_state)) model_state$edge_stability else NULL,
+                node_stability = if (!is.null(model_state)) model_state$node_stability else NULL,
+                prev_M = if (!is.null(model_state)) model_state$prev_M else NULL,
+                kalman_states = if (!is.null(model_state)) model_state$kalman_states else NULL,
+                scalar_weights = if (!is.null(model_state)) model_state$scalar_weights else NULL,
+                component_model_fits = if (!is.null(model_state)) model_state$component_model_fits else NULL,
+                component_error_states = if (!is.null(model_state)) model_state$component_error_states else NULL,
+                forecast_step = if (!is.null(model_state)) model_state$forecast_step else NULL
+            ),
+            warnings = warns
+        )
+        me_validate_snapshot_artifact(res)
+        res
+    }
+
+    if (length(syms) == 0) {
+        .w("No admissible symbols")
+        return(.empty_result())
+    }
+
+    # ── Compute lookbacks ──
+    lkb_risk <- max(
+        spec$risk$vol$lookback %||% 252L,
+        spec$risk$pca$lookback %||% 252L
+    )
+    lkb_kalman <- spec$signals$kalman$lookback %||% 252L
+    lkb_tsmom <- max(spec$signals$tsmom$horizons %||% 252L)
+    lkb_disp <- spec$market_state$dispersion$lookback %||% 63L
+    lkb_eta <- spec$market_state$eta$lookback %||% 126L
+    lkb_vov <- spec$market_state$vov$lookback %||% 63L
+    lkb_vol <- spec$market_state$vov$vol_lookback %||% 21L
+    max_lkb <- max(
+        lkb_risk, lkb_kalman, lkb_tsmom + 1,
+        lkb_eta, lkb_vov + lkb_vol
+    )
+
+    # ── Fetch price and return matrices ──
+    prices_max <- .run_stage(
+        "price_matrix",
+        adapter$price_matrix(as_of_date, max_lkb + 1, "close", syms, strict = TRUE)
+    )
+
+    if (is.null(prices_max) || ncol(prices_max) == 0) {
+        .w("No complete price history")
+        return(.empty_result())
+    }
+
+    syms <- colnames(prices_max)
+    ret_max <- diff(log(prices_max))
+    ret_max[!is.finite(ret_max)] <- 0
+
+    R_risk <- .slice_mat(ret_max, lkb_risk)
+    P_kalman <- .slice_mat(prices_max, lkb_kalman)
+    R_tsmom <- .slice_mat(ret_max, lkb_tsmom)
+    R_disp <- .slice_mat(ret_max, lkb_disp)
+    R_eta <- .slice_mat(ret_max, lkb_eta)
+    R_vov <- .slice_mat(ret_max, lkb_vov + lkb_vol - 1)
+
+    # Volume matrix (if available from adapter)
+    vol_window <- .run_stage("volume_matrix", tryCatch(
+        adapter$price_matrix(as_of_date, max_lkb + 1, "volume", syms, strict = FALSE),
+        error = function(e) NULL
+    ))
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 1: Risk Engine (§5) — with recursive states
+    # ══════════════════════════════════════════════════════════════════════════
+
+    risk_artifact <- .run_stage(
+        "risk",
+        me_run_risk_engine(R_risk, spec$risk, model_state = model_state)
+    )
+    if (is.null(risk_artifact)) {
+        return(.empty_result())
+    }
+
+    # Ensure horizon covariance matches forecast horizon
+    H_fc <- as.integer(spec$forecast$label_horizon %||% 1L)
+    if (!is.finite(H_fc) || H_fc < 1L) H_fc <- 1L
+
+    if (is.null(risk_artifact$Sigma_risk_1) && !is.null(risk_artifact$Sigma_total)) {
+        risk_artifact$Sigma_risk_1 <- risk_artifact$Sigma_total
+    }
+    if (is.null(risk_artifact$Sigma_risk_H) && !is.null(risk_artifact$Sigma_risk_1)) {
+        risk_artifact$Sigma_risk_H <- H_fc * risk_artifact$Sigma_risk_1
+    } else if (!is.null(risk_artifact$Sigma_risk_1) && !is.null(risk_artifact$Sigma_risk_H) &&
+        H_fc > 1L && identical(risk_artifact$Sigma_risk_H, risk_artifact$Sigma_risk_1)) {
+        risk_artifact$Sigma_risk_H <- H_fc * risk_artifact$Sigma_risk_1
+    }
+
+    rd <- risk_artifact$diag %||% list()
+    if (!is.null(rd$n_assets_dropped) && rd$n_assets_dropped > 0) {
+        .w(sprintf("Risk dropped %d/%d assets", rd$n_assets_dropped, rd$n_assets_input %||% NA_integer_))
+    }
+    if (isTRUE(rd$was_repaired)) .w("Covariance required nearPD repair")
+
+    if (!isTRUE(spec$risk$resid$use_glasso)) {
+        .archv("spec$risk$resid$use_glasso is FALSE (architecture requires Glasso-only residual precision)")
+    }
+    if (!isTRUE(rd$glasso_used)) {
+        .archv(sprintf(
+            "Residual precision not produced by Glasso (method=%s; fallback=%s; reason=%s)",
+            rd$residual_precision_method %||% "unknown",
+            as.character(isTRUE(rd$residual_precision_fallback)),
+            rd$residual_precision_fallback_reason %||% "NA"
+        ))
+    }
+    if (isTRUE(rd$allocator_fallback)) {
+        .fb("risk", "baseline_allocator_fallback", sprintf(
+            "Baseline allocator fallback used (%s)",
+            rd$allocator_fallback_reason %||% (rd$allocator_method %||% "unknown")
+        ))
+    }
+
+    risk_univ <- colnames(risk_artifact$Sigma_risk_H %||% risk_artifact$Sigma_risk_1 %||% risk_artifact$Sigma_total)
+    if (is.null(risk_univ)) risk_univ <- names(risk_artifact$w_baseline %||% risk_artifact$w_hrp)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 2: Graph and Structure (§§5-6, 9-10) — with recursive states
+    # ══════════════════════════════════════════════════════════════════════════
+
+    prev_P_bar <- if (!is.null(model_state)) model_state$prev_P_bar else NULL
+    prev_labels <- if (!is.null(model_state)) model_state$prev_labels else NULL
+
+    spec_graph <- spec$graph %||% list()
+    graph_artifact <- .run_stage(
+        "graph",
+        me_run_graph_pipeline(risk_artifact, spec_graph, prev_P_bar, prev_labels,
+            model_state = model_state
+        )
+    )
+    if (is.null(graph_artifact)) {
+        .fb("graph", "graph_stage_failed", "Graph stage failed; continuing without graph features")
+    } else if (isTRUE(graph_artifact$diag$skipped)) {
+        .fb("graph", "graph_stage_skipped", graph_artifact$diag$reason %||% "unknown")
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 3: Signal Engine (§§7-8) — with recursive Kalman + scalarization
+    # ══════════════════════════════════════════════════════════════════════════
+
+    P_sig <- P_kalman[, intersect(colnames(P_kalman), risk_univ), drop = FALSE]
+    R_sig <- R_tsmom[, intersect(colnames(R_tsmom), risk_univ), drop = FALSE]
+
+    signal_artifact <- .run_stage(
+        "signal",
+        me_run_signal_engine(P_sig, R_sig, risk_artifact,
+            spec$signals,
+            model_state = model_state
+        )
+    )
+
+    if (is.null(signal_artifact)) {
+        .fb("signal", "signal_engine_failed", "Signal engine failed; using zero signals")
+        signal_artifact <- list(
+            s_mom = setNames(rep(0, length(risk_univ)), risk_univ),
+            s_kal = setNames(rep(0, length(risk_univ)), risk_univ),
+            s_fac = setNames(rep(0, length(risk_univ)), risk_univ),
+            s_scalar = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_slope = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_uncertainty = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_innovation = setNames(rep(0, length(risk_univ)), risk_univ),
+            kalman_innov_ratio = setNames(rep(0, length(risk_univ)), risk_univ),
+            diag = list(n_common = length(risk_univ)),
+            signal_state_out = list()
+        )
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 4: State and Gating (§11.5, §12.4) — extended m_t + 5-comp gating
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Build extended m_t (pass full return window — each sub-state uses own lookback)
+    graph_diag_for_state <- if (!is.null(graph_artifact)) graph_artifact$diag else NULL
+    market_state_vec <- .run_stage(
+        "market_state",
+        me_build_market_state_vector(ret_max, spec$market_state,
+            graph_diag = graph_diag_for_state
+        )
+    )
+    if (is.null(market_state_vec)) {
+        market_state_vec <- c(
+            disp = 0, eta = 0, VoV = 0, dens = 0, eto = 0, chi = 0,
+            liq_avg = 0, liq_disp = 0, liq_trend = 0
+        )
+    }
+
+    # Legacy 3-way gating
+    legacy_gating <- .run_stage(
+        "legacy_gating",
+        me_softmax_gating(market_state_vec, spec$gating)
+    )
+    if (is.null(legacy_gating)) {
+        legacy_gating <- list(w_kalman = 0.5, w_tsmom = 0.5, w_cash = 0, gross_exposure = 1.0)
+    }
+
+    # Architecture 5-component gating
+    arch_gating <- .run_stage(
+        "arch_gating",
+        me_softmax_gating_5c(market_state_vec, spec$gating)
+    )
+
+    # Optimizer controls
+    opt_controls <- .run_stage(
+        "optimizer_controls",
+        me_optimizer_controls(market_state_vec, spec$portfolio)
+    )
+
+    state_gating_artifact <- list(
+        market_state = market_state_vec,
+        gating = legacy_gating,
+        arch_gating = arch_gating,
+        optimizer_controls = opt_controls,
+        diag = list(
+            dispersion = market_state_vec["disp"],
+            eta = market_state_vec["eta"],
+            vov = market_state_vec["VoV"]
+        )
+    )
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 5: Feature Engine (§11) — architecture-aligned
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Prepare volume window for liquidity features
+    vol_feat_window <- NULL
+    if (!is.null(vol_window) && ncol(vol_window) > 0) {
+        vol_feat_window <- vol_window[, intersect(colnames(vol_window), risk_univ), drop = FALSE]
+    }
+
+    P_feat <- prices_max[, intersect(colnames(prices_max), risk_univ), drop = FALSE]
+
+    feature_artifact <- .run_stage(
+        "feature",
+        me_assemble_features(
+            signal_artifact, risk_artifact, graph_artifact,
+            market_state_vec, P_feat,
+            volume_window = vol_feat_window
+        )
+    )
+
+    if (is.null(feature_artifact)) {
+        .fb("feature", "feature_engine_failed", "Feature engine failed; using empty feature matrix")
+        feature_artifact <- list(
+            X = data.frame(matrix(0, length(risk_univ), 0, dimnames = list(risk_univ, NULL))),
+            groups = list(),
+            n_features = 0
+        )
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 6: Forecast Engine (§12) — 5-component panel architecture
+    # ══════════════════════════════════════════════════════════════════════════
+
+    spec_forecast <- spec$forecast %||% list()
+
+    # Persist feature snapshots
+    feature_history_out <- .run_stage(
+        "feature_history",
+        .me_append_feature_snapshot_history(
+            model_state = model_state,
+            as_of_date = as_of_date,
+            feature_artifact = feature_artifact,
+            risk_univ = risk_univ,
+            spec_forecast = spec_forecast
+        )
+    )
+
+    if (is.null(feature_history_out)) {
+        .fb(
+            "feature_history", "feature_history_append_failed",
+            "Failed to append feature snapshot history"
+        )
+        if (!is.null(model_state) && is.list(model_state$feature_history)) {
+            feature_history_out <- model_state$feature_history
+        }
+    }
+
+    # Build feature history list for panel builder
+    fh_snapshots <- if (!is.null(feature_history_out) &&
+        is.list(feature_history_out$snapshots)) {
+        feature_history_out$snapshots
+    } else {
+        NULL
+    }
+
+    # Build R_history for panel labels
+    R_history <- ret_max # Full available return history
+
+    forecast_artifact <- .run_stage(
+        "forecast",
+        me_run_forecast_engine(
+            feature_artifact = feature_artifact,
+            risk_artifact = risk_artifact,
+            graph_artifact = graph_artifact,
+            signal_artifact = signal_artifact,
+            market_state_vec = market_state_vec,
+            spec_forecast = spec_forecast,
+            spec_gating = spec$gating,
+            feature_history = fh_snapshots,
+            R_history = R_history,
+            model_state = model_state
+        )
+    )
+
+    if (is.null(forecast_artifact)) {
+        .fb("forecast", "forecast_engine_failed", "Forecast engine failed; portfolio will use signal fallback path")
+    } else {
+        fc_diag <- forecast_artifact$diag %||% list()
+        if (grepl("FALLBACK", fc_diag$method %||% "", fixed = TRUE)) {
+            .fb(
+                "forecast", paste0("forecast_", fc_diag$method),
+                sprintf("Forecast: %s (reason: %s)", fc_diag$method, fc_diag$reason %||% "")
+            )
+        }
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # STAGE 7: Portfolio Construction (§§13-14) — consume μ_eff
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Liquidity features for caps (if available)
+    liq_features_for_port <- NULL
+    if (!is.null(feature_artifact$X) && "f_liquidity" %in% colnames(feature_artifact$X)) {
+        liq_features_for_port <- list(
+            f_liquidity = feature_artifact$X[, "f_liquidity"]
+        )
+    }
+
+    port_artifact <- .run_stage(
+        "portfolio",
+        me_build_portfolio_target(
+            risk_artifact, signal_artifact, state_gating_artifact,
+            spec$portfolio,
+            forecast_artifact = forecast_artifact,
+            graph_artifact = graph_artifact,
+            prev_target = prev_target,
+            optimizer_controls = opt_controls,
+            liquidity_features = liq_features_for_port
+        )
+    )
+
+    if (is.null(port_artifact)) {
+        .fb("portfolio", "portfolio_engine_failed", "Portfolio construction failed; returning empty portfolio")
+        return(.empty_result())
+    }
+
+    pd <- port_artifact$diag %||% list()
+    if (grepl("FALLBACK", pd$method %||% "", fixed = TRUE)) {
+        .fb(
+            "portfolio", paste0("portfolio_", pd$method),
+            sprintf("Portfolio used %s method", pd$method)
+        )
+    }
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # Assemble artifact
+    # ══════════════════════════════════════════════════════════════════════════
+
+    if (isFALSE(spec$meta$retain_windows)) {
+        risk_artifact$E_t <- NULL
+        risk_artifact$F_t <- NULL
+    }
+    if (isFALSE(spec$meta$retain_matrices)) {
+        if (!is.null(risk_artifact$Sigma_risk_H)) {
+            risk_artifact$Sigma_total <- NULL
+            risk_artifact$Sigma_f <- NULL
+            risk_artifact$Sigma_eps <- NULL
+            risk_artifact$Theta_eps <- NULL
+        } else {
+            risk_artifact$Sigma_f <- NULL
+            risk_artifact$Sigma_eps <- NULL
+            risk_artifact$Theta_eps <- NULL
+        }
+    }
+
+    architecture_flags <- list(
+        glasso_residual_precision_configured = isTRUE(spec$risk$resid$use_glasso),
+        glasso_residual_precision_used = isTRUE(rd$glasso_used),
+        standardized_path_used = isTRUE(rd$standardized_path_used),
+        factor_alignment_used = isTRUE(rd$factor_alignment_used),
+        recursive_factor_cov_used = isTRUE(rd$recursive_factor_cov_used),
+        recursive_resid_target_used = isTRUE(rd$recursive_resid_target_used),
+        horizon_covariance_available = !is.null(risk_artifact$Sigma_risk_H),
+        forecast_stage_executed = !is.null(forecast_artifact),
+        forecast_method = if (!is.null(forecast_artifact)) {
+            forecast_artifact$diag$method %||% "unknown"
+        } else {
+            "skipped"
+        },
+        feature_snapshot_history_count = if (!is.null(feature_history_out) &&
+            is.list(feature_history_out$snapshots)) {
+            length(feature_history_out$snapshots)
+        } else {
+            0L
+        },
+        legacy_hrp_alias_present = !is.null(risk_artifact$w_hrp)
+    )
+
+    meta <- list(
+        spec_hash = me_hash_spec(spec),
+        universe_counts = list(
+            investable    = length(syms_investable),
+            admissible    = length(unique(c(syms_investable, syms_prev_hold))),
+            risk_kept     = length(risk_univ),
+            risk_dropped  = length(risk_artifact$diag$dropped_assets %||% character(0)),
+            signal_common = signal_artifact$diag$n_common %||% 0,
+            active_names  = nrow(port_artifact$target_weights)
+        ),
+        feature_info = list(
+            n_features = feature_artifact$n_features %||% ncol(feature_artifact$X %||% matrix(0, 0, 0)),
+            groups = feature_artifact$groups %||% list()
+        ),
+        forecast_info = if (!is.null(forecast_artifact)) forecast_artifact$diag else list(stage = "skipped"),
+        graph_info = if (!is.null(graph_artifact)) graph_artifact$diag else list(),
+        fallbacks = fallbacks,
+        runtime_warnings = runtime_warns,
+        architecture_flags = architecture_flags,
+        architecture_violations = architecture_violations,
+        timestamps = list(
+            as_of_date = as_of_date,
+            snapped = !identical(orig_date, as_of_date)
+        )
+    )
+
+    # ── Collect all recursive state updates ──
+    risk_state <- risk_artifact$risk_state_out %||% list()
+    graph_state <- if (!is.null(graph_artifact)) graph_artifact$graph_state_out %||% list() else list()
+    signal_state <- signal_artifact$signal_state_out %||% list()
+    forecast_state <- if (!is.null(forecast_artifact)) forecast_artifact$forecast_state_out %||% list() else list()
+
+    res <- list(
+        as_of_date = as_of_date,
+        tradable_symbols = risk_univ,
+        target_weights = port_artifact$target_weights,
+        cash_weight = port_artifact$cash_weight,
+        risk = risk_artifact,
+        signals = signal_artifact,
+        market_state = state_gating_artifact$market_state,
+        gating = state_gating_artifact$gating,
+        arch_gating = state_gating_artifact$arch_gating,
+        graph = if (!is.null(graph_artifact)) {
+            list(
+                clustering = graph_artifact$clustering,
+                diag = graph_artifact$diag
+            )
+        } else {
+            list()
+        },
+        features = list(
+            n_features = feature_artifact$n_features %||% 0,
+            groups     = feature_artifact$groups %||% list()
+        ),
+        forecast = if (!is.null(forecast_artifact)) {
+            list(
+                mu_hat = forecast_artifact$mu_hat,
+                mu_eff = forecast_artifact$mu_eff,
+                sigma_hat = forecast_artifact$sigma_hat,
+                s_eff = forecast_artifact$s_eff,
+                confidence = forecast_artifact$confidence,
+                pi_t = forecast_artifact$pi_t,
+                rho_rel = forecast_artifact$rho_rel,
+                method = forecast_artifact$diag$method
+            )
+        } else {
+            list()
+        },
+        portfolio_diag = pd,
+        meta = meta,
+        model_state_out = list(
+            # Graph states
+            prev_P_bar = if (!is.null(graph_artifact)) {
+                graph_artifact$P_bar
+            } else {
+                (if (!is.null(model_state)) model_state$prev_P_bar else NULL)
+            },
+            prev_labels = if (!is.null(graph_artifact) &&
+                !is.null(graph_artifact$clustering) &&
+                !is.null(graph_artifact$clustering$labels)) {
+                graph_artifact$clustering$labels
+            } else {
+                if (!is.null(model_state)) model_state$prev_labels else NULL
+            },
+            # Portfolio state
+            prev_target = port_artifact$target_weights,
+            # Feature history
+            feature_history = feature_history_out,
+            # Risk recursive states
+            ewma_vol_state = risk_state$ewma_vol_state %||%
+                (if (!is.null(model_state)) model_state$ewma_vol_state else NULL),
+            factor_cov_state = risk_state$factor_cov_state %||%
+                (if (!is.null(model_state)) model_state$factor_cov_state else NULL),
+            resid_cov_state = risk_state$resid_cov_state %||%
+                (if (!is.null(model_state)) model_state$resid_cov_state else NULL),
+            B_prev = risk_state$B_prev %||%
+                (if (!is.null(model_state)) model_state$B_prev else NULL),
+            # Graph recursive states
+            edge_stability = graph_state$edge_stability %||%
+                (if (!is.null(model_state)) model_state$edge_stability else NULL),
+            node_stability = graph_state$node_stability %||%
+                (if (!is.null(model_state)) model_state$node_stability else NULL),
+            prev_M = graph_state$prev_M %||%
+                (if (!is.null(model_state)) model_state$prev_M else NULL),
+            chi_t = graph_state$chi_t %||% 0,
+            # Signal recursive states
+            kalman_states = signal_state$kalman_states %||%
+                (if (!is.null(model_state)) model_state$kalman_states else NULL),
+            scalar_weights = signal_state$scalar_weights %||%
+                (if (!is.null(model_state)) model_state$scalar_weights else NULL),
+            # Forecast recursive states
+            component_model_fits = forecast_state$component_model_fits %||%
+                (if (!is.null(model_state)) model_state$component_model_fits else NULL),
+            component_error_states = forecast_state$component_error_states %||%
+                (if (!is.null(model_state)) model_state$component_error_states else NULL),
+            forecast_step = forecast_state$forecast_step %||%
+                (if (!is.null(model_state)) model_state$forecast_step else 0L)
+        ),
+        warnings = unique(warns)
+    )
+
+    me_validate_snapshot_artifact(res)
+    res
+}
+
+
+

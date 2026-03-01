@@ -12,38 +12,25 @@ bt_compute_performance <- function(nav_series) {
 
     nav <- nav_series$nav
     dates <- nav_series$date
-    n <- length(nav)
 
-    # Daily returns
     rets <- diff(log(nav))
     rets <- rets[is.finite(rets)]
-
     if (length(rets) < 2) {
-        return(list(
-            cagr = NA, vol = NA, sharpe = NA, max_dd = NA,
-            calmar = NA, n_days = 0
-        ))
+        return(list(cagr = NA, vol = NA, sharpe = NA, max_dd = NA, calmar = NA, n_days = 0))
     }
 
     n_days <- as.numeric(max(dates) - min(dates))
     years <- n_days / 365.25
     if (years <= 0) years <- 1
 
-    # CAGR
-    cagr <- (nav[n] / nav[1])^(1 / years) - 1
-
-    # Volatility (annualized)
+    cagr <- (nav[length(nav)] / nav[1])^(1 / years) - 1
     vol <- sd(rets) * sqrt(252)
-
-    # Sharpe
     sharpe <- if (vol > 0) cagr / vol else NA
 
-    # Max drawdown
     cum_max <- cummax(nav)
     drawdowns <- nav / cum_max - 1
     max_dd <- min(drawdowns)
 
-    # Calmar
     calmar <- if (!is.na(max_dd) && max_dd < 0) cagr / abs(max_dd) else NA
 
     list(
@@ -53,7 +40,7 @@ bt_compute_performance <- function(nav_series) {
         max_dd   = round(max_dd, 6),
         calmar   = round(calmar, 4),
         n_days   = n_days,
-        n_obs    = n,
+        n_obs    = length(nav),
         start    = min(dates),
         end      = max(dates)
     )
@@ -61,7 +48,7 @@ bt_compute_performance <- function(nav_series) {
 
 #' @export
 bt_compute_analytics <- function(run_artifact) {
-    perf <- bt_compute_performance(run_artifact$nav_series)
+    perf_full <- bt_compute_performance(run_artifact$nav_series)
 
     # Turnover summary
     to <- unlist(run_artifact$turnover_log)
@@ -73,24 +60,28 @@ bt_compute_analytics <- function(run_artifact) {
             total_turnover  = sum(to, na.rm = TRUE)
         )
     } else {
-        list(
-            mean_turnover = NA, median_turnover = NA,
-            max_turnover = NA, total_turnover = NA
-        )
+        list(mean_turnover = NA, median_turnover = NA, max_turnover = NA, total_turnover = NA)
     }
 
     # Cost summary
     cost_total <- 0
     if (length(run_artifact$cost_log) > 0) {
-        cost_total <- sum(vapply(
-            run_artifact$cost_log,
-            function(c) c$total_cost %||% 0,
-            numeric(1)
-        ))
+        cost_total <- sum(vapply(run_artifact$cost_log, function(c) c$total_cost %||% 0, numeric(1)))
+    }
+
+    # Post-ready window (based on first_ready_exec_date)
+    rd <- run_artifact$meta$first_ready_exec_date %||% as.Date(NA)
+    perf_post_ready <- NULL
+    if (!is.na(rd) && is.data.frame(run_artifact$nav_series) && nrow(run_artifact$nav_series) > 1) {
+        nav2 <- run_artifact$nav_series
+        nav2 <- nav2[nav2$date >= rd, , drop = FALSE]
+        if (nrow(nav2) >= 2) perf_post_ready <- bt_compute_performance(nav2)
     }
 
     list(
-        performance = perf,
+        performance_full = perf_full,
+        performance_post_ready = perf_post_ready,
+        first_ready_exec_date = rd,
         turnover = turnover_summary,
         total_costs = cost_total,
         n_rebalances = length(run_artifact$rebalance_log)
@@ -99,22 +90,28 @@ bt_compute_analytics <- function(run_artifact) {
 
 #' @export
 bt_print_summary <- function(analytics) {
-    p <- analytics$performance
+    p <- analytics$performance_full
     cat(sprintf(
-        "Performance: CAGR=%.2f%% Vol=%.2f%% Sharpe=%.2f MaxDD=%.2f%%\n",
+        "FULL: CAGR=%.2f%% Vol=%.2f%% Sharpe=%.2f MaxDD=%.2f%%\n",
         p$cagr * 100, p$vol * 100, p$sharpe, p$max_dd * 100
     ))
     cat(sprintf(
-        "Period: %s to %s (%d days, %d observations)\n",
+        "FULL Period: %s to %s (%d days, %d observations)\n",
         p$start, p$end, p$n_days, p$n_obs
     ))
-    cat(sprintf(
-        "Rebalances: %d | Total Costs: %.2f\n",
-        analytics$n_rebalances, analytics$total_costs
-    ))
+
+    if (!is.null(analytics$performance_post_ready)) {
+        pr <- analytics$performance_post_ready
+        cat(sprintf(
+            "POST-READY (from %s): CAGR=%.2f%% Vol=%.2f%% Sharpe=%.2f MaxDD=%.2f%%\n",
+            as.character(analytics$first_ready_exec_date),
+            pr$cagr * 100, pr$vol * 100, pr$sharpe, pr$max_dd * 100
+        ))
+    } else {
+        cat("POST-READY: not available (model never became ready or insufficient points).\n")
+    }
+
+    cat(sprintf("Rebalances: %d | Total Costs: %.2f\n", analytics$n_rebalances, analytics$total_costs))
     t <- analytics$turnover
-    cat(sprintf(
-        "Turnover: mean=%.4f median=%.4f max=%.4f\n",
-        t$mean_turnover, t$median_turnover, t$max_turnover
-    ))
+    cat(sprintf("Turnover: mean=%.4f median=%.4f max=%.4f\n", t$mean_turnover, t$median_turnover, t$max_turnover))
 }
