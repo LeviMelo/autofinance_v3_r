@@ -1,224 +1,267 @@
-#' @title Backtest Engine — Execution and Costs
-#' @description Convert target weights into trades, simulate fills, apply costs.
-
-# ── Compute target shares ────────────────────────────────────────────────────
+# backtest_engine/R/03_execution_and_costs.R
+# Backtest Engine v3 — strict execution (no missing prices), cash-budget enforced.
 
 #' @export
-bt_compute_target_shares <- function(target_weights, nav, exec_prices) {
+bt_compute_target_shares <- function(target_weights, nav_basis, exec_prices) {
+    if (!is.data.frame(target_weights)) .bt_stop("target_weights_type", "target_weights must be data.frame")
+    if (!is.finite(nav_basis) || nav_basis <= 0) .bt_stop("nav_basis", "nav_basis must be finite > 0")
+
     if (nrow(target_weights) == 0) {
         return(setNames(numeric(0), character(0)))
     }
 
-    syms <- target_weights$symbol
-    w <- target_weights$weight_target
-    names(w) <- syms
+    syms <- as.character(target_weights$symbol)
+    w <- as.numeric(target_weights$weight_target)
+    if (any(is.na(syms) | !nzchar(syms))) .bt_stop("target_symbol", "Invalid symbol in target_weights")
+    if (anyDuplicated(syms) > 0) .bt_stop("target_symbol_dup", "Duplicate symbols in target_weights")
+    if (any(!is.finite(w)) || any(w < 0)) .bt_stop("target_weight", "Invalid weight in target_weights")
 
-    shares <- rep(0, length(syms))
-    names(shares) <- syms
-
+    shares <- setNames(rep(0, length(syms)), syms)
     for (s in syms) {
         p <- exec_prices[s]
-        if (is.na(p) || !is.finite(p) || p <= 0) next
-        notional <- w[s] * nav
-        shares[s] <- floor(notional / p) # whole shares
+        if (!is.finite(p) || p <= 0) .bt_stop("exec_price_missing", paste("Missing/invalid exec price for", s))
+        notional <- w[syms == s][1] * nav_basis
+        shares[s] <- floor(notional / p)
     }
     shares
 }
 
-# ── Generate orders ──────────────────────────────────────────────────────────
-
 #' @export
 bt_generate_orders <- function(current_positions, target_shares) {
-    all_syms <- unique(c(names(current_positions), names(target_shares)))
+    cur_syms <- .bt_clean_symbols(names(current_positions) %||% character(0))
+    tgt_syms <- .bt_clean_symbols(names(target_shares) %||% character(0))
+    all_syms <- unique(c(cur_syms, tgt_syms))
     if (length(all_syms) == 0) {
-        return(data.frame(
-            symbol = character(0), shares_delta = numeric(0),
-            direction = character(0), stringsAsFactors = FALSE
-        ))
+        return(data.frame(symbol = character(0), shares_delta = numeric(0), direction = character(0), stringsAsFactors = FALSE))
     }
 
-    cur <- rep(0, length(all_syms))
-    names(cur) <- all_syms
-    tgt <- rep(0, length(all_syms))
-    names(tgt) <- all_syms
+    cur <- setNames(rep(0, length(all_syms)), all_syms)
+    tgt <- setNames(rep(0, length(all_syms)), all_syms)
 
-    found_cur <- intersect(names(current_positions), all_syms)
-    cur[found_cur] <- current_positions[found_cur]
-    found_tgt <- intersect(names(target_shares), all_syms)
-    tgt[found_tgt] <- target_shares[found_tgt]
+    if (length(cur_syms) > 0) {
+        cur[cur_syms] <- as.numeric(current_positions[cur_syms])
+        cur[!is.finite(cur)] <- 0
+    }
+    if (length(tgt_syms) > 0) {
+        tgt[tgt_syms] <- as.numeric(target_shares[tgt_syms])
+        tgt[!is.finite(tgt)] <- 0
+    }
 
     delta <- tgt - cur
-    active <- delta != 0
-
-    if (!any(active)) {
-        return(data.frame(
-            symbol = character(0), shares_delta = numeric(0),
-            direction = character(0), stringsAsFactors = FALSE
-        ))
+    active <- which(delta != 0)
+    if (length(active) == 0) {
+        return(data.frame(symbol = character(0), shares_delta = numeric(0), direction = character(0), stringsAsFactors = FALSE))
     }
 
     data.frame(
         symbol = all_syms[active],
-        shares_delta = unname(delta[active]),
+        shares_delta = as.numeric(delta[active]),
         direction = ifelse(delta[active] > 0, "buy", "sell"),
         stringsAsFactors = FALSE
     )
 }
 
-# ── Simulate fills ────────────────────────────────────────────────────────────
-
-#' @export
-bt_simulate_fills <- function(orders, exec_prices) {
-    if (nrow(orders) == 0) {
-        return(data.frame(
-            symbol = character(0), shares_filled = numeric(0),
-            fill_price = numeric(0), notional = numeric(0),
-            stringsAsFactors = FALSE
-        ))
-    }
-
-    fills <- orders
-    fills$fill_price <- exec_prices[fills$symbol]
-    fills$shares_filled <- fills$shares_delta # full fill
-    fills$notional <- fills$shares_filled * fills$fill_price
-
-    # Handle missing prices: zero-fill
-    bad <- is.na(fills$fill_price) | !is.finite(fills$fill_price) | fills$fill_price <= 0
-    if (any(bad)) {
-        fills$shares_filled[bad] <- 0
-        fills$fill_price[bad] <- NA_real_
-        fills$notional[bad] <- 0
-    }
-
-    fills[, c("symbol", "shares_filled", "fill_price", "notional", "direction")]
-}
-
-# ── Compute costs ─────────────────────────────────────────────────────────────
-
 #' @export
 bt_compute_costs <- function(fills, spec_costs) {
-    fee_rate <- spec_costs$fee_rate %||% 0.0003
-    slippage_rate <- spec_costs$slippage_rate %||% 0.001
+    fee_rate <- spec_costs$fee_rate %||% 0
+    slip_rate <- spec_costs$slippage_rate %||% 0
+    if (!is.finite(fee_rate) || fee_rate < 0) .bt_stop("fee_rate", "fee_rate must be >= 0")
+    if (!is.finite(slip_rate) || slip_rate < 0) .bt_stop("slip_rate", "slippage_rate must be >= 0")
 
-    if (nrow(fills) == 0) {
+    if (!is.data.frame(fills) || nrow(fills) == 0) {
         return(list(
             total_cost = 0, fee_total = 0, slippage_total = 0,
-            per_symbol = data.frame(
-                symbol = character(0),
-                fee = numeric(0),
-                slippage = numeric(0)
-            )
+            per_symbol = data.frame(symbol = character(0), fee = numeric(0), slippage = numeric(0))
         ))
     }
 
-    abs_notional <- abs(fills$notional)
+    abs_notional <- abs(as.numeric(fills$notional))
     abs_notional[!is.finite(abs_notional)] <- 0
 
     fees <- abs_notional * fee_rate
-    slippage <- abs_notional * slippage_rate
+    slips <- abs_notional * slip_rate
 
     list(
-        total_cost = sum(fees + slippage),
+        total_cost = sum(fees + slips),
         fee_total = sum(fees),
-        slippage_total = sum(slippage),
-        per_symbol = data.frame(
-            symbol = fills$symbol,
-            fee = fees,
-            slippage = slippage,
-            stringsAsFactors = FALSE
-        )
+        slippage_total = sum(slips),
+        per_symbol = data.frame(symbol = fills$symbol, fee = fees, slippage = slips, stringsAsFactors = FALSE)
     )
 }
 
-# ── Full execution orchestrator ───────────────────────────────────────────────
-# Supports optional locked_symbols: those symbols must not be traded even if targeted.
+.bt_price_lookup_strict <- function(exec_prices, syms) {
+    if (any(is.na(syms) | !nzchar(syms))) {
+        bad <- syms[is.na(syms) | !nzchar(syms)]
+        .bt_stop("exec_symbol_invalid", paste("Invalid execution symbol(s):", paste(unique(bad), collapse = ", ")))
+    }
+    px <- exec_prices[syms]
+    if (any(!is.finite(px) | px <= 0)) {
+        bad <- syms[!is.finite(px) | px <= 0]
+        .bt_stop("exec_price_missing", paste("Missing/invalid exec price for:", paste(unique(bad), collapse = ", ")))
+    }
+    px
+}
 
 #' @export
-bt_execute_rebalance <- function(portfolio_state, proposal, exec_prices,
-                                 spec_execution, spec_costs) {
-    fee_rate <- spec_costs$fee_rate %||% 0.0003
-    slip_rate <- spec_costs$slippage_rate %||% 0.0010
-    cost_rate <- fee_rate + slip_rate
+bt_execute_rebalance <- function(portfolio_state, proposal, exec_prices, spec_costs) {
+    # nav basis is mandatory (set by runner at decision time)
+    nav_basis <- proposal$meta$nav_basis %||% NULL
+    if (is.null(nav_basis) || !is.finite(nav_basis) || nav_basis <= 0) {
+        .bt_stop("nav_basis_missing", "proposal$meta$nav_basis is required (runner must set it)")
+    }
 
-    # 1) initial target shares
-    target_shares <- bt_compute_target_shares(
-        proposal$target_weights, portfolio_state$nav, exec_prices
-    )
-
-    # 2) Apply trade locks
+    # apply locks (optional)
     locked <- proposal$locked_symbols %||% character(0)
+    locked <- unique(as.character(locked))
+    locked <- locked[!is.na(locked) & nzchar(locked)]
+    skipped_symbols <- character(0)
+
+    # compute target shares
+    target_shares <- bt_compute_target_shares(proposal$target_weights, nav_basis, exec_prices)
+
     if (length(locked) > 0) {
-        locked <- unique(as.character(locked))
-        cur <- portfolio_state$positions
+        cur <- portfolio_state$positions %||% setNames(numeric(0), character(0))
         for (s in locked) {
             if (s %in% names(cur)) target_shares[s] <- cur[s]
         }
     }
 
-    # 3) Build orders and estimate cash impact
+    # build orders
     orders <- bt_generate_orders(portfolio_state$positions, target_shares)
-    if (nrow(orders) > 0) {
-        px <- exec_prices[orders$symbol]
-        px[!is.finite(px) | px <= 0] <- NA_real_
-        notional <- orders$shares_delta * px
-        notional[!is.finite(notional)] <- 0
-
-        buy_notional <- sum(pmax(notional, 0), na.rm = TRUE)
-        sell_notional <- sum(pmax(-notional, 0), na.rm = TRUE)
-
-        # Costs apply to absolute traded notional
-        est_cost <- cost_rate * sum(abs(notional), na.rm = TRUE)
-
-        cash_after <- portfolio_state$cash + sell_notional - buy_notional - est_cost
-
-        # 4) If would go negative, scale DOWN buys
-        if (is.finite(cash_after) && cash_after < 0 && buy_notional > 0) {
-            # cash available for buys after accounting for sells and estimated sell costs
-            # conservative: reserve cost_rate on sells too
-            cash_avail <- portfolio_state$cash +
-                sell_notional - cost_rate * sell_notional
-
-            # max buy notional allowed including buy-side costs
-            max_buy <- cash_avail / (1 + cost_rate)
-            max_buy <- max(0, max_buy)
-
-            scale <- max_buy / buy_notional
-            scale <- max(0, min(1, scale))
-
-            # scale only BUY orders (shares_delta > 0)
-            buy_idx <- which(orders$shares_delta > 0)
-            if (length(buy_idx) > 0 && scale < 1) {
-                # adjust target_shares for buy symbols
-                for (i in buy_idx) {
-                    sym <- orders$symbol[i]
-                    # reduce towards current position by scaling delta
-                    cur_pos <- portfolio_state$positions[sym] %||% 0
-                    tgt <- target_shares[sym] %||% 0
-                    delta <- tgt - cur_pos
-                    new_tgt <- cur_pos + floor(delta * scale)
-                    target_shares[sym] <- new_tgt
-                }
-            }
-
-            # rebuild orders after scaling
-            orders <- bt_generate_orders(portfolio_state$positions, target_shares)
-        }
+    if (nrow(orders) == 0) {
+        return(list(
+            orders = orders,
+            fills = data.frame(symbol = character(0), shares_filled = numeric(0), fill_price = numeric(0), notional = numeric(0), direction = character(0)),
+            costs = bt_compute_costs(data.frame(), spec_costs),
+            cash_delta = 0,
+            target_shares = target_shares,
+            skipped_symbols = skipped_symbols
+        ))
     }
 
-    # 5) Simulate fills + true costs
-    fills <- bt_simulate_fills(orders, exec_prices)
-    costs <- bt_compute_costs(fills, spec_costs)
+    # use available prices only; orders without a valid fill price are skipped
+    ord_syms <- as.character(orders$symbol)
+    px_all <- exec_prices[ord_syms]
+    ok_px <- is.finite(px_all) & px_all > 0
 
+    if (any(!ok_px)) {
+        miss_syms <- unique(ord_syms[!ok_px])
+        skipped_symbols <- unique(c(skipped_symbols, miss_syms))
+        cur <- portfolio_state$positions %||% setNames(numeric(0), character(0))
+        for (s in miss_syms) {
+            target_shares[s] <- .bt_scalar_or_default(cur[s], 0)
+        }
+
+        keep <- ok_px
+        orders <- orders[keep, , drop = FALSE]
+        px <- as.numeric(px_all[keep])
+        names(px) <- ord_syms[keep]
+    } else {
+        px <- as.numeric(px_all)
+        names(px) <- ord_syms
+    }
+
+    if (nrow(orders) == 0) {
+        return(list(
+            orders = orders,
+            fills = data.frame(symbol = character(0), shares_filled = numeric(0), fill_price = numeric(0), notional = numeric(0), direction = character(0)),
+            costs = bt_compute_costs(data.frame(), spec_costs),
+            cash_delta = 0,
+            target_shares = target_shares,
+            skipped_symbols = skipped_symbols
+        ))
+    }
+
+    notional <- as.numeric(orders$shares_delta) * px
+
+    fee_rate <- spec_costs$fee_rate %||% 0
+    slip_rate <- spec_costs$slippage_rate %||% 0
+    cost_rate <- fee_rate + slip_rate
+
+    buy_notional <- sum(pmax(notional, 0), na.rm = TRUE)
+    sell_notional <- sum(pmax(-notional, 0), na.rm = TRUE)
+
+    # solve cash constraint for buys: B*(1+c) <= cash + S*(1-c)
+    cash0 <- portfolio_state$cash
+    if (!is.finite(cash0)) .bt_stop("cash_invalid", "portfolio_state$cash invalid")
+
+    max_buy <- (cash0 + sell_notional * (1 - cost_rate)) / (1 + cost_rate)
+    max_buy <- max(0, max_buy)
+
+    if (buy_notional > max_buy + 1e-9) {
+        if (buy_notional <= 0) .bt_stop("buy_notional", "Unexpected buy_notional <= 0 in scaling path")
+        scale <- max_buy / buy_notional
+        scale <- max(0, min(1, scale))
+
+        # scale buy deltas only (integer shares)
+        cur <- portfolio_state$positions %||% setNames(numeric(0), character(0))
+        for (i in seq_len(nrow(orders))) {
+            if (orders$shares_delta[i] > 0) {
+                s <- orders$symbol[i]
+                cur_pos <- .bt_scalar_or_default(cur[s], 0)
+                tgt <- .bt_scalar_or_default(target_shares[s], 0)
+                delta <- tgt - cur_pos
+                target_shares[s] <- cur_pos + floor(delta * scale)
+            }
+        }
+        orders <- bt_generate_orders(portfolio_state$positions, target_shares)
+        if (nrow(orders) > 0) {
+            ord_syms <- as.character(orders$symbol)
+            px_all <- exec_prices[ord_syms]
+            ok_px <- is.finite(px_all) & px_all > 0
+            if (any(!ok_px)) {
+                miss_syms <- unique(ord_syms[!ok_px])
+                skipped_symbols <- unique(c(skipped_symbols, miss_syms))
+                cur <- portfolio_state$positions %||% setNames(numeric(0), character(0))
+                for (s in miss_syms) {
+                    target_shares[s] <- .bt_scalar_or_default(cur[s], 0)
+                }
+                keep <- ok_px
+                orders <- orders[keep, , drop = FALSE]
+                px <- as.numeric(px_all[keep])
+                names(px) <- ord_syms[keep]
+            } else {
+                px <- as.numeric(px_all)
+                names(px) <- ord_syms
+            }
+        } else {
+            px <- setNames(numeric(0), character(0))
+        }
+        if (nrow(orders) == 0) {
+            return(list(
+                orders = orders,
+                fills = data.frame(symbol = character(0), shares_filled = numeric(0), fill_price = numeric(0), notional = numeric(0), direction = character(0)),
+                costs = bt_compute_costs(data.frame(), spec_costs),
+                cash_delta = 0,
+                target_shares = target_shares,
+                skipped_symbols = skipped_symbols
+            ))
+        }
+        notional <- as.numeric(orders$shares_delta) * px
+    }
+
+    fills <- data.frame(
+        symbol = orders$symbol,
+        shares_filled = as.numeric(orders$shares_delta),
+        fill_price = as.numeric(px),
+        notional = as.numeric(notional),
+        direction = orders$direction,
+        stringsAsFactors = FALSE
+    )
+
+    costs <- bt_compute_costs(fills, spec_costs)
     cash_delta <- -sum(fills$notional, na.rm = TRUE) - costs$total_cost
+    cash_after <- cash0 + cash_delta
+
+    if (!is.finite(cash_after)) .bt_stop("cash_after_invalid", "cash_after invalid")
+    if (cash_after < -1e-6) .bt_stop("cash_negative", sprintf("Execution violates cash constraint (cash_after=%.6f)", cash_after))
 
     list(
-        decision_date  = proposal$decision_date,
-        execution_date = NA,
-        orders         = orders,
-        fills          = fills,
-        costs          = costs,
-        cash_delta     = cash_delta,
-        target_shares  = target_shares,
-        warnings       = character(0)
+        orders = orders,
+        fills = fills,
+        costs = costs,
+        cash_delta = cash_delta,
+        target_shares = target_shares,
+        skipped_symbols = skipped_symbols
     )
 }

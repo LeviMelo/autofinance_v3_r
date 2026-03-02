@@ -1,0 +1,1740 @@
+Project structure for '/c/Users/Galaxy/LEVI/Projetos R/autofinance_v3_r/backtest_engine':
+===============================================================================
+  R/00_contracts_and_spec.R
+  R/01_data_context_and_clock.R
+  R/02_strategy_adapter_and_bridge.R
+  R/03_execution_and_costs.R
+  R/04_accounting.R
+  R/05_runner.R
+  R/06_analytics.R
+
+
+
+###############################################################################
+### FILE: R/00_contracts_and_spec.R
+###############################################################################
+#' @title Backtest Engine — Contracts and Spec
+#' @description BacktestSpec defaults, validation, and artifact contracts.
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+#' @export
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+.bt_is_scalar_num <- function(x) is.numeric(x) && length(x) == 1L && is.finite(x)
+.bt_is_scalar_int <- function(x) (is.numeric(x) || is.integer(x)) && length(x) == 1L && is.finite(x)
+
+# ── BacktestSpec default ─────────────────────────────────────────────────────
+# Backtester owns: clock, universe, policies, execution, costs, accounting.
+
+#' @export
+bt_spec_default <- function() {
+    list(
+        # ── clock section ──
+        clock = list(
+            freq = "months" # "months", "weeks", "days", or integer (every N days)
+        ),
+
+        # ── universe section (BASE opportunity set U(t)) ──
+        # Must be causal (uses only data <= decision_date).
+        universe = list(
+            # trailing window used for liquidity/coverage filters
+            lookback_days = 63L,
+
+            # require trading on at least this fraction of the lookback window
+            min_days_traded_ratio = 0.75,
+
+            # median traded value threshold over lookback window
+            min_median_traded_value = 5e5,
+
+            # allowed asset types if column exists; otherwise ignored
+            include_types = c("equity", "fii", "etf", "bdr"),
+
+            # optional hard cap: keep top N by median traded value (after filters)
+            max_universe = NULL,
+
+            # require strict close price history on trailing window (for comparability)
+            # If NULL: do not enforce rectangular price history at the backtester layer.
+            min_price_history_days = 252L,
+
+            # always include current holdings symbols in strategy-visible data slice
+            keep_holdings = TRUE
+        ),
+
+        # ── policies section ──
+        # Backtester decides what happens when model isn't ready.
+        policies = list(
+            warmup = list(
+                action = "hold_cash", # "hold_cash" | "baseline" | "allow_trade"
+                baseline_strategy = "all_cash" # "all_cash" | "equal_weight"
+            ),
+            cold_start = list(
+                action = "hold_cash", # "hold_cash" | "baseline" | "allow_trade"
+                baseline_strategy = "all_cash"
+            ),
+
+            # normalization tolerance for proposals
+            weight_tol = 1e-6
+        ),
+
+        # ── execution section ──
+        execution = list(
+            price_field   = "open", # field for execution prices
+            exec_lag      = 1L, # +1 day from decision to execution
+            fill_policy   = "full" # "full" fill assumption
+        ),
+
+        # ── costs section ──
+        costs = list(
+            fee_rate      = 0.0003, # proportional fee
+            slippage_rate = 0.0010 # proportional slippage
+        ),
+
+        # ── accounting section ──
+        accounting = list(
+            initial_nav   = 100000,
+            initial_cash  = 100000,
+            mark_field    = "close" # field for mark-to-market
+        ),
+
+        # ── runner section ──
+        runner = list(
+            mode          = "robust", # "strict" or "robust"
+            verbose       = TRUE
+        ),
+
+        # ── analytics section ──
+        analytics = list(
+            compute_drawdown  = TRUE,
+            compute_turnover  = TRUE
+        ),
+
+        # ── meta section ──
+        meta = list(
+            description = NULL,
+            run_id = NULL,
+            contract_version = "bt_contract_v2"
+        )
+    )
+}
+
+# ── Spec access ──────────────────────────────────────────────────────────────
+
+#' @export
+bt_get_spec <- function(overrides = NULL) {
+    spec <- bt_spec_default()
+    if (!is.null(overrides)) {
+        spec <- utils::modifyList(spec, overrides)
+    }
+    spec
+}
+
+# ── Spec validation ──────────────────────────────────────────────────────────
+
+#' @export
+bt_validate_spec <- function(spec) {
+    req <- c("clock", "universe", "policies", "execution", "costs", "accounting", "runner", "analytics", "meta")
+    miss <- setdiff(req, names(spec))
+    if (length(miss) > 0) stop("BacktestSpec missing: ", paste(miss, collapse = ", "))
+
+    # Clock
+    if (is.null(spec$clock$freq)) stop("clock$freq is required")
+
+    # Universe
+    u <- spec$universe
+    if (!.bt_is_scalar_int(u$lookback_days) || as.integer(u$lookback_days) < 5L) {
+        stop("universe$lookback_days must be integer >= 5")
+    }
+    if (!.bt_is_scalar_num(u$min_days_traded_ratio) || u$min_days_traded_ratio <= 0 || u$min_days_traded_ratio > 1) {
+        stop("universe$min_days_traded_ratio must be in (0,1]")
+    }
+    if (!.bt_is_scalar_num(u$min_median_traded_value) || u$min_median_traded_value < 0) {
+        stop("universe$min_median_traded_value must be >= 0")
+    }
+    if (!is.null(u$max_universe)) {
+        if (!.bt_is_scalar_int(u$max_universe) || as.integer(u$max_universe) < 3L) {
+            stop("universe$max_universe must be NULL or integer >= 3")
+        }
+    }
+    if (!is.null(u$min_price_history_days)) {
+        if (!.bt_is_scalar_int(u$min_price_history_days) || as.integer(u$min_price_history_days) < 5L) {
+            stop("universe$min_price_history_days must be NULL or integer >= 5")
+        }
+    }
+    if (!is.logical(u$keep_holdings) || length(u$keep_holdings) != 1L) {
+        stop("universe$keep_holdings must be TRUE/FALSE")
+    }
+
+    # Policies
+    pol <- spec$policies
+    for (k in c("warmup", "cold_start")) {
+        if (is.null(pol[[k]]$action)) stop("policies$", k, "$action is required")
+        if (!pol[[k]]$action %in% c("hold_cash", "baseline", "allow_trade")) {
+            stop("policies$", k, "$action must be hold_cash|baseline|allow_trade")
+        }
+        if (!pol[[k]]$baseline_strategy %in% c("all_cash", "equal_weight")) {
+            stop("policies$", k, "$baseline_strategy must be all_cash|equal_weight")
+        }
+    }
+    if (!.bt_is_scalar_num(pol$weight_tol) || pol$weight_tol <= 0) stop("policies$weight_tol must be > 0")
+
+    # Execution
+    if (!spec$execution$price_field %in% c("open", "close")) {
+        stop("execution$price_field must be 'open' or 'close'")
+    }
+
+    # Costs
+    if (spec$costs$fee_rate < 0) stop("costs$fee_rate must be >= 0")
+    if (spec$costs$slippage_rate < 0) stop("costs$slippage_rate must be >= 0")
+
+    # Accounting
+    if (spec$accounting$initial_nav <= 0) stop("accounting$initial_nav must be > 0")
+    if (spec$accounting$initial_cash < 0) stop("accounting$initial_cash must be >= 0")
+
+    invisible(spec)
+}
+
+# ── Proposal helpers (readiness + normalization + baseline) ───────────────────
+
+# Readiness contract (OPTIONAL for models, but strongly recommended):
+# proposal$meta$status ∈ { "OK", "WARMUP", "COLD_START", "ERROR" }
+# proposal$meta$ready_to_trade ∈ TRUE/FALSE
+# proposal$meta$reason is optional string.
+
+#' @export
+bt_assess_readiness <- function(proposal) {
+    st <- proposal$meta$status %||% NA_character_
+    rdy <- proposal$meta$ready_to_trade %||% NA
+
+    if (isTRUE(rdy)) {
+        return(list(status = "OK", ready = TRUE, stage = "ok", reason = proposal$meta$reason %||% "ready"))
+    }
+    if (identical(rdy, FALSE)) {
+        # fall back to status to classify stage
+        if (identical(st, "WARMUP")) {
+            return(list(status = "WARMUP", ready = FALSE, stage = "warmup", reason = proposal$meta$reason %||% "warmup"))
+        }
+        if (identical(st, "COLD_START")) {
+            return(list(status = "COLD_START", ready = FALSE, stage = "cold_start", reason = proposal$meta$reason %||% "cold_start"))
+        }
+        if (identical(st, "ERROR")) {
+            return(list(status = "ERROR", ready = FALSE, stage = "error", reason = proposal$meta$reason %||% "error"))
+        }
+        return(list(status = st %||% "NOT_READY", ready = FALSE, stage = "unknown", reason = proposal$meta$reason %||% "not_ready"))
+    }
+
+    # If model doesn't report readiness, we assume it's ready (backward compatible).
+    # This is intentional: otherwise older strategy functions would be forced into warmup mode.
+    if (is.na(st) || !nzchar(st)) st <- "OK"
+    list(status = st, ready = TRUE, stage = "ok", reason = proposal$meta$reason %||% "default_ready")
+}
+
+# Normalize proposal weights to sum exactly to 1 (within tolerance).
+# This is backtester-owned to keep execution protocol consistent across models.
+#' @export
+bt_normalize_proposal <- function(proposal, tol = 1e-6) {
+    tw <- proposal$target_weights
+    if (!is.data.frame(tw)) stop("proposal$target_weights must be data.frame")
+    if (nrow(tw) > 0 && !all(c("symbol", "weight_target") %in% names(tw))) {
+        stop("proposal$target_weights must have symbol, weight_target")
+    }
+
+    # sanitize
+    if (nrow(tw) > 0) {
+        tw$symbol <- as.character(tw$symbol)
+        tw$weight_target <- as.numeric(tw$weight_target)
+        tw <- tw[is.finite(tw$weight_target) & tw$weight_target > 0 & nzchar(tw$symbol), , drop = FALSE]
+    }
+
+    risky <- if (nrow(tw) > 0) sum(tw$weight_target, na.rm = TRUE) else 0
+    cash <- as.numeric(proposal$cash_weight %||% (1 - risky))
+    if (!is.finite(cash)) cash <- 1 - risky
+
+    # clamp cash
+    cash <- max(0, min(1, cash))
+    target_risky <- 1 - cash
+
+    if (risky <= 0 || target_risky <= 0) {
+        proposal$target_weights <- data.frame(symbol = character(0), weight_target = numeric(0))
+        proposal$cash_weight <- 1.0
+        return(proposal)
+    }
+
+    # rescale risky to target_risky
+    tw$weight_target <- tw$weight_target * (target_risky / risky)
+
+    # final correction for numerical drift
+    risky2 <- sum(tw$weight_target, na.rm = TRUE)
+    tot <- risky2 + cash
+    if (abs(tot - 1.0) > tol && risky2 > 0) {
+        tw$weight_target <- tw$weight_target * ((1 - cash) / risky2)
+    }
+
+    proposal$target_weights <- tw
+    proposal$cash_weight <- max(0, 1 - sum(tw$weight_target, na.rm = TRUE))
+    proposal
+}
+
+# Baseline strategy resolver (string -> function)
+#' @export
+bt_resolve_baseline_strategy <- function(name) {
+    nm <- name %||% "all_cash"
+    if (identical(nm, "all_cash")) {
+        return(bt_strategy_all_cash)
+    }
+    if (identical(nm, "equal_weight")) {
+        return(bt_strategy_equal_weight)
+    }
+    stop("Unknown baseline strategy: ", nm)
+}
+
+# Apply backtester policy override (warmup/cold-start) to a proposal.
+# Always preserves strategy_state_out from the original model call.
+#' @export
+bt_apply_policy <- function(proposal, policy_action, baseline_name,
+                            decision_date, data_context, portfolio_state,
+                            strategy_spec, runtime_ctx = list()) {
+    if (policy_action %in% c("allow_trade")) {
+        proposal$meta$bt_override <- FALSE
+        proposal$meta$bt_override_action <- "allow_trade"
+        return(proposal)
+    }
+
+    if (policy_action %in% c("hold_cash")) {
+        proposal$target_weights <- data.frame(symbol = character(0), weight_target = numeric(0))
+        proposal$cash_weight <- 1.0
+        proposal$meta$bt_override <- TRUE
+        proposal$meta$bt_override_action <- "hold_cash"
+        return(proposal)
+    }
+
+    if (policy_action %in% c("baseline")) {
+        base_fn <- bt_resolve_baseline_strategy(baseline_name)
+        # baseline is stateless; do NOT replace strategy_state_out
+        base_prop <- bt_call_strategy(
+            strategy_fn = base_fn,
+            decision_date = decision_date,
+            data_context = data_context,
+            portfolio_state = portfolio_state,
+            strategy_state_in = NULL,
+            strategy_spec = strategy_spec,
+            runtime_ctx = runtime_ctx
+        )
+        # merge baseline portfolio into original proposal
+        proposal$target_weights <- base_prop$target_weights
+        proposal$cash_weight <- base_prop$cash_weight
+        proposal$warnings <- unique(c(proposal$warnings, paste0("BT baseline applied: ", baseline_name)))
+        proposal$meta$bt_override <- TRUE
+        proposal$meta$bt_override_action <- paste0("baseline:", baseline_name)
+        return(proposal)
+    }
+
+    stop("Unknown policy action: ", policy_action)
+}
+
+# ── StrategyProposal validation ──────────────────────────────────────────────
+
+#' @export
+bt_validate_proposal <- function(proposal) {
+    req <- c("decision_date", "target_weights", "cash_weight")
+    miss <- setdiff(req, names(proposal))
+    if (length(miss) > 0) stop("StrategyProposal missing: ", paste(miss, collapse = ", "))
+
+    tgt <- proposal$target_weights
+    if (!is.data.frame(tgt)) stop("target_weights must be a data.frame")
+    if (nrow(tgt) > 0 && !all(c("symbol", "weight_target") %in% names(tgt))) {
+        stop("target_weights must have 'symbol' and 'weight_target' columns")
+    }
+
+    # Optional: locked_symbols (character vector)
+    if (!is.null(proposal$locked_symbols)) {
+        if (!is.character(proposal$locked_symbols)) stop("locked_symbols must be character")
+    }
+
+    # Budget check (runner will normalize; this warns for visibility)
+    risky <- sum(tgt$weight_target, na.rm = TRUE)
+    tot <- risky + proposal$cash_weight
+    if (is.finite(tot) && abs(tot - 1.0) > 1e-3) {
+        warning(sprintf("Proposal weights sum to %.4f (runner will normalize)", tot), call. = FALSE)
+    }
+
+    invisible(proposal)
+}
+
+# ── ExecutionReport validation ───────────────────────────────────────────────
+
+#' @export
+bt_validate_execution <- function(report) {
+    req <- c(
+        "decision_date", "execution_date", "orders", "fills",
+        "costs", "cash_delta"
+    )
+    miss <- setdiff(req, names(report))
+    if (length(miss) > 0) stop("ExecutionReport missing: ", paste(miss, collapse = ", "))
+
+    if (report$execution_date <= report$decision_date) {
+        stop("execution_date must be after decision_date")
+    }
+
+    invisible(report)
+}
+
+# ── PortfolioState validation ────────────────────────────────────────────────
+
+#' @export
+bt_validate_state <- function(state) {
+    req <- c("as_of_date", "positions", "cash", "nav")
+    miss <- setdiff(req, names(state))
+    if (length(miss) > 0) stop("PortfolioState missing: ", paste(miss, collapse = ", "))
+
+    if (state$cash < 0) {
+        warning("Portfolio cash is negative", call. = FALSE)
+    }
+    if (state$nav <= 0) {
+        warning("Portfolio NAV is non-positive", call. = FALSE)
+    }
+
+    invisible(state)
+}
+
+# ── BacktestRunArtifact validation ───────────────────────────────────────────
+
+#' @export
+bt_validate_run_artifact <- function(result) {
+    req <- c("nav_series", "rebalance_log")
+    miss <- setdiff(req, names(result))
+    if (length(miss) > 0) stop("BacktestRunArtifact missing: ", paste(miss, collapse = ", "))
+
+    nav <- result$nav_series
+    if (!is.data.frame(nav) || !all(c("date", "nav") %in% names(nav))) {
+        stop("nav_series must be a data.frame with 'date' and 'nav' columns")
+    }
+
+    invisible(result)
+}
+
+# ── Strategy caller (runtime_ctx optional) ───────────────────────────────────
+# This keeps backwards compatibility with strategy functions that don't accept runtime_ctx.
+
+#' @export
+bt_call_strategy <- function(strategy_fn, decision_date, data_context,
+                             portfolio_state, strategy_state_in,
+                             strategy_spec, runtime_ctx = list()) {
+    fmls <- names(formals(strategy_fn))
+    if (!is.null(fmls) && "runtime_ctx" %in% fmls) {
+        return(strategy_fn(decision_date, data_context, portfolio_state,
+            strategy_state_in, strategy_spec,
+            runtime_ctx = runtime_ctx
+        ))
+    }
+    strategy_fn(decision_date, data_context, portfolio_state, strategy_state_in, strategy_spec)
+}
+
+
+
+###############################################################################
+### FILE: R/01_data_context_and_clock.R
+###############################################################################
+#' @title Backtest Engine — Data Context and Clock
+#' @description Calendar, scheduling, price access, no-lookahead enforcement, base universe selection.
+
+# ── Data context constructor ──────────────────────────────────────────────────
+
+#' @export
+bt_make_data_context <- function(data_bundle_or_panel) {
+    if (!requireNamespace("data.table", quietly = TRUE)) {
+        stop("Package 'data.table' required")
+    }
+
+    if (is.list(data_bundle_or_panel) && "panel_adj_model" %in% names(data_bundle_or_panel)) {
+        dt <- data.table::as.data.table(data_bundle_or_panel$panel_adj_model)
+    } else if (is.data.frame(data_bundle_or_panel)) {
+        dt <- data.table::as.data.table(data_bundle_or_panel)
+    } else {
+        stop("Input must be a data.frame or bundle with 'panel_adj_model'")
+    }
+
+    req <- c("symbol", "refdate", "open", "close")
+    miss <- setdiff(req, names(dt))
+    if (length(miss) > 0) stop("Panel missing: ", paste(miss, collapse = ", "))
+
+    if (!inherits(dt$refdate, "Date")) dt[, refdate := as.Date(refdate)]
+    data.table::setkeyv(dt, c("symbol", "refdate"))
+
+    # Normalize activity columns BOTH ways for downstream compatibility
+    if (!"traded_value" %in% names(dt) && "turnover" %in% names(dt)) dt[, traded_value := turnover]
+    if (!"turnover" %in% names(dt) && "traded_value" %in% names(dt)) dt[, turnover := traded_value]
+
+    if (!"traded_units" %in% names(dt) && "qty" %in% names(dt)) dt[, traded_units := qty]
+    if (!"qty" %in% names(dt) && "traded_units" %in% names(dt)) dt[, qty := traded_units]
+
+    if (!"n_trades" %in% names(dt) && "ntrades" %in% names(dt)) dt[, n_trades := ntrades]
+
+    list(dt = dt)
+}
+
+# ── Calendar ──────────────────────────────────────────────────────────────────
+
+#' @export
+bt_calendar <- function(data_ctx) sort(unique(data_ctx$dt$refdate))
+
+# ── Rebalance schedule ────────────────────────────────────────────────────────
+
+#' @export
+bt_rebalance_dates <- function(calendar, spec_clock) {
+    freq <- spec_clock$freq %||% "months"
+
+    if (length(calendar) < 2) {
+        return(calendar)
+    }
+
+    if (freq == "days") {
+        return(calendar[-1])
+    }
+
+    if (freq == "weeks") {
+        wks <- as.numeric(format(calendar, "%W"))
+        keep <- c(FALSE, diff(wks) != 0)
+        return(calendar[keep])
+    }
+
+    if (freq == "months") {
+        mos <- as.numeric(format(calendar, "%m"))
+        keep <- c(FALSE, diff(mos) != 0)
+        return(calendar[keep])
+    }
+
+    if (is.numeric(freq)) {
+        idx <- seq(1, length(calendar), by = max(1L, as.integer(freq)))
+        return(calendar[idx[-1]])
+    }
+
+    stop("Unsupported clock$freq: ", freq)
+}
+
+# ── Decision → Execution mapping ─────────────────────────────────────────────
+
+#' @export
+bt_map_execution_date <- function(calendar, decision_date, spec_execution) {
+    lag <- spec_execution$exec_lag %||% 1L
+    future <- calendar[calendar > decision_date]
+    if (length(future) < lag) {
+        return(as.Date(NA))
+    }
+    future[lag]
+}
+
+# ── Price fetching ────────────────────────────────────────────────────────────
+
+#' @export
+bt_get_exec_prices <- function(data_ctx, exec_date, price_field, symbols = NULL) {
+    sub <- data_ctx$dt[refdate == exec_date]
+    if (!is.null(symbols)) sub <- sub[symbol %in% symbols]
+
+    prices <- sub[[price_field]]
+    names(prices) <- sub$symbol
+
+    if (!is.null(symbols)) {
+        out <- rep(NA_real_, length(symbols))
+        names(out) <- symbols
+        found <- intersect(symbols, names(prices))
+        out[found] <- prices[found]
+        return(out)
+    }
+    prices
+}
+
+#' @export
+bt_get_mark_prices <- function(data_ctx, mark_date, mark_field = "close", symbols = NULL) {
+    bt_get_exec_prices(data_ctx, mark_date, mark_field, symbols)
+}
+
+# ── No-lookahead data slice ───────────────────────────────────────────────────
+
+#' @export
+bt_as_of_slice <- function(data_ctx, as_of_date) {
+    data_ctx$dt[refdate <= as_of_date]
+}
+
+# ── Universe selection (Backtester-owned base opportunity set) ────────────────
+
+.bt_last_n_dates <- function(calendar, as_of_date, n) {
+    cal <- calendar[calendar <= as_of_date]
+    if (length(cal) < n) {
+        return(NULL)
+    }
+    tail(cal, n)
+}
+
+#' @export
+bt_select_universe <- function(data_ctx, as_of_date, universe_spec) {
+    if (!requireNamespace("data.table", quietly = TRUE)) stop("Need data.table")
+
+    as_of_date <- as.Date(as_of_date)
+    dt <- data_ctx$dt
+    cal <- bt_calendar(data_ctx)
+
+    lb <- as.integer(universe_spec$lookback_days %||% 63L)
+    dates_lb <- .bt_last_n_dates(cal, as_of_date, lb)
+    if (is.null(dates_lb)) {
+        return(list(
+            universe = character(0),
+            status = "WARMUP",
+            reason = sprintf("Universe warmup: need %d days, have %d", lb, sum(cal <= as_of_date)),
+            diag = list(as_of_date = as_of_date, have_days = sum(cal <= as_of_date), need_days = lb)
+        ))
+    }
+
+    sub <- dt[refdate %in% dates_lb]
+    # type filter if available
+    if ("asset_type" %in% names(sub)) {
+        types <- universe_spec$include_types %||% NULL
+        if (!is.null(types)) sub <- sub[asset_type %in% types]
+    }
+
+    # Ensure traded_value exists
+    if (!"traded_value" %in% names(sub)) {
+        if ("turnover" %in% names(sub)) sub[, traded_value := turnover] else sub[, traded_value := NA_real_]
+    }
+
+    # Aggregate liquidity / coverage
+    stats <- sub[, .(
+        n_obs = .N,
+        med_tv = median(traded_value, na.rm = TRUE)
+    ), by = symbol]
+
+    cov_ratio <- stats$n_obs / length(dates_lb)
+    stats[, cov := cov_ratio]
+
+    min_cov <- universe_spec$min_days_traded_ratio %||% 0.75
+    min_tv <- universe_spec$min_median_traded_value %||% 0
+
+    stats <- stats[cov >= min_cov & is.finite(med_tv) & med_tv >= min_tv]
+
+    # Require valid last close on as_of_date (or last available in window if missing on exact day)
+    last_px <- dt[refdate <= as_of_date, .(last_close = tail(close, 1)), by = symbol]
+    stats <- merge(stats, last_px, by = "symbol", all.x = TRUE)
+    stats <- stats[is.finite(last_close) & last_close > 0]
+
+    # Optional: rectangular close price history
+    mph <- universe_spec$min_price_history_days %||% NULL
+    if (!is.null(mph)) {
+        mph <- as.integer(mph)
+        dates_ph <- .bt_last_n_dates(cal, as_of_date, mph)
+        if (is.null(dates_ph)) {
+            return(list(
+                universe = character(0),
+                status = "WARMUP",
+                reason = sprintf("Price-history warmup: need %d days, have %d", mph, sum(cal <= as_of_date)),
+                diag = list(as_of_date = as_of_date, have_days = sum(cal <= as_of_date), need_days = mph)
+            ))
+        }
+
+        cand <- stats$symbol
+        subp <- dt[symbol %in% cand & refdate %in% dates_ph, .(n_obs = .N, n_finite = sum(is.finite(close) & close > 0)), by = symbol]
+        subp <- subp[n_obs == length(dates_ph) & n_finite == length(dates_ph)]
+        stats <- stats[symbol %in% subp$symbol]
+    }
+
+    # Optional cap by liquidity rank
+    maxu <- universe_spec$max_universe %||% NULL
+    if (!is.null(maxu)) {
+        maxu <- as.integer(maxu)
+        data.table::setorder(stats, -med_tv)
+        stats <- head(stats, maxu)
+    }
+
+    u <- unique(as.character(stats$symbol))
+    u <- u[!is.na(u) & nzchar(u)]
+
+    list(
+        universe = u,
+        status = "OK",
+        reason = "ok",
+        diag = list(
+            as_of_date = as_of_date,
+            lookback_days = lb,
+            n_universe = length(u),
+            min_cov = min_cov,
+            min_median_traded_value = min_tv,
+            min_price_history_days = mph %||% NA_integer_
+        )
+    )
+}
+
+# ── Tradability mask (optional; useful for models) ────────────────────────────
+
+#' @export
+bt_tradability_mask <- function(data_ctx, as_of_date, symbols) {
+    if (!requireNamespace("data.table", quietly = TRUE)) stop("Need data.table")
+    as_of_date <- as.Date(as_of_date)
+
+    dt <- data_ctx$dt[refdate == as_of_date & symbol %in% symbols]
+    if (nrow(dt) == 0) {
+        out <- setNames(rep(FALSE, length(symbols)), symbols)
+        return(out)
+    }
+
+    # Ensure fields exist
+    if (!"traded_value" %in% names(dt) && "turnover" %in% names(dt)) dt[, traded_value := turnover]
+    if (!"n_trades" %in% names(dt) && "ntrades" %in% names(dt)) dt[, n_trades := ntrades]
+    if (!"n_trades" %in% names(dt)) dt[, n_trades := NA_real_]
+    if (!"traded_value" %in% names(dt)) dt[, traded_value := NA_real_]
+
+    tv <- dt$traded_value
+    names(tv) <- dt$symbol
+    nt <- dt$n_trades
+    names(nt) <- dt$symbol
+    cl <- dt$close
+    names(cl) <- dt$symbol
+
+    out <- setNames(rep(FALSE, length(symbols)), symbols)
+    out[names(tv)] <- (is.finite(tv) & tv > 0) & (is.finite(nt) & nt > 0) & (is.finite(cl) & cl > 0)
+    out
+}
+
+# ── Build strategy-visible context (no-lookahead + base universe + holdings) ─
+
+#' @export
+bt_build_strategy_context <- function(data_ctx, decision_date, base_universe,
+                                      holdings_symbols = character(0), keep_holdings = TRUE) {
+    decision_date <- as.Date(decision_date)
+
+    syms <- base_universe
+    if (isTRUE(keep_holdings) && length(holdings_symbols) > 0) {
+        syms <- unique(c(syms, holdings_symbols))
+    }
+
+    dt_slice <- bt_as_of_slice(data_ctx, decision_date)
+    dt_slice <- dt_slice[symbol %in% syms]
+
+    list(
+        dt = dt_slice,
+        decision_date = decision_date,
+        universe = base_universe
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/02_strategy_adapter_and_bridge.R
+###############################################################################
+#' @title Backtest Engine — Strategy Adapter and Bridge
+#' @description Model-agnostic strategy interface with built-in adapters.
+
+# ── Equal-weight adapter ──────────────────────────────────────────────────────
+
+#' @export
+bt_strategy_equal_weight <- function(decision_date, data_context,
+                                     portfolio_state, strategy_state_in,
+                                     strategy_spec, runtime_ctx = list()) {
+    decision_date <- as.Date(decision_date)
+
+    sub <- data_context$dt[refdate == decision_date]
+    syms <- unique(sub$symbol)
+    syms <- syms[!is.na(syms) & nchar(syms) > 0]
+
+    if (length(syms) == 0) {
+        return(list(
+            decision_date = decision_date,
+            target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+            cash_weight = 1.0,
+            warnings = "No symbols on decision date",
+            diagnostics = list(),
+            strategy_state_out = strategy_state_in,
+            meta = list(strategy = "equal_weight", status = "WARMUP", ready_to_trade = FALSE, reason = "no_symbols")
+        ))
+    }
+
+    w <- rep(1 / length(syms), length(syms))
+    names(w) <- syms
+
+    list(
+        decision_date = decision_date,
+        target_weights = data.frame(symbol = syms, weight_target = w, stringsAsFactors = FALSE),
+        cash_weight = 0.0,
+        warnings = character(0),
+        diagnostics = list(n_symbols = length(syms)),
+        strategy_state_out = strategy_state_in,
+        meta = list(strategy = "equal_weight", status = "OK", ready_to_trade = TRUE, reason = "ok")
+    )
+}
+
+# ── All-cash adapter ──────────────────────────────────────────────────────────
+
+#' @export
+bt_strategy_all_cash <- function(decision_date, data_context,
+                                 portfolio_state, strategy_state_in,
+                                 strategy_spec, runtime_ctx = list()) {
+    decision_date <- as.Date(decision_date)
+    list(
+        decision_date = decision_date,
+        target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+        cash_weight = 1.0,
+        warnings = character(0),
+        diagnostics = list(),
+        strategy_state_out = strategy_state_in,
+        meta = list(strategy = "all_cash", status = "OK", ready_to_trade = TRUE, reason = "cash")
+    )
+}
+
+# ── Model-engine adapter (CAME) ─────────────────────────────────────────────
+
+# NOTE:
+# - Backtester owns warmup/cold-start policy enforcement.
+# - This adapter reports readiness via proposal$meta$status and ready_to_trade.
+# - It still runs CAME catch-up internally because the current runner calls strategies only on rebalance dates.
+
+#' @export
+bt_strategy_from_model_engine <- function(decision_date, data_context,
+                                          portfolio_state, strategy_state_in,
+                                          strategy_spec, runtime_ctx = list()) {
+    decision_date <- as.Date(decision_date)
+
+    # ---- initialize / restore CAME state ----
+    came_state <- NULL
+    last_model_date <- as.Date(NA)
+
+    if (!is.null(strategy_state_in) && is.list(strategy_state_in)) {
+        if (!is.null(strategy_state_in$came_state)) came_state <- strategy_state_in$came_state
+        if (!is.null(strategy_state_in$last_model_date)) last_model_date <- as.Date(strategy_state_in$last_model_date)
+    }
+    if (is.null(came_state)) came_state <- came_state_init()
+
+    # ---- build trading calendar up to decision_date ----
+    cal <- sort(unique(data_context$dt$refdate))
+    cal <- cal[cal <= decision_date]
+    if (length(cal) == 0) {
+        return(list(
+            decision_date = decision_date,
+            target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+            cash_weight = 1.0,
+            warnings = "No calendar data up to decision_date",
+            diagnostics = list(),
+            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+            meta = list(strategy = "came", status = "WARMUP", ready_to_trade = FALSE, reason = "no_calendar")
+        ))
+    }
+
+    # ---- CAME minimum warmup requirement (model-specific readiness) ----
+    L <- as.integer(strategy_spec$risk$lookback %||% 252L)
+    H <- as.integer(strategy_spec$forecast$H %||% 21L)
+    mom_h <- strategy_spec$signals$mom_horizons %||% c(21L, 63L, 126L, 252L)
+
+    need_days <- max(L, max(as.integer(mom_h)), 63L) + H + 5L + 1L
+    if (length(cal) < need_days) {
+        return(list(
+            decision_date = decision_date,
+            target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+            cash_weight = 1.0,
+            warnings = sprintf("CAME warmup: have %d need %d", length(cal), need_days),
+            diagnostics = list(have_days = length(cal), need_days = need_days),
+            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+            meta = list(strategy = "came", status = "WARMUP", ready_to_trade = FALSE, reason = "insufficient_history")
+        ))
+    }
+
+    first_run_date <- cal[need_days]
+
+    # ---- decide which days to run (catch-up) ----
+    if (is.na(last_model_date) || last_model_date < first_run_date) {
+        run_dates <- cal[cal >= first_run_date]
+    } else {
+        run_dates <- cal[cal > last_model_date]
+    }
+    run_dates <- run_dates[run_dates <= decision_date]
+
+    # If nothing to do: return current holdings (executed reality)
+    if (length(run_dates) == 0) {
+        w_hold <- bt_compute_weights(portfolio_state)
+        tw <- data.frame(symbol = names(w_hold), weight_target = as.numeric(w_hold), stringsAsFactors = FALSE)
+        tw <- tw[is.finite(tw$weight_target) & tw$weight_target > 0, , drop = FALSE]
+        cw <- max(0, 1 - sum(tw$weight_target, na.rm = TRUE))
+
+        return(list(
+            decision_date = decision_date,
+            target_weights = tw,
+            cash_weight = cw,
+            warnings = character(0),
+            diagnostics = list(catchup_days = 0L, reused_holdings = TRUE),
+            strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+            meta = list(strategy = "came", status = "OK", ready_to_trade = TRUE, reason = "no_new_days")
+        ))
+    }
+
+    # ---- for turnover/frozen-carry correctness, use ACTUAL holdings as prev_target on the trade day ----
+    w_hold <- bt_compute_weights(portfolio_state)
+    prev_target_trade <- data.frame(
+        symbol = names(w_hold),
+        weight_target = as.numeric(w_hold),
+        stringsAsFactors = FALSE
+    )
+    prev_target_trade <- prev_target_trade[is.finite(prev_target_trade$weight_target) & prev_target_trade$weight_target > 0, , drop = FALSE]
+
+    # ---- run catch-up days in no-trade mode, final day in trade mode ----
+    snap <- NULL
+    n_catch <- 0L
+
+    for (d in run_dates) {
+        is_last <- identical(as.Date(d), decision_date)
+
+        spec_d <- strategy_spec
+        if (is.null(spec_d$meta)) spec_d$meta <- list()
+
+        # Backtester should never hard-stop for readiness; keep CAME internally permissive.
+        spec_d$meta$strict <- FALSE
+        spec_d$forecast$cold_start_policy <- "skip"
+
+        # prevent internal trading on catch-up days (state updates only)
+        spec_d$meta$no_trade <- !is_last
+
+        pt <- if (is_last) prev_target_trade else NULL
+
+        snap <- tryCatch(
+            came_run_snapshot(
+                data_bundle_or_panel = data_context$dt,
+                as_of_date = d,
+                spec = spec_d,
+                state = came_state,
+                prev_target = pt
+            ),
+            error = function(e) e
+        )
+
+        if (inherits(snap, "error")) {
+            return(list(
+                decision_date = decision_date,
+                target_weights = data.frame(symbol = character(0), weight_target = numeric(0)),
+                cash_weight = 1.0,
+                warnings = paste("CAME failed on", as.character(d), ":", conditionMessage(snap)),
+                diagnostics = list(failed_date = as.character(d)),
+                strategy_state_out = list(came_state = came_state, last_model_date = last_model_date),
+                meta = list(strategy = "came", status = "ERROR", ready_to_trade = FALSE, reason = "came_error")
+            ))
+        }
+
+        came_state <- snap$state_out
+        last_model_date <- as.Date(d)
+        n_catch <- n_catch + 1L
+    }
+
+    # ---- readiness (report only; backtester enforces) ----
+    cold <- isTRUE(snap$forecast$diag$cold_start %||% FALSE)
+    panel_n <- snap$forecast$diag$panel_n %||% 0L
+
+    if (cold || panel_n == 0L) {
+        status <- "COLD_START"
+        ready <- FALSE
+        reason <- sprintf("forecast_not_fitted(panel_n=%d)", as.integer(panel_n))
+    } else {
+        status <- "OK"
+        ready <- TRUE
+        reason <- "ok"
+    }
+
+    # Always return model target; backtester decides whether to trade.
+    target_weights <- snap$weights
+    cash_weight <- snap$cash_weight
+
+    list(
+        decision_date = decision_date,
+        target_weights = target_weights,
+        cash_weight = cash_weight,
+        warnings = character(0),
+        diagnostics = list(
+            catchup_days = n_catch,
+            panel_n = panel_n,
+            cold_start = cold,
+            gating_pi = snap$forecast$pi,
+            m_t = snap$m_t,
+            base_universe_n = length(runtime_ctx$base_universe %||% character(0))
+        ),
+        strategy_state_out = list(
+            came_state = came_state,
+            last_model_date = last_model_date
+        ),
+        meta = list(
+            strategy = "came",
+            status = status,
+            ready_to_trade = ready,
+            reason = reason,
+            spec_hash = snap$meta$spec_hash,
+            contract_version = "came_proposal_v1"
+        ),
+        # Optional: forbid trading non-tradables if you want (keep NULL for now)
+        locked_symbols = NULL
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/03_execution_and_costs.R
+###############################################################################
+#' @title Backtest Engine — Execution and Costs
+#' @description Convert target weights into trades, simulate fills, apply costs.
+
+# ── Compute target shares ────────────────────────────────────────────────────
+
+#' @export
+bt_compute_target_shares <- function(target_weights, nav, exec_prices) {
+    if (nrow(target_weights) == 0) {
+        return(setNames(numeric(0), character(0)))
+    }
+
+    syms <- target_weights$symbol
+    w <- target_weights$weight_target
+    names(w) <- syms
+
+    shares <- rep(0, length(syms))
+    names(shares) <- syms
+
+    for (s in syms) {
+        p <- exec_prices[s]
+        if (is.na(p) || !is.finite(p) || p <= 0) next
+        notional <- w[s] * nav
+        shares[s] <- floor(notional / p) # whole shares
+    }
+    shares
+}
+
+# ── Generate orders ──────────────────────────────────────────────────────────
+
+#' @export
+bt_generate_orders <- function(current_positions, target_shares) {
+    all_syms <- unique(c(names(current_positions), names(target_shares)))
+    if (length(all_syms) == 0) {
+        return(data.frame(
+            symbol = character(0), shares_delta = numeric(0),
+            direction = character(0), stringsAsFactors = FALSE
+        ))
+    }
+
+    cur <- rep(0, length(all_syms))
+    names(cur) <- all_syms
+    tgt <- rep(0, length(all_syms))
+    names(tgt) <- all_syms
+
+    found_cur <- intersect(names(current_positions), all_syms)
+    cur[found_cur] <- current_positions[found_cur]
+    found_tgt <- intersect(names(target_shares), all_syms)
+    tgt[found_tgt] <- target_shares[found_tgt]
+
+    delta <- tgt - cur
+    active <- delta != 0
+
+    if (!any(active)) {
+        return(data.frame(
+            symbol = character(0), shares_delta = numeric(0),
+            direction = character(0), stringsAsFactors = FALSE
+        ))
+    }
+
+    data.frame(
+        symbol = all_syms[active],
+        shares_delta = unname(delta[active]),
+        direction = ifelse(delta[active] > 0, "buy", "sell"),
+        stringsAsFactors = FALSE
+    )
+}
+
+# ── Simulate fills ────────────────────────────────────────────────────────────
+
+#' @export
+bt_simulate_fills <- function(orders, exec_prices) {
+    if (nrow(orders) == 0) {
+        return(data.frame(
+            symbol = character(0), shares_filled = numeric(0),
+            fill_price = numeric(0), notional = numeric(0),
+            stringsAsFactors = FALSE
+        ))
+    }
+
+    fills <- orders
+    fills$fill_price <- exec_prices[fills$symbol]
+    fills$shares_filled <- fills$shares_delta # full fill
+    fills$notional <- fills$shares_filled * fills$fill_price
+
+    # Handle missing prices: zero-fill
+    bad <- is.na(fills$fill_price) | !is.finite(fills$fill_price) | fills$fill_price <= 0
+    if (any(bad)) {
+        fills$shares_filled[bad] <- 0
+        fills$fill_price[bad] <- NA_real_
+        fills$notional[bad] <- 0
+    }
+
+    fills[, c("symbol", "shares_filled", "fill_price", "notional", "direction")]
+}
+
+# ── Compute costs ─────────────────────────────────────────────────────────────
+
+#' @export
+bt_compute_costs <- function(fills, spec_costs) {
+    fee_rate <- spec_costs$fee_rate %||% 0.0003
+    slippage_rate <- spec_costs$slippage_rate %||% 0.001
+
+    if (nrow(fills) == 0) {
+        return(list(
+            total_cost = 0, fee_total = 0, slippage_total = 0,
+            per_symbol = data.frame(
+                symbol = character(0),
+                fee = numeric(0),
+                slippage = numeric(0)
+            )
+        ))
+    }
+
+    abs_notional <- abs(fills$notional)
+    abs_notional[!is.finite(abs_notional)] <- 0
+
+    fees <- abs_notional * fee_rate
+    slippage <- abs_notional * slippage_rate
+
+    list(
+        total_cost = sum(fees + slippage),
+        fee_total = sum(fees),
+        slippage_total = sum(slippage),
+        per_symbol = data.frame(
+            symbol = fills$symbol,
+            fee = fees,
+            slippage = slippage,
+            stringsAsFactors = FALSE
+        )
+    )
+}
+
+# ── Full execution orchestrator ───────────────────────────────────────────────
+# Supports optional locked_symbols: those symbols must not be traded even if targeted.
+
+#' @export
+bt_execute_rebalance <- function(portfolio_state, proposal, exec_prices,
+                                 spec_execution, spec_costs) {
+    fee_rate <- spec_costs$fee_rate %||% 0.0003
+    slip_rate <- spec_costs$slippage_rate %||% 0.0010
+    cost_rate <- fee_rate + slip_rate
+
+    # 1) initial target shares
+    target_shares <- bt_compute_target_shares(
+        proposal$target_weights, portfolio_state$nav, exec_prices
+    )
+
+    # 2) Apply trade locks
+    locked <- proposal$locked_symbols %||% character(0)
+    if (length(locked) > 0) {
+        locked <- unique(as.character(locked))
+        cur <- portfolio_state$positions
+        for (s in locked) {
+            if (s %in% names(cur)) target_shares[s] <- cur[s]
+        }
+    }
+
+    # 3) Build orders and estimate cash impact
+    orders <- bt_generate_orders(portfolio_state$positions, target_shares)
+    if (nrow(orders) > 0) {
+        px <- exec_prices[orders$symbol]
+        px[!is.finite(px) | px <= 0] <- NA_real_
+        notional <- orders$shares_delta * px
+        notional[!is.finite(notional)] <- 0
+
+        buy_notional <- sum(pmax(notional, 0), na.rm = TRUE)
+        sell_notional <- sum(pmax(-notional, 0), na.rm = TRUE)
+
+        # Costs apply to absolute traded notional
+        est_cost <- cost_rate * sum(abs(notional), na.rm = TRUE)
+
+        cash_after <- portfolio_state$cash + sell_notional - buy_notional - est_cost
+
+        # 4) If would go negative, scale DOWN buys
+        if (is.finite(cash_after) && cash_after < 0 && buy_notional > 0) {
+            # cash available for buys after accounting for sells and estimated sell costs
+            # conservative: reserve cost_rate on sells too
+            cash_avail <- portfolio_state$cash +
+                sell_notional - cost_rate * sell_notional
+
+            # max buy notional allowed including buy-side costs
+            max_buy <- cash_avail / (1 + cost_rate)
+            max_buy <- max(0, max_buy)
+
+            scale <- max_buy / buy_notional
+            scale <- max(0, min(1, scale))
+
+            # scale only BUY orders (shares_delta > 0)
+            buy_idx <- which(orders$shares_delta > 0)
+            if (length(buy_idx) > 0 && scale < 1) {
+                # adjust target_shares for buy symbols
+                for (i in buy_idx) {
+                    sym <- orders$symbol[i]
+                    # reduce towards current position by scaling delta
+                    cur_pos <- portfolio_state$positions[sym] %||% 0
+                    tgt <- target_shares[sym] %||% 0
+                    delta <- tgt - cur_pos
+                    new_tgt <- cur_pos + floor(delta * scale)
+                    target_shares[sym] <- new_tgt
+                }
+            }
+
+            # rebuild orders after scaling
+            orders <- bt_generate_orders(portfolio_state$positions, target_shares)
+        }
+    }
+
+    # 5) Simulate fills + true costs
+    fills <- bt_simulate_fills(orders, exec_prices)
+    costs <- bt_compute_costs(fills, spec_costs)
+
+    cash_delta <- -sum(fills$notional, na.rm = TRUE) - costs$total_cost
+
+    list(
+        decision_date  = proposal$decision_date,
+        execution_date = NA,
+        orders         = orders,
+        fills          = fills,
+        costs          = costs,
+        cash_delta     = cash_delta,
+        target_shares  = target_shares,
+        warnings       = character(0)
+    )
+}
+
+
+
+###############################################################################
+### FILE: R/04_accounting.R
+###############################################################################
+#' @title Backtest Engine — Accounting
+#' @description Portfolio state management: positions (shares), cash, NAV, MTM.
+
+# ── Initialize portfolio state ────────────────────────────────────────────────
+
+#' @export
+bt_init_portfolio_state <- function(initial_nav, initial_cash = NULL) {
+    if (is.null(initial_cash)) initial_cash <- initial_nav
+    list(
+        as_of_date  = as.Date(NA),
+        positions   = setNames(numeric(0), character(0)), # shares by symbol
+        cash        = initial_cash,
+        nav         = initial_nav,
+        mark_prices = setNames(numeric(0), character(0))
+    )
+}
+
+# ── Apply fills to state ──────────────────────────────────────────────────────
+
+#' @export
+bt_apply_fills <- function(state, exec_report) {
+    fills <- exec_report$fills
+    if (nrow(fills) == 0) {
+        return(state)
+    }
+
+    pos <- state$positions
+
+    for (i in seq_len(nrow(fills))) {
+        sym <- fills$symbol[i]
+        delta <- fills$shares_filled[i]
+        if (is.na(delta) || !is.finite(delta)) next
+
+        if (sym %in% names(pos)) {
+            pos[sym] <- pos[sym] + delta
+        } else {
+            pos[sym] <- delta
+        }
+    }
+
+    # Remove zero positions
+    pos <- pos[pos != 0]
+
+    # Update cash
+    state$cash <- state$cash + exec_report$cash_delta
+    state$positions <- pos
+    state
+}
+
+# ── Mark-to-market ────────────────────────────────────────────────────────────
+
+#' @export
+bt_mark_to_market <- function(state, mark_prices, mark_date) {
+    pos <- state$positions
+    if (length(pos) == 0) {
+        state$nav <- state$cash
+        state$as_of_date <- mark_date
+        state$mark_prices <- mark_prices
+        return(state)
+    }
+
+    # Align prices to positions
+    syms <- names(pos)
+    mp <- rep(NA_real_, length(syms))
+    names(mp) <- syms
+    found <- intersect(syms, names(mark_prices))
+    mp[found] <- mark_prices[found]
+
+    # Use last known price for missing
+    if (!is.null(state$mark_prices) && length(state$mark_prices) > 0) {
+        still_missing <- syms[is.na(mp)]
+        for (s in still_missing) {
+            if (s %in% names(state$mark_prices) && is.finite(state$mark_prices[s])) {
+                mp[s] <- state$mark_prices[s]
+            }
+        }
+    }
+
+    # Compute NAV
+    pos_value <- sum(pos * mp, na.rm = TRUE)
+    state$nav <- pos_value + state$cash
+    state$as_of_date <- mark_date
+    state$mark_prices <- mp
+    state
+}
+
+# ── Compute current weights ───────────────────────────────────────────────────
+
+#' @export
+bt_compute_weights <- function(state) {
+    if (state$nav <= 0 || length(state$positions) == 0) {
+        return(setNames(numeric(0), character(0)))
+    }
+
+    values <- state$positions * state$mark_prices[names(state$positions)]
+    values[!is.finite(values)] <- 0
+    values / state$nav
+}
+
+# ── Compute turnover ──────────────────────────────────────────────────────────
+
+#' @export
+bt_compute_turnover <- function(weights_before, weights_after) {
+    all_syms <- unique(c(names(weights_before), names(weights_after)))
+    if (length(all_syms) == 0) {
+        return(0)
+    }
+
+    wb <- rep(0, length(all_syms))
+    names(wb) <- all_syms
+    wa <- rep(0, length(all_syms))
+    names(wa) <- all_syms
+
+    wb[names(weights_before)] <- weights_before
+    wa[names(weights_after)] <- weights_after
+
+    sum(abs(wa - wb)) / 2
+}
+
+
+
+###############################################################################
+### FILE: R/05_runner.R
+###############################################################################
+#' @title Backtest Engine — Runner
+#' @description Walk-forward simulation loop with stateful strategy support,
+#'              backtester-owned universe selection and readiness policies.
+
+#' @export
+bt_run_backtest <- function(data_bundle_or_panel, strategy_fn,
+                            strategy_spec, bt_spec = NULL) {
+    bt_spec <- bt_get_spec(bt_spec)
+    bt_validate_spec(bt_spec)
+
+    data_ctx <- bt_make_data_context(data_bundle_or_panel)
+    cal <- bt_calendar(data_ctx)
+    rebal_dates <- bt_rebalance_dates(cal, bt_spec$clock)
+
+    if (length(rebal_dates) == 0) {
+        warning("No rebalance dates in calendar", call. = FALSE)
+        res <- list(
+            nav_series = data.frame(date = as.Date(character(0)), nav = numeric(0)),
+            rebalance_log = list(),
+            execution_log = list(),
+            target_log = list(),
+            cost_log = list(),
+            turnover_log = list(),
+            warnings = "No rebalance dates",
+            meta = list(spec = bt_spec, strategy_spec = strategy_spec)
+        )
+        bt_validate_run_artifact(res)
+        return(res)
+    }
+
+    # ── Initialize ──
+    state <- bt_init_portfolio_state(
+        initial_nav  = bt_spec$accounting$initial_nav,
+        initial_cash = bt_spec$accounting$initial_cash
+    )
+
+    strategy_state <- NULL
+    nav_history <- list()
+    rebal_log <- list()
+    exec_log <- list()
+    target_log <- list()
+    cost_log <- list()
+    turnover_log <- list()
+    readiness_log <- list()
+    universe_log <- list()
+    all_warnings <- character(0)
+
+    verbose <- isTRUE(bt_spec$runner$verbose)
+    robust <- identical(bt_spec$runner$mode, "robust")
+
+    first_ready_decision_date <- as.Date(NA)
+    first_ready_exec_date <- as.Date(NA)
+
+    # ── Walk-forward loop (rebalance dates) ──
+    for (i in seq_along(rebal_dates)) {
+        decision_date <- as.Date(rebal_dates[i])
+
+        # Map to execution date
+        exec_date <- bt_map_execution_date(cal, decision_date, bt_spec$execution)
+        if (is.na(exec_date)) {
+            if (verbose) message(sprintf("  [%s] No execution date available, skipping", decision_date))
+            next
+        }
+
+        dd_key <- as.character(decision_date)
+        ed_key <- as.character(exec_date)
+
+        # Mark to market at decision time (using close by default)
+        mark_p <- bt_get_mark_prices(data_ctx, decision_date, bt_spec$accounting$mark_field)
+        state <- bt_mark_to_market(state, mark_p, decision_date)
+        weights_before <- bt_compute_weights(state)
+
+        holdings_syms <- names(state$positions)
+
+        # ── Backtester-owned base universe selection U(t) ──
+        ures <- bt_select_universe(data_ctx, decision_date, bt_spec$universe)
+        base_univ <- ures$universe
+        universe_log[[ed_key]] <- ures
+
+        # Build strategy-visible context: no-lookahead slice AND universe AND holdings carry
+        data_ctx_strategy <- bt_build_strategy_context(
+            data_ctx = data_ctx,
+            decision_date = decision_date,
+            base_universe = base_univ,
+            holdings_symbols = holdings_syms,
+            keep_holdings = bt_spec$universe$keep_holdings %||% TRUE
+        )
+
+        # Optional: tradability mask (for diagnostics / model use)
+        trad_mask <- bt_tradability_mask(data_ctx, decision_date, unique(c(base_univ, holdings_syms)))
+
+        runtime_ctx <- list(
+            base_universe = base_univ,
+            universe_status = ures$status,
+            universe_reason = ures$reason,
+            universe_diag = ures$diag,
+            tradability_mask = trad_mask,
+            exec_date = exec_date,
+            bt_spec = bt_spec
+        )
+
+        # ── Call strategy (model) ──
+        proposal <- tryCatch(
+            bt_call_strategy(
+                strategy_fn = strategy_fn,
+                decision_date = decision_date,
+                data_context = data_ctx_strategy,
+                portfolio_state = state,
+                strategy_state_in = strategy_state,
+                strategy_spec = strategy_spec,
+                runtime_ctx = runtime_ctx
+            ),
+            error = function(e) {
+                all_warnings <<- c(all_warnings, sprintf("[%s] Strategy failed: %s", dd_key, e$message))
+                NULL
+            }
+        )
+
+        if (is.null(proposal)) {
+            if (robust) next else stop(sprintf("Strategy failed on %s", dd_key))
+        }
+
+        # Carry forward strategy state (always)
+        strategy_state <- proposal$strategy_state_out
+
+        # Validate proposal shape
+        tryCatch(bt_validate_proposal(proposal), error = function(e) {
+            all_warnings <<- c(all_warnings, sprintf("[%s] Proposal invalid: %s", dd_key, e$message))
+            if (!robust) stop(e)
+        })
+
+        # ── Backtester readiness + policy enforcement ──
+        # Universe warmup is also a "warmup condition" regardless of model status.
+        rd <- bt_assess_readiness(proposal)
+        stage <- rd$stage
+        status <- rd$status
+        reason <- rd$reason
+
+        if (!identical(ures$status, "OK")) {
+            stage <- "warmup"
+            status <- "WARMUP"
+            reason <- paste0("universe_", ures$status, ": ", ures$reason)
+            proposal$meta$status <- "WARMUP"
+            proposal$meta$ready_to_trade <- FALSE
+            proposal$meta$reason <- reason
+        }
+
+        # Apply policy
+        if (!isTRUE(proposal$meta$ready_to_trade %||% rd$ready)) {
+            if (identical(stage, "warmup")) {
+                pa <- bt_spec$policies$warmup$action %||% "hold_cash"
+                bs <- bt_spec$policies$warmup$baseline_strategy %||% "all_cash"
+                proposal <- bt_apply_policy(proposal, pa, bs, decision_date, data_ctx_strategy, state, strategy_spec, runtime_ctx)
+            } else if (identical(stage, "cold_start")) {
+                pa <- bt_spec$policies$cold_start$action %||% "hold_cash"
+                bs <- bt_spec$policies$cold_start$baseline_strategy %||% "all_cash"
+                proposal <- bt_apply_policy(proposal, pa, bs, decision_date, data_ctx_strategy, state, strategy_spec, runtime_ctx)
+            } else {
+                # unknown not-ready treated as warmup for safety
+                pa <- bt_spec$policies$warmup$action %||% "hold_cash"
+                bs <- bt_spec$policies$warmup$baseline_strategy %||% "all_cash"
+                proposal <- bt_apply_policy(proposal, pa, bs, decision_date, data_ctx_strategy, state, strategy_spec, runtime_ctx)
+            }
+        } else {
+            proposal$meta$bt_override <- FALSE
+            proposal$meta$bt_override_action <- "none"
+        }
+
+        # Normalize (backtester-owned)
+        proposal <- bt_normalize_proposal(proposal, tol = bt_spec$policies$weight_tol %||% 1e-6)
+
+        # Record first readiness (model readiness, not override)
+        if (is.na(first_ready_decision_date)) {
+            if (isTRUE(rd$ready) && identical(rd$status, "OK")) {
+                first_ready_decision_date <- decision_date
+                first_ready_exec_date <- exec_date
+            }
+        }
+
+        readiness_log[[ed_key]] <- list(
+            decision_date = decision_date,
+            execution_date = exec_date,
+            model_status = rd$status,
+            model_ready = rd$ready,
+            model_reason = rd$reason,
+            bt_override = proposal$meta$bt_override %||% FALSE,
+            bt_override_action = proposal$meta$bt_override_action %||% "none",
+            universe_status = ures$status,
+            n_universe = length(base_univ),
+            n_holdings = length(holdings_syms),
+            n_tradable = sum(trad_mask[base_univ] %||% FALSE, na.rm = TRUE)
+        )
+
+        # ── Execute ──
+        exec_prices <- bt_get_exec_prices(
+            data_ctx, exec_date,
+            bt_spec$execution$price_field,
+            proposal$target_weights$symbol
+        )
+
+        exec_report <- bt_execute_rebalance(
+            state, proposal, exec_prices,
+            bt_spec$execution, bt_spec$costs
+        )
+        exec_report$execution_date <- exec_date
+
+        # ── Update accounting ──
+        state <- bt_apply_fills(state, exec_report)
+
+        # MTM at execution date (close)
+        mark_exec <- bt_get_mark_prices(data_ctx, exec_date, bt_spec$accounting$mark_field)
+        state <- bt_mark_to_market(state, mark_exec, exec_date)
+
+        weights_after <- bt_compute_weights(state)
+        turnover <- bt_compute_turnover(weights_before, weights_after)
+
+        # ── Log ──
+        nav_history[[ed_key]] <- state$nav
+        rebal_log[[ed_key]] <- list(
+            decision_date = decision_date,
+            exec_date = exec_date,
+            nav = state$nav,
+            cash = state$cash,
+            n_positions = length(state$positions),
+            proposal_status = proposal$meta$status %||% NA_character_,
+            bt_override = proposal$meta$bt_override %||% FALSE,
+            bt_override_action = proposal$meta$bt_override_action %||% "none",
+            universe_status = ures$status,
+            n_universe = length(base_univ)
+        )
+        exec_log[[ed_key]] <- exec_report
+        target_log[[ed_key]] <- proposal$target_weights
+        cost_log[[ed_key]] <- exec_report$costs
+        turnover_log[[ed_key]] <- turnover
+
+        if (length(proposal$warnings) > 0) all_warnings <- c(all_warnings, proposal$warnings)
+
+        if (verbose && (i %% 5 == 0 || i == length(rebal_dates))) {
+            message(sprintf(
+                "  Rebalance %d/%d [%s→%s] NAV=%.0f Cash=%.0f Pos=%d TO=%.4f U=%d Override=%s",
+                i, length(rebal_dates), dd_key, ed_key,
+                state$nav, state$cash, length(state$positions), turnover,
+                length(base_univ),
+                as.character(proposal$meta$bt_override %||% FALSE)
+            ))
+        }
+    }
+
+    # ── Build NAV series ──
+    nav_vals <- unlist(nav_history)
+    if (length(nav_vals) > 0) {
+        nav_df <- data.frame(
+            date = as.Date(names(nav_vals)),
+            nav = unname(nav_vals),
+            stringsAsFactors = FALSE
+        )
+    } else {
+        nav_df <- data.frame(date = as.Date(character(0)), nav = numeric(0))
+    }
+
+    # ── Assemble artifact ──
+    res <- list(
+        nav_series = nav_df,
+        rebalance_log = rebal_log,
+        execution_log = exec_log,
+        target_log = target_log,
+        cost_log = cost_log,
+        turnover_log = turnover_log,
+        readiness_log = readiness_log,
+        universe_log = universe_log,
+        warnings = unique(all_warnings),
+        meta = list(
+            spec = bt_spec,
+            strategy_spec = strategy_spec,
+            n_rebalances = length(rebal_log),
+            final_nav = state$nav,
+            final_cash = state$cash,
+            final_positions = length(state$positions),
+            first_ready_decision_date = first_ready_decision_date,
+            first_ready_exec_date = first_ready_exec_date
+        )
+    )
+
+    bt_validate_run_artifact(res)
+    res
+}
+
+
+
+###############################################################################
+### FILE: R/06_analytics.R
+###############################################################################
+#' @title Backtest Engine — Analytics
+#' @description Performance metrics from BacktestRunArtifact.
+
+#' @export
+bt_compute_performance <- function(nav_series) {
+    if (!is.data.frame(nav_series) || nrow(nav_series) < 2) {
+        return(list(
+            cagr = NA, vol = NA, sharpe = NA, max_dd = NA,
+            calmar = NA, n_days = 0
+        ))
+    }
+
+    nav <- nav_series$nav
+    dates <- nav_series$date
+
+    rets <- diff(log(nav))
+    rets <- rets[is.finite(rets)]
+    if (length(rets) < 2) {
+        return(list(cagr = NA, vol = NA, sharpe = NA, max_dd = NA, calmar = NA, n_days = 0))
+    }
+
+    n_days <- as.numeric(max(dates) - min(dates))
+    years <- n_days / 365.25
+    if (years <= 0) years <- 1
+
+    cagr <- (nav[length(nav)] / nav[1])^(1 / years) - 1
+    vol <- sd(rets) * sqrt(252)
+    sharpe <- if (vol > 0) cagr / vol else NA
+
+    cum_max <- cummax(nav)
+    drawdowns <- nav / cum_max - 1
+    max_dd <- min(drawdowns)
+
+    calmar <- if (!is.na(max_dd) && max_dd < 0) cagr / abs(max_dd) else NA
+
+    list(
+        cagr     = round(cagr, 6),
+        vol      = round(vol, 6),
+        sharpe   = round(sharpe, 4),
+        max_dd   = round(max_dd, 6),
+        calmar   = round(calmar, 4),
+        n_days   = n_days,
+        n_obs    = length(nav),
+        start    = min(dates),
+        end      = max(dates)
+    )
+}
+
+#' @export
+bt_compute_analytics <- function(run_artifact) {
+    perf_full <- bt_compute_performance(run_artifact$nav_series)
+
+    # Turnover summary
+    to <- unlist(run_artifact$turnover_log)
+    turnover_summary <- if (length(to) > 0) {
+        list(
+            mean_turnover   = mean(to, na.rm = TRUE),
+            median_turnover = median(to, na.rm = TRUE),
+            max_turnover    = max(to, na.rm = TRUE),
+            total_turnover  = sum(to, na.rm = TRUE)
+        )
+    } else {
+        list(mean_turnover = NA, median_turnover = NA, max_turnover = NA, total_turnover = NA)
+    }
+
+    # Cost summary
+    cost_total <- 0
+    if (length(run_artifact$cost_log) > 0) {
+        cost_total <- sum(vapply(run_artifact$cost_log, function(c) c$total_cost %||% 0, numeric(1)))
+    }
+
+    # Post-ready window (based on first_ready_exec_date)
+    rd <- run_artifact$meta$first_ready_exec_date %||% as.Date(NA)
+    perf_post_ready <- NULL
+    if (!is.na(rd) && is.data.frame(run_artifact$nav_series) && nrow(run_artifact$nav_series) > 1) {
+        nav2 <- run_artifact$nav_series
+        nav2 <- nav2[nav2$date >= rd, , drop = FALSE]
+        if (nrow(nav2) >= 2) perf_post_ready <- bt_compute_performance(nav2)
+    }
+
+    list(
+        performance_full = perf_full,
+        performance_post_ready = perf_post_ready,
+        first_ready_exec_date = rd,
+        turnover = turnover_summary,
+        total_costs = cost_total,
+        n_rebalances = length(run_artifact$rebalance_log)
+    )
+}
+
+#' @export
+bt_print_summary <- function(analytics) {
+    p <- analytics$performance_full
+    cat(sprintf(
+        "FULL: CAGR=%.2f%% Vol=%.2f%% Sharpe=%.2f MaxDD=%.2f%%\n",
+        p$cagr * 100, p$vol * 100, p$sharpe, p$max_dd * 100
+    ))
+    cat(sprintf(
+        "FULL Period: %s to %s (%d days, %d observations)\n",
+        p$start, p$end, p$n_days, p$n_obs
+    ))
+
+    if (!is.null(analytics$performance_post_ready)) {
+        pr <- analytics$performance_post_ready
+        cat(sprintf(
+            "POST-READY (from %s): CAGR=%.2f%% Vol=%.2f%% Sharpe=%.2f MaxDD=%.2f%%\n",
+            as.character(analytics$first_ready_exec_date),
+            pr$cagr * 100, pr$vol * 100, pr$sharpe, pr$max_dd * 100
+        ))
+    } else {
+        cat("POST-READY: not available (model never became ready or insufficient points).\n")
+    }
+
+    cat(sprintf("Rebalances: %d | Total Costs: %.2f\n", analytics$n_rebalances, analytics$total_costs))
+    t <- analytics$turnover
+    cat(sprintf("Turnover: mean=%.4f median=%.4f max=%.4f\n", t$mean_turnover, t$median_turnover, t$max_turnover))
+}
+
+
+
