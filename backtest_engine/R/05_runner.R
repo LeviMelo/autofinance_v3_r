@@ -154,6 +154,13 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
 
     req <- win$requirements
     stateful <- isTRUE(req$stateful)
+    upd_bdays <- bt_spec$runner$stateful_update_every_bdays %||% req$state_update_default_bdays %||% 1L
+    upd_bdays <- as.integer(upd_bdays)
+    if (!is.finite(upd_bdays) || upd_bdays < 1L) upd_bdays <- 1L
+    upd_idx <- seq.int(1L, length(sim_dates), by = upd_bdays)
+    upd_set <- setNames(rep(TRUE, length(upd_idx)), as.character(sim_dates[upd_idx]))
+    upd_call_mode <- as.character(bt_spec$runner$stateful_update_call_mode %||% "light")
+    profile_stages <- isTRUE(bt_spec$runner$profile_stages)
 
     # state
     state <- bt_init_portfolio_state(bt_spec$accounting$initial_nav, bt_spec$accounting$initial_cash)
@@ -164,6 +171,8 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
     exec_rows <- list()
     skip_rows <- list()
     dec_rows <- list()
+    strat_prof_rows <- list()
+    model_stage_rows <- list()
 
     verbose <- isTRUE(bt_spec$runner$verbose)
     if (verbose) {
@@ -279,7 +288,12 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
 
         # 3) strategy update (stateful) on non-decision days (no trade)
         is_decision <- nrow(decisions) > 0 && (t %in% decisions$decision_date)
+        do_stateful_update <- FALSE
         if (stateful && !is_decision) {
+            flag <- upd_set[t_key]
+            do_stateful_update <- length(flag) == 1L && !is.na(flag) && isTRUE(as.logical(flag))
+        }
+        if (do_stateful_update) {
             # Before score start, bootstrap state with a causal relaxed universe.
             # From A0 onward, enforce strict investability rules.
             base_u <- if (t < A0) {
@@ -301,11 +315,34 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
                 no_trade = TRUE,
                 bt_spec = bt_spec,
                 window = win,
-                event = "update"
+                event = "update",
+                stateful_update_every_bdays = upd_bdays,
+                stateful_update_call_mode = upd_call_mode,
+                profile_stages = profile_stages
             )
-
-            prop <- bt_call_strategy(strategy_fn, t, ctx, state, strategy_state, strategy_spec, runtime_ctx)
+            if (profile_stages) {
+                t_stg <- system.time({
+                    prop <- bt_call_strategy(strategy_fn, t, ctx, state, strategy_state, strategy_spec, runtime_ctx)
+                })
+                strat_prof_rows[[length(strat_prof_rows) + 1L]] <- data.frame(
+                    date = t, event = "update", elapsed = as.numeric(t_stg["elapsed"]),
+                    user = as.numeric(t_stg["user.self"]), sys = as.numeric(t_stg["sys.self"]),
+                    stringsAsFactors = FALSE
+                )
+            } else {
+                prop <- bt_call_strategy(strategy_fn, t, ctx, state, strategy_state, strategy_spec, runtime_ctx)
+            }
             bt_validate_proposal(prop, tol = 1e-8)
+            stg_any <- prop$meta$stage_timing %||% prop$meta$came_stage_timing %||% NULL
+            if (profile_stages && is.list(stg_any)) {
+                stg <- stg_any
+                for (nm in names(stg)) {
+                    model_stage_rows[[length(model_stage_rows) + 1L]] <- data.frame(
+                        date = t, event = "update", stage = as.character(nm),
+                        elapsed = as.numeric(stg[[nm]]), stringsAsFactors = FALSE
+                    )
+                }
+            }
             strategy_state <- prop$strategy_state_out
         }
 
@@ -334,11 +371,34 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
                 bt_spec = bt_spec,
                 window = win,
                 event = "decision",
-                exec_date = ed
+                exec_date = ed,
+                stateful_update_every_bdays = upd_bdays,
+                stateful_update_call_mode = upd_call_mode,
+                profile_stages = profile_stages
             )
-
-            prop <- bt_call_strategy(strategy_fn, t, ctx, state, strategy_state, strategy_spec, runtime_ctx)
+            if (profile_stages) {
+                t_stg <- system.time({
+                    prop <- bt_call_strategy(strategy_fn, t, ctx, state, strategy_state, strategy_spec, runtime_ctx)
+                })
+                strat_prof_rows[[length(strat_prof_rows) + 1L]] <- data.frame(
+                    date = t, event = "decision", elapsed = as.numeric(t_stg["elapsed"]),
+                    user = as.numeric(t_stg["user.self"]), sys = as.numeric(t_stg["sys.self"]),
+                    stringsAsFactors = FALSE
+                )
+            } else {
+                prop <- bt_call_strategy(strategy_fn, t, ctx, state, strategy_state, strategy_spec, runtime_ctx)
+            }
             bt_validate_proposal(prop, tol = 1e-8)
+            stg_any <- prop$meta$stage_timing %||% prop$meta$came_stage_timing %||% NULL
+            if (profile_stages && is.list(stg_any)) {
+                stg <- stg_any
+                for (nm in names(stg)) {
+                    model_stage_rows[[length(model_stage_rows) + 1L]] <- data.frame(
+                        date = t, event = "decision", stage = as.character(nm),
+                        elapsed = as.numeric(stg[[nm]]), stringsAsFactors = FALSE
+                    )
+                }
+            }
 
             # enforce allowed symbols
             .bt_assert_symbols_allowed(prop$target_weights$symbol, base_u, hold_syms, bt_spec$universe$keep_holdings %||% TRUE)
@@ -401,6 +461,47 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
             stringsAsFactors = FALSE
         )
     }
+    prof_tbl <- if (length(strat_prof_rows) > 0) {
+        do.call(rbind, strat_prof_rows)
+    } else {
+        data.frame(
+            date = as.Date(character(0)), event = character(0),
+            elapsed = numeric(0), user = numeric(0), sys = numeric(0),
+            stringsAsFactors = FALSE
+        )
+    }
+    prof_summary <- list(
+        enabled = profile_stages,
+        calls = nrow(prof_tbl),
+        elapsed_total = if (nrow(prof_tbl) > 0) sum(prof_tbl$elapsed, na.rm = TRUE) else 0
+    )
+    model_stage_tbl <- if (length(model_stage_rows) > 0) {
+        do.call(rbind, model_stage_rows)
+    } else {
+        data.frame(
+            date = as.Date(character(0)), event = character(0), stage = character(0), elapsed = numeric(0),
+            stringsAsFactors = FALSE
+        )
+    }
+    model_stage_summary <- if (nrow(model_stage_tbl) > 0) {
+        aggregate(elapsed ~ stage, data = model_stage_tbl, FUN = sum)
+    } else {
+        data.frame(stage = character(0), elapsed = numeric(0), stringsAsFactors = FALSE)
+    }
+    if (profile_stages && verbose) {
+        message(sprintf(
+            "[BT] profiling strategy calls: n=%d elapsed_total=%.3fs (update_every_bdays=%d mode=%s)",
+            prof_summary$calls, prof_summary$elapsed_total, upd_bdays, upd_call_mode
+        ))
+        if (nrow(model_stage_summary) > 0) {
+            top <- model_stage_summary[order(-model_stage_summary$elapsed), , drop = FALSE]
+            top <- head(top, 5L)
+            message(sprintf(
+                "[BT] model stage totals (top): %s",
+                paste(sprintf("%s=%.3fs", top$stage, top$elapsed), collapse = " | ")
+            ))
+        }
+    }
 
     res <- list(
         nav = nav,
@@ -413,7 +514,15 @@ bt_run_backtest_range <- function(data_bundle_or_panel, strategy_fn, strategy_sp
             strategy_spec = strategy_spec,
             final_nav = tail(nav$nav, 1),
             final_cash = tail(nav$cash, 1),
-            final_positions = tail(nav$n_positions, 1)
+            final_positions = tail(nav$n_positions, 1),
+            stateful_update_every_bdays = upd_bdays,
+            stateful_update_call_mode = upd_call_mode,
+            profiling = list(
+                strategy_calls = prof_tbl,
+                summary = prof_summary,
+                model_stages = model_stage_tbl,
+                model_stage_summary = model_stage_summary
+            )
         )
     )
 

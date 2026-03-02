@@ -47,6 +47,7 @@ Returns a validated snapshot with:
 - `structure`
 - `signals`
 - `forecast`
+- `compute` (runtime controls: candidate subset, profiling, light-update, clustering cadence)
 - `gating`
 - `reliability`
 - `optimizer`
@@ -57,6 +58,16 @@ Use `came_spec_validate(spec)` after custom edits.
 ## Backtest Integration
 CAME is integrated through backtest adapter `bt_strategy_from_model_engine`.
 Backtester controls trade/no-trade scheduling and execution; CAME controls target portfolio proposal.
+Chronology knobs are backtester-owned (model-agnostic), passed through `runtime_ctx` to adapters.
+
+Runtime controls commonly used for scale:
+- `compute$candidate_max`
+- `compute$candidate_policy`
+- `compute$keep_holdings`
+- `compute$profile`
+- `compute$light_update`
+- `compute$cluster_refresh_every_updates`
+- `compute$cluster_refresh_chi_threshold`
 
 For strict comparisons:
 - use common scored window across strategies,

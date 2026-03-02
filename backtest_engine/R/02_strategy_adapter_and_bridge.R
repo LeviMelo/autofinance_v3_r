@@ -79,6 +79,10 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
     # required to let the model bootstrap history before the scored trading starts
     spec_d$meta$strict <- FALSE
     spec_d$forecast$cold_start_policy <- "skip"
+    if (is.null(spec_d$compute)) spec_d$compute <- list()
+    spec_d$compute$profile <- isTRUE(runtime_ctx$profile_stages %||% FALSE)
+    call_mode <- as.character(runtime_ctx$stateful_update_call_mode %||% "full")
+    spec_d$compute$light_update <- isTRUE(no_trade) && identical(call_mode, "light")
 
     snap <- came_run_snapshot(
         data_bundle_or_panel = data_context$dt,
@@ -94,6 +98,13 @@ bt_strategy_from_model_engine <- function(decision_date, data_context,
         target_weights = snap$weights,
         cash_weight = snap$cash_weight,
         strategy_state_out = list(came_state = snap$state_out, last_model_date = d),
-        meta = list(strategy = "came", no_trade = no_trade)
+        meta = list(
+            strategy = "came",
+            no_trade = no_trade,
+            stage_timing = snap$meta$stage_timing %||% NULL,
+            came_stage_timing = snap$meta$stage_timing %||% NULL,
+            came_full_universe_size = snap$meta$full_universe_size %||% NA_integer_,
+            came_compute_universe_size = snap$meta$compute_universe_size %||% NA_integer_
+        )
     )
 }

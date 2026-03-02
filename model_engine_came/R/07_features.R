@@ -42,6 +42,37 @@
   sol
 }
 
+.came_graph_shrink_multi <- function(L_norm, S_mat, lambda_g = 0.1, eps = 1e-8) {
+  came_assert(is.matrix(L_norm), "feat_shr_multi_L", "L_norm must be a matrix")
+  n <- ncol(L_norm)
+  came_assert(n == nrow(L_norm), "feat_shr_multi_square", "L_norm must be square")
+  came_assert(is.matrix(S_mat), "feat_shr_multi_S", "S_mat must be a matrix")
+
+  Sm <- S_mat[colnames(L_norm), , drop = FALSE]
+  Sm[!is.finite(Sm)] <- 0
+
+  lam <- lambda_g %||% 0.1
+  if (!is.finite(lam) || lam < 0) lam <- 0.1
+
+  A <- diag(n) + lam * L_norm
+  sol <- tryCatch({
+    R <- chol(A)
+    backsolve(R, forwardsolve(t(R), Sm))
+  }, error = function(e) NULL)
+
+  if (is.null(sol)) {
+    sol <- tryCatch(solve(A, Sm), error = function(e) NULL)
+  }
+  if (is.null(sol)) {
+    sol <- tryCatch(solve(A + eps * diag(n), Sm), error = function(e) NULL)
+  }
+  if (is.null(sol)) stop(came_error("feat_shr_multi_solve_failed", "Failed to compute (I+lambda L_norm)^{-1}S"))
+
+  rownames(sol) <- colnames(L_norm)
+  colnames(sol) <- colnames(S_mat)
+  sol
+}
+
 .came_cluster_center <- function(s, labels) {
   s <- s[names(labels)]
   out <- s
@@ -261,15 +292,31 @@ came_features_build <- function(risk_art, struct_art, sig_art, activity_window, 
   lambda_g <- (spec$features$lambda_g %||% 0.1)
   if (!is.finite(lambda_g) || lambda_g < 0) lambda_g <- 0.1
 
-  build_graph_block <- function(s, tag) {
-    s <- s[syms]
-    s[!is.finite(s)] <- 0
+  S_sig <- cbind(
+    mom = sig_art$s_mom[syms],
+    kal = sig_art$s_kal[syms],
+    fac = sig_art$s_fac[syms]
+  )
+  rownames(S_sig) <- syms
+  S_sig[!is.finite(S_sig)] <- 0
 
-    peer <- .came_graph_mv(A, s)
+  peer_all <- as.matrix(A %*% S_sig)
+  sgn_all <- as.matrix(A_sgn %*% S_sig)
+  ten_all <- as.matrix(L %*% S_sig)
+  shr_all <- .came_graph_shrink_multi(L_norm, S_sig, lambda_g = lambda_g)
+
+  build_graph_block <- function(sig_col, tag) {
+    s <- S_sig[, sig_col]
+    peer <- peer_all[, sig_col]
     rel <- s - peer
-    sgn <- .came_graph_mv(A_sgn, s)
-    ten <- .came_graph_mv(L, s)
-    shr <- .came_graph_shrink(L_norm, s, lambda_g = lambda_g)
+    sgn <- sgn_all[, sig_col]
+    ten <- ten_all[, sig_col]
+    shr <- shr_all[, sig_col]
+    names(peer) <- syms
+    names(rel) <- syms
+    names(sgn) <- syms
+    names(ten) <- syms
+    names(shr) <- syms
 
     clctr <- .came_cluster_center(s, labels)
     clz <- .came_cluster_z(s, labels)
@@ -288,9 +335,9 @@ came_features_build <- function(risk_art, struct_art, sig_art, activity_window, 
     out
   }
 
-  g_mom <- build_graph_block(sig_art$s_mom, "mom")
-  g_kal <- build_graph_block(sig_art$s_kal, "kal")
-  g_fac <- build_graph_block(sig_art$s_fac, "fac")
+  g_mom <- build_graph_block("mom", "mom")
+  g_kal <- build_graph_block("kal", "kal")
+  g_fac <- build_graph_block("fac", "fac")
 
   f_graph_meta <- cbind(
     f_deg = deg,
@@ -318,9 +365,8 @@ came_features_build <- function(risk_art, struct_art, sig_art, activity_window, 
     idx <- intersect(idx, syms)
     if (length(idx) >= 2) {
       b_bar <- colMeans(B[idx, , drop = FALSE])
-      for (nm in idx) {
-        f_cf2[nm] <- sum((B[nm, ] - b_bar) * g_scalar)
-      }
+      Bc <- sweep(B[idx, , drop = FALSE], 2, b_bar, FUN = "-")
+      f_cf2[idx] <- as.numeric(Bc %*% g_scalar)
     }
   }
   f_pca_graph <- cbind(f_cf1 = f_cf1, f_cf2 = f_cf2)

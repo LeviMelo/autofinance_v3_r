@@ -389,8 +389,8 @@ bt_build_strategy_context <- function(data_ctx, decision_date, base_universe,
         syms <- unique(c(syms, as.character(holdings_symbols)))
     }
 
-    dt_slice <- bt_as_of_slice(data_ctx, d)
-    dt_slice <- dt_slice[symbol %in% syms]
+    # Single-pass filtered slice avoids materializing the full as-of panel first.
+    dt_slice <- data_ctx$dt[symbol %in% syms & refdate <= d]
 
     list(
         dt = dt_slice,

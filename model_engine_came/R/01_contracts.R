@@ -75,15 +75,29 @@ came_spec_default <- function() {
       n_components = 5L,
       ridge_lambda = 0.10,
       ew_lambda = 0.99,
-      refit_every = 5L,
+      # Lower refit cadence for runtime scalability (models are reused between refits).
+      refit_every = 10L,
       kappa_min = 0.7,
       kappa_max = 1.3,
       lambda_err = 0.97,
-      history_keep = 300L,
+      history_keep = 240L,
 
       # strict cold-start policy: "error" or "skip"
       # "skip" must be handled explicitly by runner (not silently)
       cold_start_policy = "error"
+    ),
+
+    # ---- compute/runtime controls (non-architectural behavior knobs) ----
+    compute = list(
+      candidate_max = 160L,
+      candidate_policy = "liquidity_plus_holdings",
+      keep_holdings = TRUE,
+      profile = FALSE,
+      light_update = FALSE,
+      parallel_components = FALSE,
+      parallel_cores = 2L,
+      cluster_refresh_every_updates = 1L,
+      cluster_refresh_chi_threshold = Inf
     ),
 
     # ---- gating (architecture §12.4) ----
@@ -105,8 +119,10 @@ came_spec_default <- function() {
     optimizer = list(
       max_weight_base = 0.15,
       max_weight_min = 0.01,
-      turnover_cost_base = 5.0,
-      turnover_cost_illiq_scale = 2.0,
+      # Lower default turnover friction to avoid over-freezing allocations.
+      turnover_cost_base = 0.75,
+      turnover_cost_illiq_scale = 0.75,
+      turnover_cost_max = 2.0,
       gamma_base = 1.0,
       gamma_vov_scale = 1.0,
       tau_disp_scale = 0.5,
@@ -123,7 +139,7 @@ came_spec_default <- function() {
 }
 
 came_spec_validate <- function(spec) {
-  req <- c("data", "risk", "structure", "signals", "forecast", "gating", "optimizer", "meta", "reliability")
+  req <- c("data", "risk", "structure", "signals", "forecast", "compute", "gating", "optimizer", "meta", "reliability")
   miss <- setdiff(req, names(spec))
   came_assert(
     length(miss) == 0, "spec_missing_sections",
@@ -171,6 +187,40 @@ came_spec_validate <- function(spec) {
   came_assert(
     csp %in% c("error", "skip"), "spec_cold_start_policy",
     "forecast$cold_start_policy must be 'error' or 'skip'"
+  )
+
+  # compute/runtime controls
+  cp <- spec$compute
+  if (!is.null(cp$candidate_max)) {
+    came_assert(
+      is.numeric(cp$candidate_max) && length(cp$candidate_max) == 1L &&
+        is.finite(cp$candidate_max) && as.integer(cp$candidate_max) >= 3L,
+      "spec_compute_candidate_max", "compute$candidate_max must be NULL or integer >= 3"
+    )
+  }
+  pol <- cp$candidate_policy %||% "liquidity_plus_holdings"
+  came_assert(
+    is.character(pol) && length(pol) == 1L && pol %in% c("liquidity_plus_holdings"),
+    "spec_compute_candidate_policy", "compute$candidate_policy must be 'liquidity_plus_holdings'"
+  )
+  came_assert(is.logical(cp$keep_holdings) && length(cp$keep_holdings) == 1L, "spec_compute_keep_holdings", "compute$keep_holdings must be TRUE/FALSE")
+  came_assert(is.logical(cp$profile) && length(cp$profile) == 1L, "spec_compute_profile", "compute$profile must be TRUE/FALSE")
+  came_assert(is.logical(cp$light_update) && length(cp$light_update) == 1L, "spec_compute_light_update", "compute$light_update must be TRUE/FALSE")
+  came_assert(is.logical(cp$parallel_components) && length(cp$parallel_components) == 1L, "spec_compute_parallel_components", "compute$parallel_components must be TRUE/FALSE")
+  came_assert(
+    is.numeric(cp$parallel_cores) && length(cp$parallel_cores) == 1L &&
+      is.finite(cp$parallel_cores) && as.integer(cp$parallel_cores) >= 1L,
+    "spec_compute_parallel_cores", "compute$parallel_cores must be integer >= 1"
+  )
+  came_assert(
+    is.numeric(cp$cluster_refresh_every_updates) && length(cp$cluster_refresh_every_updates) == 1L &&
+      is.finite(cp$cluster_refresh_every_updates) && as.integer(cp$cluster_refresh_every_updates) >= 1L,
+    "spec_compute_cluster_refresh_every", "compute$cluster_refresh_every_updates must be integer >= 1"
+  )
+  came_assert(
+    is.numeric(cp$cluster_refresh_chi_threshold) && length(cp$cluster_refresh_chi_threshold) == 1L &&
+      !is.na(cp$cluster_refresh_chi_threshold),
+    "spec_compute_cluster_refresh_chi", "compute$cluster_refresh_chi_threshold must be numeric (Inf allowed)"
   )
 
   invisible(spec)

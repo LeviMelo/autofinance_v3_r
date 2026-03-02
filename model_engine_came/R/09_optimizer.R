@@ -8,7 +8,9 @@ came_optimizer_controls <- function(m_t, spec) {
   gamma <- pmin(20, pmax(0.1, gamma))
 
   tau <- (spec$optimizer$turnover_cost_base %||% 5.0) * (1 + (spec$optimizer$tau_disp_scale %||% 0.5) * abs(disp))
-  tau <- pmax(0, tau)
+  tau_max <- spec$optimizer$turnover_cost_max %||% Inf
+  if (!is.finite(tau_max) || tau_max < 0) tau_max <- Inf
+  tau <- pmin(tau_max, pmax(0, tau))
 
   rho_gross <- spec$optimizer$gross_base %||% 0.95
   rho_gross <- pmin(0.99, pmax(0.10, rho_gross))

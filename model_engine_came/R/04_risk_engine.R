@@ -204,10 +204,7 @@ came_risk_update <- function(R_window, state, spec) {
   D_t[!is.finite(D_t) | D_t <= 0] <- 1e-4
 
   # standardized returns window: r_tilde = D^{-1} r (architecture §5.1)
-  R_std <- R
-  for (j in seq_len(ncol(R_std))) {
-    R_std[, j] <- R_std[, j] / D_series[, j]
-  }
+  R_std <- R / pmax(D_series, 1e-12)
   R_std[!is.finite(R_std)] <- 0
 
   # --- PCA systematic layer (architecture §5.2) ---
@@ -313,6 +310,11 @@ came_risk_update <- function(R_window, state, spec) {
   st_out$risk$S_e <- S_e
   st_out$risk$B_prev <- B
 
+  min_eig <- NA_real_
+  if (isTRUE(spec$meta$retain_debug %||% FALSE)) {
+    min_eig <- min(eigen(Sigma_1, symmetric = TRUE, only.values = TRUE)$values)
+  }
+
   list(
     risk = list(
       sigma2 = sigma2_t,
@@ -335,7 +337,7 @@ came_risk_update <- function(R_window, state, spec) {
       align_used = align_used,
       glasso_lambda = lam_gl,
       H = H,
-      min_eig = min(eigen(Sigma_1, symmetric = TRUE, only.values = TRUE)$values)
+      min_eig = min_eig
     )
   )
 }

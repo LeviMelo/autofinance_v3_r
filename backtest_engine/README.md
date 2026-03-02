@@ -48,6 +48,7 @@ Each strategy must expose:
 - `prehistory_days`
 - `stateful`
 - `supports_replay`
+- optional: `state_update_default_bdays` (integer trading-day cadence for non-decision state updates)
 
 The runner combines model and universe needs into `W_star` and rejects infeasible ranges.
 
@@ -62,6 +63,14 @@ At decision dates, base universe is selected with strict investability constrain
 - Daily mark-to-market supports:
   - `mark_missing_policy = "error"`
   - `mark_missing_policy = "carry_last"` with optional `max_stale_mark_days`.
+
+### Stateful Update Cadence (Model-Agnostic)
+Runner controls stateful updates through trading-day integers:
+- `runner$stateful_update_every_bdays`: `NULL` or integer `>=1`
+  - `NULL` => use strategy requirement `state_update_default_bdays`
+  - fallback => `1` (daily)
+- `runner$stateful_update_call_mode`: `"full"` or `"light"` (generic runtime hint)
+- `runner$profile_stages`: collect strategy/model timing tables in `res$meta$profiling`
 
 ## Public Entrypoints
 - `bt_get_spec(overrides = NULL)`
@@ -91,7 +100,8 @@ bt_spec <- bt_get_spec(list(
   clock = list(freq = "months"),
   universe = list(lookback_days = 63L, min_price_history_days = 252L, max_universe = 40L),
   execution = list(price_field = "open", exec_lag = 1L),
-  accounting = list(mark_field = "close", mark_missing_policy = "carry_last", max_stale_mark_days = NULL)
+  accounting = list(mark_field = "close", mark_missing_policy = "carry_last", max_stale_mark_days = NULL),
+  runner = list(stateful_update_every_bdays = 5L, stateful_update_call_mode = "light", profile_stages = TRUE)
 ))
 
 res <- bt_run_backtest_range(panel, strategy_fn, strategy_spec, "2024-03-01", "2025-12-15", bt_spec)

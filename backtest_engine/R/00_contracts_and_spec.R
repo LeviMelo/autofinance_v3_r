@@ -83,7 +83,14 @@ bt_spec_default <- function() {
         ),
         runner = list(
             mode = "strict", # "strict" only in v3
-            verbose = TRUE
+            verbose = TRUE,
+            # Stateful update cadence on non-decision days in trading/business days.
+            # NULL => use strategy requirement default; fallback is 1 (daily).
+            stateful_update_every_bdays = NULL,
+            # Generic hint for adapters. Backtester stays model-agnostic.
+            stateful_update_call_mode = "light", # "full" | "light"
+            # Collect strategy/model timing diagnostics.
+            profile_stages = FALSE
         ),
         analytics = list(
             rf_annual = 0.0 # optional risk-free for sharpe; 0 by default
@@ -166,6 +173,19 @@ bt_validate_spec <- function(spec) {
     rn <- spec$runner
     if (!identical(rn$mode %||% "strict", "strict")) .bt_stop("spec_runner_mode", "runner$mode must be 'strict' in v3")
     if (!is.logical(rn$verbose) || length(rn$verbose) != 1L) .bt_stop("spec_runner_verbose", "runner$verbose must be TRUE/FALSE")
+    sub <- rn$stateful_update_every_bdays
+    if (!is.null(sub)) {
+        if (!.bt_is_scalar_int(sub) || as.integer(sub) < 1L) {
+            .bt_stop("spec_runner_stateful_bdays", "runner$stateful_update_every_bdays must be NULL or integer >= 1")
+        }
+    }
+    scm <- rn$stateful_update_call_mode %||% "light"
+    if (!is.character(scm) || length(scm) != 1L || !scm %in% c("full", "light")) {
+        .bt_stop("spec_runner_stateful_mode", "runner$stateful_update_call_mode must be 'full' or 'light'")
+    }
+    if (!is.logical(rn$profile_stages) || length(rn$profile_stages) != 1L) {
+        .bt_stop("spec_runner_profile", "runner$profile_stages must be TRUE/FALSE")
+    }
 
     # analytics
     an <- spec$analytics
@@ -180,7 +200,8 @@ bt_validate_spec <- function(spec) {
 #   model_id = <string>,
 #   prehistory_days = <int >= 0>,  # trading days required strictly BEFORE first scored decision date
 #   stateful = TRUE/FALSE,
-#   supports_replay = TRUE/FALSE
+#   supports_replay = TRUE/FALSE,
+#   state_update_default_bdays = <optional int >= 1>
 # )
 
 #' @export
@@ -193,6 +214,11 @@ bt_validate_requirements <- function(req) {
     if (!.bt_is_scalar_int(req$prehistory_days) || as.integer(req$prehistory_days) < 0L) .bt_stop("req_prehistory", "requirements$prehistory_days must be integer >= 0")
     if (!is.logical(req$stateful) || length(req$stateful) != 1L) .bt_stop("req_stateful", "requirements$stateful must be TRUE/FALSE")
     if (!is.logical(req$supports_replay) || length(req$supports_replay) != 1L) .bt_stop("req_replay", "requirements$supports_replay must be TRUE/FALSE")
+    if ("state_update_default_bdays" %in% names(req) && !is.null(req$state_update_default_bdays)) {
+        if (!.bt_is_scalar_int(req$state_update_default_bdays) || as.integer(req$state_update_default_bdays) < 1L) {
+            .bt_stop("req_state_update_default_bdays", "requirements$state_update_default_bdays must be NULL or integer >= 1")
+        }
+    }
     invisible(req)
 }
 
@@ -222,7 +248,8 @@ bt_strategy_requirements <- function(strategy_fn, strategy_spec) {
             model_id = "came",
             prehistory_days = .bt_came_prehistory_days(strategy_spec),
             stateful = TRUE,
-            supports_replay = FALSE
+            supports_replay = FALSE,
+            state_update_default_bdays = 5L
         )
         bt_validate_requirements(req)
         return(req)

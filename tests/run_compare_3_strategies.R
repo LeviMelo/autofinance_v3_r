@@ -9,6 +9,8 @@ OUT_DIR <- "bt_outputs"
 if (!dir.exists(OUT_DIR)) dir.create(OUT_DIR, recursive = TRUE)
 OUT_PNG <- file.path(OUT_DIR, "nav_comparison.png")
 OUT_CSV <- file.path(OUT_DIR, "nav_comparison.csv")
+OUT_CAME_STAGE_CSV <- file.path(OUT_DIR, "came_stage_timing.csv")
+OUT_CAME_STAGE_SUM_CSV <- file.path(OUT_DIR, "came_stage_summary.csv")
 
 BUILD_DATA <- TRUE
 PANEL_RDS <- file.path(OUT_DIR, "panel_adj_model.rds")
@@ -21,7 +23,7 @@ BT_END <- "2025-12-15"
 
 LOOKBACK_DAYS <- 252L # your "lookback window size"
 UNIV_LB_DAYS <- 63L
-TOP_K <- 40L
+TOP_K <- 80L
 
 # extra trading-day buffers (CA fetch window + safety + exec_lag)
 PRE_BUFFER <- 20L
@@ -68,6 +70,18 @@ attr(bt_strategy_equal_weight, "bt_requirements") <- list(
 
 # CAME spec + requirements (used to derive W_star BEFORE building data)
 came_spec <- came_spec_default()
+# Runtime/perf + turnover tuning for current scaling target.
+came_spec$forecast$refit_every <- 15L
+came_spec$forecast$history_keep <- 220L
+came_spec$optimizer$turnover_cost_base <- 0.50
+came_spec$optimizer$turnover_cost_illiq_scale <- 0.50
+came_spec$optimizer$turnover_cost_max <- 1.25
+came_spec$compute$candidate_max <- 160L
+came_spec$compute$candidate_policy <- "liquidity_plus_holdings"
+came_spec$compute$keep_holdings <- TRUE
+came_spec$compute$parallel_components <- FALSE
+came_spec$compute$cluster_refresh_every_updates <- 5L
+came_spec$compute$cluster_refresh_chi_threshold <- 0.15
 req_came <- bt_strategy_requirements(bt_strategy_from_model_engine, came_spec)
 
 # Universe-driven requirement (backtester enforces investability rules strictly)
@@ -241,7 +255,13 @@ bt_spec <- bt_get_spec(list(
         mark_missing_policy = "carry_last",
         max_stale_mark_days = NULL
     ),
-    runner = list(mode = "strict", verbose = TRUE),
+    runner = list(
+        mode = "strict",
+        verbose = TRUE,
+        stateful_update_every_bdays = 5L,
+        stateful_update_call_mode = "light",
+        profile_stages = TRUE
+    ),
     analytics = list(rf_annual = 0.0)
 ))
 
@@ -259,9 +279,29 @@ an_bm <- bt_compute_analytics(res_bm)
 bt_print_summary(an_bm)
 
 cat("\n===== RUN: CAME =====\n")
-res_cm <- bt_run_backtest_range(panel, bt_strategy_from_model_engine, came_spec, BT_START, BT_END, bt_spec)
+t_cm <- NULL
+res_cm <- NULL
+t_cm <- system.time({
+    res_cm <- tryCatch(
+        bt_run_backtest_range(panel, bt_strategy_from_model_engine, came_spec, BT_START, BT_END, bt_spec),
+        error = function(e) e
+    )
+})
+cat(sprintf(
+    "[TIMING] CAME bt_run_backtest_range: elapsed=%.3fs user=%.3fs sys=%.3fs\n",
+    as.numeric(t_cm["elapsed"]), as.numeric(t_cm["user.self"]), as.numeric(t_cm["sys.self"])
+))
+if (inherits(res_cm, "error")) stop(res_cm)
 an_cm <- bt_compute_analytics(res_cm)
 bt_print_summary(an_cm)
+if (!is.null(res_cm$meta$profiling$model_stages) && is.data.frame(res_cm$meta$profiling$model_stages) && nrow(res_cm$meta$profiling$model_stages) > 0) {
+    write.csv(res_cm$meta$profiling$model_stages, OUT_CAME_STAGE_CSV, row.names = FALSE)
+    cat("[OK] wrote:", OUT_CAME_STAGE_CSV, "\n")
+}
+if (!is.null(res_cm$meta$profiling$model_stage_summary) && is.data.frame(res_cm$meta$profiling$model_stage_summary) && nrow(res_cm$meta$profiling$model_stage_summary) > 0) {
+    write.csv(res_cm$meta$profiling$model_stage_summary, OUT_CAME_STAGE_SUM_CSV, row.names = FALSE)
+    cat("[OK] wrote:", OUT_CAME_STAGE_SUM_CSV, "\n")
+}
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 7) Plot scored NAVs (daily)

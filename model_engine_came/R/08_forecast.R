@@ -140,11 +140,13 @@ came_build_training_panel <- function(history_snapshots, R_history, H, required_
   }
   came_assert(!is.null(required_cols) && length(required_cols) > 0, "forecast_required_cols", "No feature schema provided")
 
-  rows_X <- list()
-  rows_y <- c()
-  rows_age <- c()
-  rows_asset <- c()
-  rows_date <- c()
+  rows_X <- vector("list", length(history_snapshots))
+  rows_y <- vector("list", length(history_snapshots))
+  rows_age <- vector("list", length(history_snapshots))
+  rows_asset <- vector("list", length(history_snapshots))
+  rows_date <- vector("list", length(history_snapshots))
+  n_blocks <- 0L
+  syms_R <- colnames(R_history)
 
   for (snap in history_snapshots) {
     d <- as.Date(snap$date)
@@ -161,28 +163,40 @@ came_build_training_panel <- function(history_snapshots, R_history, H, required_
       "Feature schema drift detected across history snapshots (colnames not identical). Rebuild history."
     )
 
-    syms <- rownames(Xs)
-    # y_{i,d}^{(H)} = sum_{h=1..H} r_{i, ix+h}
-    for (sym in syms) {
-      if (!(sym %in% colnames(R_history))) next
-      y <- sum(R_history[(ix + 1):(ix + H), sym], na.rm = TRUE)
-      if (!is.finite(y)) next
+    syms <- intersect(rownames(Xs), syms_R)
+    if (length(syms) == 0L) next
 
-      rows_X[[length(rows_X) + 1L]] <- Xs[sym, , drop = TRUE]
-      rows_y <- c(rows_y, y)
-      rows_asset <- c(rows_asset, sym)
-      rows_date <- c(rows_date, as.character(d))
+    y_block <- colSums(R_history[(ix + 1):(ix + H), syms, drop = FALSE], na.rm = TRUE)
+    keep <- is.finite(y_block)
+    if (!any(keep)) next
 
-      age <- (nrow(R_history) - (ix + H))
-      rows_age <- c(rows_age, age)
-    }
+    syms_keep <- syms[keep]
+    y_keep <- as.numeric(y_block[keep])
+
+    n_blocks <- n_blocks + 1L
+    rows_X[[n_blocks]] <- Xs[syms_keep, , drop = FALSE]
+    rows_y[[n_blocks]] <- y_keep
+    rows_asset[[n_blocks]] <- syms_keep
+    rows_date[[n_blocks]] <- rep(as.character(d), length(syms_keep))
+    rows_age[[n_blocks]] <- rep(nrow(R_history) - (ix + H), length(syms_keep))
   }
 
-  if (length(rows_y) < 100) {
+  if (n_blocks < 1L) {
+    return(list(X = NULL, y = NULL, age = NULL, asset = NULL, date = NULL, n = 0L))
+  }
+
+  rows_X <- rows_X[seq_len(n_blocks)]
+  rows_y <- unlist(rows_y[seq_len(n_blocks)], use.names = FALSE)
+  rows_age <- unlist(rows_age[seq_len(n_blocks)], use.names = FALSE)
+  rows_asset <- unlist(rows_asset[seq_len(n_blocks)], use.names = FALSE)
+  rows_date <- unlist(rows_date[seq_len(n_blocks)], use.names = FALSE)
+
+  if (length(rows_y) < 100L) {
     return(list(X = NULL, y = NULL, age = NULL, asset = NULL, date = NULL, n = 0L))
   }
 
   X_panel <- do.call(rbind, rows_X)
+  X_panel <- as.matrix(X_panel)
   colnames(X_panel) <- required_cols
   X_panel[!is.finite(X_panel)] <- 0
 
@@ -241,6 +255,36 @@ came_build_training_panel <- function(history_snapshots, R_history, H, required_
   r
 }
 
+.came_rho_rel_vec <- function(liq_z, illiq_z, node_stab, eto, chi, a) {
+  a0 <- as.numeric(a["intercept"])
+  a1 <- as.numeric(a["liq_z"])
+  a2 <- as.numeric(a["illiq_z"])
+  a3 <- as.numeric(a["node_stab"])
+  a4 <- as.numeric(a["eto"])
+  a5 <- as.numeric(a["chi"])
+  if (!is.finite(a0)) a0 <- 0
+  if (!is.finite(a1)) a1 <- 0
+  if (!is.finite(a2)) a2 <- 0
+  if (!is.finite(a3)) a3 <- 0
+  if (!is.finite(a4)) a4 <- 0
+  if (!is.finite(a5)) a5 <- 0
+
+  lz <- as.numeric(liq_z)
+  iz <- as.numeric(illiq_z)
+  ns <- as.numeric(node_stab)
+  lz[!is.finite(lz)] <- 0
+  iz[!is.finite(iz)] <- 0
+  ns[!is.finite(ns)] <- 1
+  eto <- if (is.finite(eto)) eto else 0
+  chi <- if (is.finite(chi)) chi else 0
+
+  z <- a0 + a1 * lz + a2 * iz + a3 * ns + a4 * eto + a5 * chi
+  r <- 1 / (1 + exp(-z))
+  r <- pmin(1, pmax(0.05, r))
+  r[!is.finite(r)] <- 0.8
+  r
+}
+
 # --- main forecast update ---------------------------------------------------
 
 came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_snapshots, R_history, state, spec) {
@@ -275,11 +319,17 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   pi <- came_softmax(A_pi %*% mtv + b_pi, temperature = spec$gating$temperature %||% 1.0)
   names(pi) <- paste0("C", seq_len(C))
 
-  # training panel (matured labels only)
-  panel <- came_build_training_panel(history_snapshots, R_history, H, required_cols = colnames(X_now))
-
   models <- st$forecast$models
+  light_update <- isTRUE(spec$compute$light_update %||% FALSE)
   should_refit <- is.null(models) || (st$forecast$step %% refit_every == 0L)
+  # Light updates may skip expensive refits only after models already exist.
+  # On first bootstrap, refit must remain enabled.
+  if (light_update && !is.null(models)) should_refit <- FALSE
+  panel <- if (should_refit) {
+    came_build_training_panel(history_snapshots, R_history, H, required_cols = colnames(X_now))
+  } else {
+    list(X = NULL, y = NULL, age = NULL, asset = NULL, date = NULL, n = 0L)
+  }
 
   # ---- cold start handling ----
   if (is.null(models) && should_refit && (panel$n %||% 0L) == 0L) {
@@ -320,10 +370,10 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
 
     mu_hat <- setNames(rep(0, length(syms)), syms)
 
-    sigma_hat <- setNames(rep(0, length(syms)), syms)
-    for (i in seq_along(syms)) {
-      sigma_hat[i] <- sqrt(sum((q[i, ]^2) * (comp_sigma^2)))
-    }
+    c_eff <- min(ncol(q), length(comp_sigma))
+    came_assert(c_eff >= 1L, "forecast_sigma_dims", "Invalid component dimensions for sigma_hat (cold start)")
+    sigma_hat <- sqrt(as.numeric((q[, seq_len(c_eff), drop = FALSE]^2) %*% (comp_sigma[seq_len(c_eff)]^2)))
+    names(sigma_hat) <- syms
     sigma_hat[!is.finite(sigma_hat) | sigma_hat <= 0] <- 0.01
 
     # reliability
@@ -338,10 +388,8 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
     ns[!is.finite(ns)] <- 1
 
     a <- spec$reliability$a
-    rho <- setNames(rep(0.8, length(syms)), syms)
-    for (i in seq_along(syms)) {
-      rho[i] <- .came_rho_rel(liq_z[i], illiq_z[i], ns[i], eto0, chi0, a)
-    }
+    rho <- .came_rho_rel_vec(liq_z, illiq_z, ns, eto0, chi0, a)
+    names(rho) <- syms
 
     mu_eff <- rho * mu_hat
     s_eff <- sigma_hat / sqrt(pmax(rho, spec$reliability$eps %||% 1e-6))
@@ -369,16 +417,24 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
     came_assert(panel$n > 0, "forecast_no_panel", "Insufficient matured history to fit forecast models (cold start).")
     w <- (ew_lambda^panel$age)
 
-    models <- vector("list", C)
-    names(models) <- paste0("C", seq_len(C))
-
-    for (c in seq_len(C)) {
+    fit_one <- function(c) {
       cols <- .came_comp_cols(colnames(panel$X), c)
       cols <- intersect(cols, colnames(panel$X))
       came_assert(length(cols) > 0, "forecast_no_features", paste("No features for component", c))
-      models[[c]] <- .came_weighted_ridge(panel$X[, cols, drop = FALSE], panel$y, w, ridge_lambda)
+      .came_weighted_ridge(panel$X[, cols, drop = FALSE], panel$y, w, ridge_lambda)
     }
 
+    use_parallel <- isTRUE(spec$compute$parallel_components %||% FALSE) &&
+      (.Platform$OS.type != "windows") &&
+      (C >= 2L)
+    if (use_parallel) {
+      ncores <- as.integer(spec$compute$parallel_cores %||% 2L)
+      if (!is.finite(ncores) || ncores < 1L) ncores <- 2L
+      models <- parallel::mclapply(seq_len(C), fit_one, mc.cores = ncores)
+    } else {
+      models <- lapply(seq_len(C), fit_one)
+    }
+    names(models) <- paste0("C", seq_len(C))
     st$forecast$models <- models
   } else {
     came_assert(!is.null(models) && length(models) == C, "forecast_models_missing", "Models missing but refit disabled")
@@ -398,7 +454,11 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   q_raw <- sweep(kappa, 2, pi, "*")
   q <- q_raw / pmax(rowSums(q_raw), 1e-12)
 
-  mu_hat <- rowSums(q * comp_mu)
+  c_mu <- min(ncol(q), ncol(comp_mu))
+  came_assert(c_mu >= 1L, "forecast_mu_dims", "Invalid component dimensions for mu_hat")
+  q_use <- q[, seq_len(c_mu), drop = FALSE]
+  comp_mu_use <- comp_mu[, seq_len(c_mu), drop = FALSE]
+  mu_hat <- rowSums(q_use * comp_mu_use)
   names(mu_hat) <- syms
 
   # --- store today's component means for future matured error updates
@@ -446,13 +506,23 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
           y_m <- rowSums(R_history[(matured_ix + 1):(matured_ix + H), common_assets, drop = FALSE], na.rm = TRUE)
           y_m[!is.finite(y_m)] <- 0
 
-          for (c in seq_len(C)) {
-            pred <- comp_mu_m[common_assets, c]
-            e2 <- (y_m - pred)^2
-            pool_e2 <- stats::median(e2, na.rm = TRUE)
-            if (is.finite(pool_e2)) {
+          pred_mat <- as.matrix(comp_mu_m[common_assets, , drop = FALSE])
+          c_err <- min(ncol(pred_mat), C)
+          if (c_err >= 1L) {
+            pred_mat <- pred_mat[, seq_len(c_err), drop = FALSE]
+            y_aligned <- y_m[rownames(pred_mat)]
+            y_aligned[!is.finite(y_aligned)] <- 0
+            e2_mat <- sweep(pred_mat, 1, y_aligned, FUN = "-")^2
+            pool_e2 <- apply(e2_mat, 2, stats::median, na.rm = TRUE)
+          } else {
+            pool_e2 <- numeric(0)
+          }
+
+          for (c in seq_len(c_err)) {
+            pe <- pool_e2[c]
+            if (is.finite(pe)) {
               key <- paste0("C", c)
-              st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pool_e2
+              st$forecast$error_buckets[[key]][b] <- lambda_err * st$forecast$error_buckets[[key]][b] + (1 - lambda_err) * pe
             }
           }
         }
@@ -465,10 +535,10 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   comp_sigma[!is.finite(comp_sigma) | comp_sigma <= 0] <- 0.01
 
   # combined uncertainty s^(H) (architecture §12.7)
-  sigma_hat <- setNames(rep(0, length(syms)), syms)
-  for (i in seq_along(syms)) {
-    sigma_hat[i] <- sqrt(sum((q[i, ]^2) * (comp_sigma^2)))
-  }
+  c_eff <- min(ncol(q), length(comp_sigma))
+  came_assert(c_eff >= 1L, "forecast_sigma_dims", "Invalid component dimensions for sigma_hat")
+  sigma_hat <- sqrt(as.numeric((q[, seq_len(c_eff), drop = FALSE]^2) %*% (comp_sigma[seq_len(c_eff)]^2)))
+  names(sigma_hat) <- syms
   sigma_hat[!is.finite(sigma_hat) | sigma_hat <= 0] <- 0.01
 
   # reliability (architecture §12.8)
@@ -483,10 +553,8 @@ came_forecast_update <- function(X_now, m_t, struct_diag, node_stab, history_sna
   ns[!is.finite(ns)] <- 1
 
   a <- spec$reliability$a
-  rho <- setNames(rep(0.8, length(syms)), syms)
-  for (i in seq_along(syms)) {
-    rho[i] <- .came_rho_rel(liq_z[i], illiq_z[i], ns[i], eto, chi, a)
-  }
+  rho <- .came_rho_rel_vec(liq_z, illiq_z, ns, eto, chi, a)
+  names(rho) <- syms
 
   mu_eff <- rho * mu_hat
   s_eff <- sigma_hat / sqrt(pmax(rho, spec$reliability$eps %||% 1e-6))

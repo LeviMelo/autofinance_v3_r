@@ -1,7 +1,48 @@
 # 10_runner.R — end-to-end snapshot runner (hard restart) with tradability-correct optimization
 
+.came_largest_eigen_power <- function(S, n_iter = 20L, eps = 1e-10) {
+  S <- as.matrix(S)
+  n <- ncol(S)
+  if (n < 1L || nrow(S) != n) return(NA_real_)
+  v <- rep(1 / sqrt(n), n)
+  for (k in seq_len(n_iter)) {
+    w <- as.numeric(S %*% v)
+    wn <- sqrt(sum(w * w))
+    if (!is.finite(wn) || wn <= eps) return(NA_real_)
+    v <- w / wn
+  }
+  as.numeric(crossprod(v, S %*% v))
+}
+
+.came_pick_candidate_universe <- function(univ, prev_hold, tv_last, compute_spec) {
+  syms <- unique(as.character(univ))
+  syms <- syms[!is.na(syms) & nzchar(syms)]
+  if (length(syms) <= 3L) return(syms)
+
+  cand_max <- compute_spec$candidate_max %||% length(syms)
+  if (!is.finite(cand_max) || as.integer(cand_max) < 3L) cand_max <- length(syms)
+  cand_max <- min(length(syms), as.integer(cand_max))
+
+  keep_hold <- isTRUE(compute_spec$keep_holdings %||% TRUE)
+  tv <- tv_last[syms]
+  tv[!is.finite(tv)] <- 0
+  ranked <- names(sort(tv, decreasing = TRUE))
+  cand <- head(ranked, cand_max)
+  if (keep_hold) {
+    ph <- intersect(as.character(prev_hold), syms)
+    cand <- unique(c(ph, cand))
+  }
+  if (length(cand) < 3L) cand <- unique(c(cand, head(ranked, 3L)))
+  cand
+}
+
 came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, state = NULL, prev_target = NULL) {
-  spec <- spec %||% came_spec_default()
+  if (is.null(spec)) {
+    spec <- came_spec_default()
+  } else if (is.null(spec$compute)) {
+    # Backward-compat: inject compute defaults when older specs are passed.
+    spec$compute <- came_spec_default()$compute
+  }
   came_spec_validate(spec)
   state <- state %||% came_state_init()
   came_state_validate(state)
@@ -15,7 +56,18 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     came_assert(is.finite(as_of_date) && !is.na(as_of_date), "runner_no_date", "No calendar date <= as_of_date")
   }
 
-  inv <- adapter$investable_universe(as_of_date, spec$data)
+  profile_stages <- isTRUE(spec$compute$profile %||% FALSE)
+  stage_timing <- list()
+  .run_stage <- function(stage, expr) {
+    if (!profile_stages) return(came_run_stage(stage, expr))
+    tm <- system.time({
+      out <- came_run_stage(stage, expr)
+    })
+    stage_timing[[stage]] <<- as.numeric(tm["elapsed"])
+    out
+  }
+
+  inv <- .run_stage("data_investable_universe", adapter$investable_universe(as_of_date, spec$data))
   eps_hold <- spec$data$eps_hold %||% 1e-8
 
   prev_hold <- character(0)
@@ -33,14 +85,33 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   H <- spec$forecast$H %||% 21L
   lookback <- max(L, max(spec$signals$mom_horizons), 63L) + H + 5L
 
-  P_win <- adapter$prices(as_of_date, lookback + 1L, univ, strict = TRUE)
-  came_assert(ncol(P_win) >= 3, "runner_price_strict", "Too few assets with complete price history under strict policy.")
+  P_win_full <- .run_stage("data_prices", adapter$prices(as_of_date, lookback + 1L, univ, strict = TRUE))
+  came_assert(ncol(P_win_full) >= 3, "runner_price_strict", "Too few assets with complete price history under strict policy.")
+  state <- came_state_pi(state, colnames(P_win_full))
+
+  act_full <- .run_stage("data_activity", adapter$activity(as_of_date, min(63L, nrow(P_win_full)), colnames(P_win_full), strict = FALSE))
+  tv_full <- act_full$traded_value[nrow(act_full$traded_value), ]
+  names(tv_full) <- colnames(act_full$traded_value)
+
+  compute_univ <- .came_pick_candidate_universe(
+    univ = colnames(P_win_full),
+    prev_hold = prev_hold,
+    tv_last = tv_full,
+    compute_spec = spec$compute
+  )
+  compute_univ <- intersect(colnames(P_win_full), compute_univ)
+  came_assert(length(compute_univ) >= 3L, "runner_compute_universe_small", "Computed candidate universe has <3 assets")
+
+  P_win <- P_win_full[, compute_univ, drop = FALSE]
+  act <- list(
+    traded_value = act_full$traded_value[, compute_univ, drop = FALSE],
+    traded_units = act_full$traded_units[, compute_univ, drop = FALSE],
+    n_trades = act_full$n_trades[, compute_univ, drop = FALSE]
+  )
+
   R_win <- diff(log(pmax(P_win, 1e-12)))
   R_win[!is.finite(R_win)] <- 0
-
-  state <- came_state_pi(state, colnames(P_win))
-
-  act <- adapter$activity(as_of_date, min(63L, nrow(P_win)), colnames(P_win), strict = FALSE)
+  nR <- nrow(R_win)
 
   # Tradability mask a_{i,t}
   tv_t <- act$traded_value[nrow(act$traded_value), ]
@@ -51,7 +122,8 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   a_t <- a_t[colnames(P_win)]
 
   # ---- risk ----
-  risk_res <- came_run_stage("risk", came_risk_update(tail(R_win, L), state, spec))
+  R_risk <- if (nR > L) tail(R_win, L) else R_win
+  risk_res <- .run_stage("risk", came_risk_update(R_risk, state, spec))
   risk_art <- risk_res$risk
   state1 <- risk_res$state_out
 
@@ -59,7 +131,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   activity_last <- act$traded_value[nrow(act$traded_value), ]
   names(activity_last) <- colnames(act$traded_value)
 
-  struct_res <- came_run_stage("structure", came_structure_update(risk_art$Theta, activity_last, state1, spec))
+  struct_res <- .run_stage("structure", came_structure_update(risk_art$Theta, activity_last, state1, spec))
   struct_art <- struct_res$structure
   state2 <- struct_res$state_out
 
@@ -86,11 +158,8 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     Cmat[!is.finite(Cmat)] <- 0
     diag(Cmat) <- 1
 
-    ev <- tryCatch(eigen(Cmat, symmetric = TRUE, only.values = TRUE)$values,
-      error = function(e) NULL
-    )
-
-    eta <- if (is.null(ev) || length(ev) == 0L) 0 else (max(ev) / length(ev))
+    ev_max <- tryCatch(.came_largest_eigen_power(Cmat, n_iter = 20L), error = function(e) NA_real_)
+    eta <- if (!is.finite(ev_max)) 0 else (ev_max / ncol(Cmat))
     if (!is.finite(eta)) eta <- 0
   }
 
@@ -116,12 +185,15 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
 
   # ---- signals ----
   P_last <- P_win[nrow(P_win), ]
-  sig_res <- came_run_stage("signals", came_signals_update(P_last, tail(R_win, max(spec$signals$mom_horizons)), risk_art, struct_art, state2, spec))
+  mom_max <- max(spec$signals$mom_horizons)
+  R_sig <- if (nR > mom_max) tail(R_win, mom_max) else R_win
+  sig_res <- .run_stage("signals", came_signals_update(P_last, R_sig, risk_art, struct_art, state2, spec))
   sig_art <- sig_res$signals
   state3 <- sig_res$state_out
 
   # ---- features ----
-  feat_res <- came_run_stage("features", came_features_build(risk_art, struct_art, sig_art, act, tail(R_win, 63L), m_t, spec))
+  R_feat <- if (nR > 63L) tail(R_win, 63L) else R_win
+  feat_res <- .run_stage("features", came_features_build(risk_art, struct_art, sig_art, act, R_feat, m_t, spec))
   X_now <- feat_res$X
 
   state4 <- came_history_append(state3, as_of_date, X_now, keep = spec$forecast$history_keep %||% 300L)
@@ -135,7 +207,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
   node_stab <- node_stab[colnames(P_win)]
   node_stab[!is.finite(node_stab)] <- 1
 
-  fc_res <- came_run_stage("forecast", came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec))
+  fc_res <- .run_stage("forecast", came_forecast_update(X_now, m_t, struct_art$diag, node_stab, hist_snaps, R_history, state4, spec))
   fc_art <- fc_res$forecast
   fc_art$diag <- fc_res$diag
   state5 <- fc_res$state_out
@@ -180,7 +252,7 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
     }
   } else {
     # portfolio-level optimization with frozen carry handling
-    opt_res <- came_run_stage("optimizer", came_optimize_portfolio(
+    opt_res <- .run_stage("optimizer", came_optimize_portfolio(
       mu_eff = fc_art$mu_eff,
       Sigma_H = risk_art$Sigma_H,
       prev_w = prev_w,
@@ -226,7 +298,13 @@ came_run_snapshot <- function(data_bundle_or_panel, as_of_date, spec = NULL, sta
       frozen = if (no_trade) character(0) else opt_res$frozen,
       no_trade = no_trade
     ),
-    meta = list(spec_hash = came_hash(spec)),
+    meta = list(
+      spec_hash = came_hash(spec),
+      profile_enabled = profile_stages,
+      stage_timing = stage_timing,
+      full_universe_size = length(colnames(P_win_full)),
+      compute_universe_size = length(compute_univ)
+    ),
     state_out = state5
   )
 

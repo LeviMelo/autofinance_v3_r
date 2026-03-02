@@ -25,22 +25,45 @@ came_make_data_adapter <- function(data_bundle_or_panel) {
   came_assert(!any(is.na(dt$refdate)), "data_refdate", "refdate must be coercible to Date")
 
   data.table::setkeyv(dt, c("symbol","refdate"))
+  data.table::setindexv(dt, c("refdate", "symbol"))
   came_assert(anyDuplicated(dt, by=c("symbol","refdate")) == 0, "data_duplicates", "Duplicate (symbol, refdate) rows")
 
   if (!"asset_type" %in% names(dt)) dt[, asset_type := "equity"]
+  cal_all <- sort(unique(dt$refdate))
+  mat_cache <- new.env(parent = emptyenv())
+  mat_cache_keys <- character(0)
 
   adapter <- list()
 
-  adapter$calendar <- function() sort(unique(dt$refdate))
+  adapter$calendar <- function() cal_all
 
   adapter$panel_upto <- function(as_of_date) dt[refdate <= as.Date(as_of_date)]
 
+  .window_bounds <- function(as_of_date, lookback) {
+    d <- as.Date(as_of_date)
+    i <- match(d, cal_all)
+    came_assert(!is.na(i), "data_asof_not_in_calendar", "as_of_date not in adapter calendar")
+    j0 <- max(1L, as.integer(i) - as.integer(lookback) + 1L)
+    list(start = cal_all[j0], end = cal_all[i])
+  }
+
   adapter$matrix_field <- function(as_of_date, lookback, field, symbols = NULL, strict = TRUE) {
-    sub <- adapter$panel_upto(as_of_date)
-    cal <- sort(unique(sub$refdate))
-    dates <- tail(cal, lookback)
-    sub <- sub[refdate %in% dates]
-    if (!is.null(symbols)) sub <- sub[symbol %in% symbols]
+    sym_key <- if (is.null(symbols)) "*" else paste(sort(unique(as.character(symbols))), collapse = ",")
+    k <- paste0(
+      as.character(as.Date(as_of_date)), "|", as.integer(lookback), "|", field, "|",
+      if (isTRUE(strict)) "1" else "0", "|", sym_key
+    )
+    if (exists(k, envir = mat_cache, inherits = FALSE)) {
+      return(get(k, envir = mat_cache, inherits = FALSE))
+    }
+
+    wb <- .window_bounds(as_of_date, lookback)
+    sub <- dt[refdate >= wb$start & refdate <= wb$end]
+    if (!is.null(symbols)) {
+      symbols <- unique(as.character(symbols))
+      symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+      sub <- sub[symbol %in% symbols]
+    }
     came_assert(field %in% names(sub), "data_field_missing", paste("Field missing:", field))
 
     mat <- data.table::dcast(sub, refdate ~ symbol, value.var = field)
@@ -49,6 +72,13 @@ came_make_data_adapter <- function(data_bundle_or_panel) {
     if (strict) {
       keep <- colSums(is.finite(out)) == nrow(out)
       out <- out[, keep, drop=FALSE]
+    }
+    assign(k, out, envir = mat_cache)
+    mat_cache_keys <<- c(mat_cache_keys, k)
+    if (length(mat_cache_keys) > 256L) {
+      old <- mat_cache_keys[1L]
+      if (exists(old, envir = mat_cache, inherits = FALSE)) rm(list = old, envir = mat_cache)
+      mat_cache_keys <<- mat_cache_keys[-1L]
     }
     out
   }
@@ -67,24 +97,49 @@ came_make_data_adapter <- function(data_bundle_or_panel) {
 
   adapter$activity <- function(as_of_date, lookback, symbols = NULL, strict = FALSE) {
     fields <- c("traded_value","traded_units","n_trades")
-    sub <- adapter$panel_upto(as_of_date)
+    wb <- .window_bounds(as_of_date, lookback)
+    sub <- dt[refdate >= wb$start & refdate <= wb$end]
     for (f in fields) {
-      came_assert(f %in% names(sub), "data_activity_missing",
-                  paste("Missing required activity field:", f, "(architecture requires traded_value, traded_units, n_trades)."))
+      came_assert(
+        f %in% names(sub), "data_activity_missing",
+        paste("Missing required activity field:", f, "(architecture requires traded_value, traded_units, n_trades).")
+      )
     }
-    tv <- adapter$matrix_field(as_of_date, lookback, "traded_value", symbols, strict)
-    tu <- adapter$matrix_field(as_of_date, lookback, "traded_units", symbols, strict)
-    nt <- adapter$matrix_field(as_of_date, lookback, "n_trades", symbols, strict)
-    list(traded_value = tv, traded_units = tu, n_trades = nt)
+
+    cal <- sort(unique(sub$refdate))
+    dates <- tail(cal, lookback)
+    sub <- sub[refdate %in% dates]
+    if (!is.null(symbols)) {
+      symbols <- unique(as.character(symbols))
+      symbols <- symbols[!is.na(symbols) & nzchar(symbols)]
+      sub <- sub[symbol %in% symbols]
+    }
+
+    mk <- function(field) {
+      mat <- data.table::dcast(sub, refdate ~ symbol, value.var = field)
+      out <- as.matrix(mat[, -1, with = FALSE])
+      rownames(out) <- as.character(mat$refdate)
+      if (strict) {
+        keep <- colSums(is.finite(out)) == nrow(out)
+        out <- out[, keep, drop = FALSE]
+      }
+      out
+    }
+
+    list(
+      traded_value = mk("traded_value"),
+      traded_units = mk("traded_units"),
+      n_trades = mk("n_trades")
+    )
   }
 
   adapter$investable_universe <- function(as_of_date, spec_data) {
     sub <- adapter$panel_upto(as_of_date)
-    cal <- sort(unique(sub$refdate))
+    cal <- cal_all[cal_all <= as.Date(as_of_date)]
     lkb <- min(63L, length(cal))
     if (lkb < 5) return(character(0))
-    dates <- tail(cal, lkb)
-    sub <- sub[refdate %in% dates]
+    wb <- .window_bounds(as_of_date, lkb)
+    sub <- dt[refdate >= wb$start & refdate <= wb$end]
 
     allowed <- spec_data$allowed_types %||% c("equity")
     if ("asset_type" %in% names(sub)) sub <- sub[asset_type %in% allowed]

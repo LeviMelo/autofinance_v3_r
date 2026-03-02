@@ -481,12 +481,33 @@ came_structure_update <- function(Theta, traded_value_last, state, spec) {
   ops <- .came_operators(P_bar, M, beta_w = beta_w)
 
   # clustering (architecture §10) + persistence
-  cl <- .came_spectral_cluster(ops$L_norm, spec$structure$K_min, spec$structure$K_max)
   labels_prev <- state$structure$labels
-  if (!is.null(labels_prev)) {
-    labels_prev <- labels_prev[names(labels_prev) %||% names(cl$labels)]
+  cl_steps_prev <- as.integer(state$structure$cluster_steps %||% 0L)
+  cl_steps <- cl_steps_prev + 1L
+  refresh_every <- as.integer(spec$compute$cluster_refresh_every_updates %||% 1L)
+  if (!is.finite(refresh_every) || refresh_every < 1L) refresh_every <- 1L
+  chi_thr <- as.numeric(spec$compute$cluster_refresh_chi_threshold %||% Inf)
+  refresh_due <- (refresh_every <= 1L) || ((cl_steps %% refresh_every) == 0L)
+  shock_due <- is.finite(chi_thr) && is.finite(chi) && (chi >= chi_thr)
+  needs_refresh <- refresh_due || shock_due || is.null(labels_prev)
+  can_reuse_labels <- FALSE
+  if (!is.null(labels_prev) && !is.null(M_prev)) {
+    lp <- came_pi_vector(labels_prev, univ, init_val = NA_real_)
+    can_reuse_labels <- (!needs_refresh) && all(is.finite(lp))
+    if (isTRUE(can_reuse_labels)) labels_prev <- as.integer(lp)
   }
-  cl$labels <- .came_persist_labels(cl$labels, labels_prev)
+
+  if (isTRUE(can_reuse_labels)) {
+    cl <- list(
+      labels = labels_prev,
+      K = length(unique(labels_prev)),
+      method = "reuse_prev_by_schedule",
+      within = NA_real_
+    )
+  } else {
+    cl <- .came_spectral_cluster(ops$L_norm, spec$structure$K_min, spec$structure$K_max)
+    cl$labels <- .came_persist_labels(cl$labels, labels_prev)
+  }
 
   # state update
   st_out <- state
@@ -495,6 +516,7 @@ came_structure_update <- function(Theta, traded_value_last, state, spec) {
   st_out$structure$edge_stab <- edge_stab
   st_out$structure$node_stab <- node_stab
   st_out$structure$labels <- as.integer(cl$labels)
+  st_out$structure$cluster_steps <- cl_steps
 
   list(
     structure = list(

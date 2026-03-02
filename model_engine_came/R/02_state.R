@@ -66,7 +66,8 @@ came_state_init <- function() {
       M_prev = NULL,
       edge_stab = NULL,
       node_stab = NULL,
-      labels = NULL
+      labels = NULL,
+      cluster_steps = 0L
     ),
     signals = list(
       kalman = NULL,

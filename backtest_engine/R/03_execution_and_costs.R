@@ -19,7 +19,12 @@ bt_compute_target_shares <- function(target_weights, nav_basis, exec_prices) {
     shares <- setNames(rep(0, length(syms)), syms)
     for (s in syms) {
         p <- exec_prices[s]
-        if (!is.finite(p) || p <= 0) .bt_stop("exec_price_missing", paste("Missing/invalid exec price for", s))
+        # Missing/invalid execution prices are handled later in bt_execute_rebalance
+        # by skipping those symbols and preserving current holdings.
+        if (!is.finite(p) || p <= 0) {
+            shares[s] <- 0
+            next
+        }
         notional <- w[syms == s][1] * nav_basis
         shares[s] <- floor(notional / p)
     }
